@@ -111,8 +111,17 @@ function Write-State {
     # Write then rename, so a concurrent reader never observes a half-written file. A torn read
     # would be treated as absent state, which would silently switch enforcement off.
     $tmp = "$Path.$PID.tmp"
-    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
-    Move-Item -LiteralPath $tmp -Destination $Path -Force
+    try {
+        Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+    }
+    finally {
+        # If the rename failed (for example a transient lock) the temp file would otherwise be
+        # orphaned in the gates directory, so clean it up unconditionally.
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Add-AuditRow {

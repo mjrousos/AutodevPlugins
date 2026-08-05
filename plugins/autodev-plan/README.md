@@ -138,11 +138,38 @@ plugins/autodev-plan/
 │   ├── autodev-architecture-review.agent.md
 │   ├── autodev-security-review.agent.md
 │   └── autodev-privacy-review.agent.md
-└── hooks/scripts/
-    ├── autodev-gates.ps1             # Gate tracker (Windows)
-    └── autodev-gates.sh              # Gate tracker (Linux/macOS, needs jq)
+├── hooks/scripts/
+│   ├── autodev-gates.ps1             # Gate tracker (Windows)
+│   └── autodev-gates.sh              # Gate tracker (Linux/macOS, needs jq)
+└── tests/
+    ├── gates.tests.ps1               # Gate tracker tests (Windows)
+    └── gates.tests.sh                # Gate tracker tests (Linux/macOS)
 ```
 
 Both scripts implement the same state machine and are dispatched by event name. They are written
 to **fail open**: `preToolUse` hooks are fail-closed by design in the CLI, so a crash there would
 permanently break `ask_user`. Every path is wrapped, always emits valid JSON, and always exits 0.
+
+## Tests
+
+The two gate tracker implementations have to stay behaviorally identical, so both are covered by
+an equivalent suite. Each test runs the hook script as a real subprocess — feeding a payload on
+stdin and asserting on the single JSON object it writes to stdout — against an isolated
+`COPILOT_HOME`, so running them never touches real session state.
+
+```
+# Windows
+powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-plan/tests/gates.tests.ps1
+
+# Linux / macOS (requires jq)
+bash plugins/autodev-plan/tests/gates.tests.sh
+```
+
+Coverage includes verdict parsing (including the negatives — a verdict mentioned in prose must
+never count), the enforcement decisions, all three loop bounds, re-gate invalidation, the audit
+trail, and the fail-safe paths: corrupt state, empty and garbage stdin, non-reviewer sub-agents,
+a hostile session id, and a missing `jq`.
+
+CI runs the PowerShell suite on Windows and the bash suite on both Linux and macOS, and also
+validates every JSON manifest and checks that no `*.sh` file has CRLF endings — a CRLF shebang
+would make the hooks unrunnable on Linux and macOS.

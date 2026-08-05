@@ -18,7 +18,7 @@ Generates code implementations based on a plan from [Autodev-Plan](../autodev-pl
 
 `hooks.json` follows the standard hook schema. Add entries under `hooks` using any of the
 supported events: `sessionStart`, `sessionEnd`, `userPromptSubmitted`, `preToolUse`,
-`postToolUse`, `agentStop`, and `errorOccurred`.
+`postToolUse`, `subagentStart`, `subagentStop`, `agentStop`, and `errorOccurred`.
 
 ```json
 {
@@ -28,7 +28,7 @@ supported events: `sessionStart`, `sessionEnd`, `userPromptSubmitted`, `preToolU
       {
         "type": "command",
         "bash": "bash hooks/scripts/example.sh",
-        "powershell": "pwsh -File hooks/scripts/example.ps1",
+        "powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File hooks/scripts/example.ps1",
         "timeoutSec": 30
       }
     ]
@@ -36,7 +36,9 @@ supported events: `sessionStart`, `sessionEnd`, `userPromptSubmitted`, `preToolU
 }
 ```
 
-Provide both `bash` and `powershell` keys so hooks work on Linux, macOS, and Windows.
+Provide both `bash` and `powershell` keys so hooks work on Linux, macOS, and Windows. Prefer
+`powershell` over `pwsh` in the `powershell` key: `powershell.exe` (Windows PowerShell 5.1) ships
+with Windows, whereas `pwsh` (PowerShell 7) is a separate install that may not be present.
 
 ## MCP servers
 
