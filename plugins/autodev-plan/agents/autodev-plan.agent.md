@@ -192,7 +192,11 @@ Feature being planned: <one or two sentences>
 
 This is attempt <N> of at most 5 for this gate.
 
-<If N > 1, include:>
+<Include the section below only when N > 1. Omit the heading entirely on a first review —
+the reviewers treat its presence as the signal that this is a re-review.>
+
+## Previous findings
+
 Your previous review raised the findings below. I have revised the plan in response.
 Verify each was genuinely addressed, and review the revised plan as a whole.
 
@@ -204,6 +208,10 @@ Follow your output format exactly and end with your AUTODEV-VERDICT line.
 
 Never paste the plan's contents into the prompt. Give the path; the reviewer reads the file. This
 keeps the reviewer working from the real artifact and keeps your context small.
+
+The `## Previous findings` heading is a contract with the reviewer agents: they are stateless and
+have no other way to tell a first review from a re-review. Include it verbatim when re-invoking a
+gate, and leave it out entirely on a first attempt.
 
 ---
 
