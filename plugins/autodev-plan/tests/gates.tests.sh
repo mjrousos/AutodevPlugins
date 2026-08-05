@@ -221,6 +221,21 @@ t_deny_ask_user() {
 }
 run_test "ask_user is denied while gating" t_deny_ask_user
 
+for TOOL in view edit create task bash powershell grep glob; do
+  # Defense in depth. hooks.json scopes this hook to ask_user, but if that matcher were ever
+  # broadened the orchestrator would be denied the task tool it needs to invoke the next gate,
+  # and would then deadlock against the agentStop block.
+  # shellcheck disable=SC2317
+  t_other_tool_allowed() {
+    local sid out
+    sid="$(new_session_id)"
+    round "$sid" architecture ISSUES > /dev/null
+    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg t "$TOOL" '{sessionId:$s, toolName:$t}')")"
+    assert_equal '{}' "$out"
+  }
+  run_test "'$TOOL' is NOT denied while gating" t_other_tool_allowed
+done
+
 t_names_next_gate() {
   local sid
   sid="$(new_session_id)"
@@ -348,6 +363,121 @@ t_no_temp_files() {
   assert_equal 0 "$count" 'temp files must be renamed away or cleaned up'
 }
 run_test "state writes leave no orphaned temp files" t_no_temp_files
+
+# --------------------------------------------------------------------------------------------
+echo
+echo "Hook wiring (hooks.json is what connects all of the above to the CLI)"
+# --------------------------------------------------------------------------------------------
+
+PLUGIN_ROOT_DIR="$(cd "$TESTS_DIR/.." && pwd)"
+HOOKS_JSON="$PLUGIN_ROOT_DIR/hooks.json"
+
+# The CLI anchors a matcher as ^(?:PATTERN)$ against the full value. grep -E is POSIX ERE and
+# does not understand the (?: ... ) non-capturing group syntax, so normalize it to a plain group
+# before matching. Without this every comparison silently fails, which would make the
+# "ignores unrelated sub-agents" assertions pass for the wrong reason.
+matches() { # pattern value
+  local ere="${1//(\?:/(}"
+  printf '%s' "$2" | grep -qE "^(${ere})$"
+}
+
+hooks_q() { jq -r "$1" "$HOOKS_JSON" 2>/dev/null; }
+
+t_hooks_events() {
+  local evt
+  assert_equal 1 "$(hooks_q '.version')" || return 1
+  for evt in subagentStart subagentStop agentStop preToolUse; do
+    [ "$(hooks_q ".hooks | has(\"$evt\")")" = "true" ] || fail "missing hook event '$evt'" || return 1
+  done
+}
+run_test "hooks.json declares all four hook events" t_hooks_events
+
+t_hooks_both_shells() {
+  local missing
+  missing="$(hooks_q '[.hooks | to_entries[] | .key as $k | .value[] | select((.bash | not) or (.powershell | not)) | $k] | join(", ")')"
+  [ -z "$missing" ] || fail "entries missing a bash or powershell command: $missing"
+}
+run_test "every hook entry supplies both bash and powershell commands" t_hooks_both_shells
+
+t_hooks_dispatch() {
+  local bad
+  # Each entry must invoke the matching script and pass its own event name.
+  bad="$(hooks_q '[.hooks | to_entries[] | .key as $k | .value[]
+    | select((.bash | test("autodev-gates\\.sh\" " + $k + "$") | not)
+          or (.powershell | test("autodev-gates\\.ps1\" " + $k + "$") | not)
+          or (.bash | test("\\$\\{PLUGIN_ROOT\\}") | not)
+          or (.powershell | test("\\$\\{PLUGIN_ROOT\\}") | not))
+    | $k] | join(", ")')"
+  [ -z "$bad" ] || fail "wrong script, event name or missing \${PLUGIN_ROOT}: $bad"
+}
+run_test "every hook entry dispatches its own event name to the right script" t_hooks_dispatch
+
+t_hooks_no_pwsh() {
+  # pwsh (PowerShell 7) is a separate install, so relying on it would add a prerequisite the
+  # plugin documents as unnecessary.
+  local bad
+  bad="$(hooks_q '[.hooks | to_entries[] | .key as $k | .value[] | select(.powershell | test("(^|[ \"])pwsh([ \"]|$)")) | $k] | join(", ")')"
+  [ -z "$bad" ] || fail "entries using pwsh: $bad"
+}
+run_test "hook entries invoke powershell.exe rather than pwsh" t_hooks_no_pwsh
+
+t_hooks_scripts_exist() {
+  local rel
+  for rel in hooks/scripts/autodev-gates.ps1 hooks/scripts/autodev-gates.sh; do
+    [ -f "$PLUGIN_ROOT_DIR/$rel" ] || fail "hooks.json references a missing file: $rel" || return 1
+  done
+}
+run_test "every script referenced by hooks.json exists" t_hooks_scripts_exist
+
+t_matcher_catches_reviewers() {
+  local pattern gate name
+  pattern="$(hooks_q '.hooks.subagentStart[0].matcher // ""')"
+  [ -n "$pattern" ] || fail 'subagentStart has no matcher; it would fire for every sub-agent' || return 1
+  for gate in architecture security privacy; do
+    # The CLI passes the fully namespaced agent name.
+    name="autodev-plan:autodev-$gate-review"
+    matches "$pattern" "$name" || fail "matcher does not match '$name'" || return 1
+  done
+}
+run_test "the subagentStart matcher catches all three reviewer agents" t_matcher_catches_reviewers
+
+t_matcher_ignores_others() {
+  local pattern name
+  pattern="$(hooks_q '.hooks.subagentStart[0].matcher // ""')"
+  # Note 'security-review' is a CLI built-in and must not be mistaken for our gate.
+  for name in explore general-purpose task code-review security-review rubber-duck research; do
+    if matches "$pattern" "$name"; then fail "matcher wrongly matches the unrelated agent '$name'"; return 1; fi
+  done
+}
+run_test "the subagentStart matcher ignores unrelated sub-agents" t_matcher_ignores_others
+
+t_pretooluse_matcher_scope() {
+  local pattern tool
+  pattern="$(hooks_q '.hooks.preToolUse[0].matcher // ""')"
+  [ -n "$pattern" ] || fail 'preToolUse has no matcher; it would fire for every tool call' || return 1
+  matches "$pattern" 'ask_user' || fail "matcher does not match 'ask_user'" || return 1
+  for tool in view edit create task bash powershell grep glob web_fetch; do
+    if matches "$pattern" "$tool"; then fail "matcher wrongly matches '$tool'"; return 1; fi
+  done
+}
+run_test "the preToolUse matcher is scoped to ask_user only" t_pretooluse_matcher_scope
+
+t_subagentstop_no_matcher() {
+  # The script filters on agentName in-process instead; if a matcher were added here the
+  # tracker would silently stop seeing verdicts.
+  local m
+  m="$(hooks_q '.hooks.subagentStop[0].matcher // ""')"
+  [ -z "$m" ] || fail 'subagentStop declares a matcher, which the CLI does not honor for that event'
+}
+run_test "subagentStop has no matcher, since the CLI does not support one there" t_subagentstop_no_matcher
+
+t_hooks_timeouts() {
+  # A command hook that times out is fail-open, so an unset timeout risks a hung session.
+  local bad
+  bad="$(hooks_q '[.hooks | to_entries[] | .key as $k | .value[] | select(.timeoutSec | not) | $k] | join(", ")')"
+  [ -z "$bad" ] || fail "entries without timeoutSec: $bad"
+}
+run_test "every hook entry sets a timeout" t_hooks_timeouts
 
 # --------------------------------------------------------------------------------------------
 

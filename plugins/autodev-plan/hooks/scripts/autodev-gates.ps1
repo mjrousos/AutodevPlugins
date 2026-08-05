@@ -402,6 +402,13 @@ try {
         }
 
         'preToolUse' {
+            # hooks.json restricts this hook to ask_user via a matcher, but do not rely on that
+            # alone: without this check a broadened or missing matcher would deny *every* tool
+            # while gating, including the task tool the orchestrator needs to invoke the next
+            # gate, deadlocking it against the agentStop block.
+            $toolName = [string]$payload.toolName
+            if ($toolName -notmatch '^(?:ask_user|AskUserQuestion)$') { Write-JsonResult @{}; exit 0 }
+
             if (-not (Test-Path -LiteralPath $statePath)) { Write-JsonResult @{}; exit 0 }
             $state = Read-State -Path $statePath -SessionId $sessionId
             if ((Get-Phase -State $state) -ne 'gating') { Write-JsonResult @{}; exit 0 }

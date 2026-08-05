@@ -299,6 +299,15 @@ $FOOTER" '{modifiedResponse: $r}'
     ;;
 
   preToolUse)
+    # hooks.json restricts this hook to ask_user via a matcher, but do not rely on that alone:
+    # without this check a broadened or missing matcher would deny *every* tool while gating,
+    # including the task tool the orchestrator needs to invoke the next gate, deadlocking it
+    # against the agentStop block.
+    case "$(json_get '.toolName')" in
+      ask_user | AskUserQuestion) ;;
+      *) emit_empty ;;
+    esac
+
     [ -f "$STATE_PATH" ] || emit_empty
     [ "$(get_phase "$STATE")" = "gating" ] || emit_empty
 

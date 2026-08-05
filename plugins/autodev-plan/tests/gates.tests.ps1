@@ -185,6 +185,18 @@ Test-Case 'ask_user is denied while gating' {
     Assert-Equal 'deny' $parsed.permissionDecision
 }
 
+foreach ($tool in @('view', 'edit', 'create', 'task', 'bash', 'powershell', 'grep', 'glob')) {
+    $t = $tool
+    Test-Case "'$t' is NOT denied while gating" {
+        # Defense in depth. hooks.json scopes this hook to ask_user, but if that matcher were
+        # ever broadened the orchestrator would be denied the task tool it needs to invoke the
+        # next gate, and would then deadlock against the agentStop block.
+        $sid = New-SessionId
+        Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+        Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = $t })
+    }.GetNewClosure()
+}
+
 Test-Case 'agentStop names the next gate once one passes' {
     $sid = New-SessionId
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
@@ -291,6 +303,107 @@ Test-Case 'state writes leave no orphaned temp files' {
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
     $stray = @(Get-ChildItem -LiteralPath (Join-Path $script:Root 'autodev-plan\gates') -Filter '*.tmp' -ErrorAction SilentlyContinue)
     Assert-Equal 0 $stray.Count 'temp files must be renamed away or cleaned up'
+}
+
+# ------------------------------------------------------------------------------------------
+Write-Host "`nHook wiring (hooks.json is what connects all of the above to the CLI)" -ForegroundColor Cyan
+# ------------------------------------------------------------------------------------------
+
+$script:PluginRoot = Split-Path $PSScriptRoot -Parent
+$script:Hooks = Get-Content -LiteralPath (Join-Path $script:PluginRoot 'hooks.json') -Raw | ConvertFrom-Json
+
+# The CLI anchors a matcher as ^(?:PATTERN)$ against the full value.
+function Test-Matcher {
+    param([string]$Pattern, [string]$Value)
+    return $Value -match "^(?:$Pattern)$"
+}
+
+Test-Case 'hooks.json declares all four hook events' {
+    Assert-Equal 1 $script:Hooks.version
+    foreach ($evt in @('subagentStart', 'subagentStop', 'agentStop', 'preToolUse')) {
+        if (-not $script:Hooks.hooks.PSObject.Properties[$evt]) { throw "missing hook event '$evt'" }
+    }
+}
+
+Test-Case 'every hook entry supplies both bash and powershell commands' {
+    foreach ($prop in $script:Hooks.hooks.PSObject.Properties) {
+        foreach ($entry in $prop.Value) {
+            if (-not $entry.bash) { throw "$($prop.Name) is missing a bash command" }
+            if (-not $entry.powershell) { throw "$($prop.Name) is missing a powershell command" }
+        }
+    }
+}
+
+Test-Case 'every hook entry dispatches its own event name to the right script' {
+    foreach ($prop in $script:Hooks.hooks.PSObject.Properties) {
+        foreach ($entry in $prop.Value) {
+            Assert-Match "autodev-gates\.sh`" $($prop.Name)$" $entry.bash "bad bash wiring for $($prop.Name)"
+            Assert-Match "autodev-gates\.ps1`" $($prop.Name)$" $entry.powershell "bad powershell wiring for $($prop.Name)"
+            Assert-Match '\$\{PLUGIN_ROOT\}' $entry.bash 'must resolve via ${PLUGIN_ROOT}'
+            Assert-Match '\$\{PLUGIN_ROOT\}' $entry.powershell 'must resolve via ${PLUGIN_ROOT}'
+        }
+    }
+}
+
+Test-Case 'hook entries invoke powershell.exe rather than pwsh' {
+    # pwsh (PowerShell 7) is a separate install, so relying on it would add a prerequisite the
+    # plugin documents as unnecessary.
+    foreach ($prop in $script:Hooks.hooks.PSObject.Properties) {
+        foreach ($entry in $prop.Value) {
+            if ($entry.powershell -match '(^|\s|")pwsh(\s|$|")') { throw "$($prop.Name) uses pwsh" }
+        }
+    }
+}
+
+Test-Case 'every script referenced by hooks.json exists' {
+    foreach ($rel in @('hooks/scripts/autodev-gates.ps1', 'hooks/scripts/autodev-gates.sh')) {
+        $full = Join-Path $script:PluginRoot $rel
+        if (-not (Test-Path -LiteralPath $full)) { throw "hooks.json references a missing file: $rel" }
+    }
+}
+
+Test-Case 'the subagentStart matcher catches all three reviewer agents' {
+    $pattern = $script:Hooks.hooks.subagentStart[0].matcher
+    if (-not $pattern) { throw 'subagentStart has no matcher; it would fire for every sub-agent' }
+    foreach ($gate in @('architecture', 'security', 'privacy')) {
+        # The CLI passes the fully namespaced agent name.
+        $name = "autodev-plan:autodev-$gate-review"
+        if (-not (Test-Matcher $pattern $name)) { throw "matcher does not match '$name'" }
+    }
+}
+
+Test-Case 'the subagentStart matcher ignores unrelated sub-agents' {
+    $pattern = $script:Hooks.hooks.subagentStart[0].matcher
+    foreach ($name in @('explore', 'general-purpose', 'task', 'code-review', 'security-review', 'rubber-duck', 'research')) {
+        # Note 'security-review' is a CLI built-in and must not be mistaken for our gate.
+        if (Test-Matcher $pattern $name) { throw "matcher wrongly matches the unrelated agent '$name'" }
+    }
+}
+
+Test-Case 'the preToolUse matcher is scoped to ask_user only' {
+    $pattern = $script:Hooks.hooks.preToolUse[0].matcher
+    if (-not $pattern) { throw 'preToolUse has no matcher; it would fire for every tool call' }
+    if (-not (Test-Matcher $pattern 'ask_user')) { throw "matcher does not match 'ask_user'" }
+    foreach ($tool in @('view', 'edit', 'create', 'task', 'bash', 'powershell', 'grep', 'glob', 'web_fetch')) {
+        if (Test-Matcher $pattern $tool) { throw "matcher wrongly matches '$tool'" }
+    }
+}
+
+Test-Case 'subagentStop has no matcher, since the CLI does not support one there' {
+    # The script filters on agentName in-process instead; if a matcher were added here the
+    # tracker would silently stop seeing verdicts.
+    if ($script:Hooks.hooks.subagentStop[0].matcher) {
+        throw 'subagentStop declares a matcher, which the CLI does not honor for that event'
+    }
+}
+
+Test-Case 'every hook entry sets a timeout' {
+    # A command hook that times out is fail-open, so an unset timeout risks a hung session.
+    foreach ($prop in $script:Hooks.hooks.PSObject.Properties) {
+        foreach ($entry in $prop.Value) {
+            if (-not $entry.timeoutSec) { throw "$($prop.Name) has no timeoutSec" }
+        }
+    }
 }
 
 # ------------------------------------------------------------------------------------------
