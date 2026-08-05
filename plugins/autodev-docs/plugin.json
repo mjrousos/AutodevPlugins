@@ -1,0 +1,16 @@
+{
+  "name": "autodev-docs",
+  "version": "0.1.0",
+  "description": "Generates documentation for your codebase or project.",
+  "author": {
+    "name": "Mike Rousos",
+    "email": "mjrousos@github.com",
+    "url": "https://github.com/mjrousos"
+  },
+  "license": "MIT",
+  "keywords": ["autodev", "documentation", "sdlc"],
+  "agents": ["agents/"],
+  "skills": ["skills/"],
+  "hooks": "hooks.json",
+  "mcpServers": ".mcp.json"
+}

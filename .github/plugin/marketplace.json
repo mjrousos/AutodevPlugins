@@ -1,0 +1,31 @@
+{
+  "name": "autodev-plugins",
+  "owner": {
+    "name": "Mike Rousos",
+    "email": "mjrousos@github.com"
+  },
+  "metadata": {
+    "description": "Plugins for automating the software development lifecycle with GitHub Copilot.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "autodev-plan",
+      "description": "Generates a development plan based on a project or feature description, hardened by isolated architecture, security, and privacy review gates.",
+      "version": "0.2.0",
+      "source": "./plugins/autodev-plan"
+    },
+    {
+      "name": "autodev-implement",
+      "description": "Generates code implementations based on a plan from Autodev-Plan.",
+      "version": "0.1.0",
+      "source": "./plugins/autodev-implement"
+    },
+    {
+      "name": "autodev-docs",
+      "description": "Generates documentation for your codebase or project.",
+      "version": "0.1.0",
+      "source": "./plugins/autodev-docs"
+    }
+  ]
+}

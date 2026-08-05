@@ -1,0 +1,16 @@
+{
+  "name": "autodev-plan",
+  "version": "0.2.0",
+  "description": "Generates a development plan based on a project or feature description, hardened by isolated architecture, security, and privacy review gates.",
+  "author": {
+    "name": "Mike Rousos",
+    "email": "mjrousos@github.com",
+    "url": "https://github.com/mjrousos"
+  },
+  "license": "MIT",
+  "keywords": ["autodev", "planning", "sdlc"],
+  "agents": ["agents/"],
+  "skills": ["skills/"],
+  "hooks": "hooks.json",
+  "mcpServers": ".mcp.json"
+}
