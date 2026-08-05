@@ -129,9 +129,21 @@ For each gate, loop:
 1. Invoke the reviewer through the `task` tool (see *Invoking a reviewer*).
 2. Read the verdict line at the end of its response.
 3. If `AUTODEV-VERDICT: PASS` → the gate is closed. Move to the next gate.
-4. If `AUTODEV-VERDICT: ISSUES` (or the verdict is missing or unparseable) → address the
-   findings, then **re-invoke the same reviewer**. This is the loop; it is mandatory, not
-   optional.
+4. If `AUTODEV-VERDICT: ISSUES` → address the findings, then **re-invoke the same reviewer**.
+   This is the loop; it is mandatory, not optional.
+5. If the verdict is **missing or unparseable**, the tracker records the attempt as `ISSUES`
+   automatically — a reviewer that fails to state a verdict never yields a pass. Handle it by
+   what the response actually contains:
+   - **It contains usable findings** but no readable verdict line: treat it exactly as `ISSUES`
+     and address the findings normally.
+   - **It contains nothing you can act on** (empty, truncated, or off-format): re-invoke the
+     same reviewer immediately **without editing the plan**. There is nothing to fix, and
+     editing the plan to look busy would only muddy the next review.
+
+   Either way the attempt has already been counted against the gate's budget, so a reviewer that
+   keeps malfunctioning walks the gate to its cap and escalates rather than looping forever.
+   Never treat a missing verdict as a pass, and never substitute your own judgment for the
+   verdict the reviewer failed to give.
 
 Addressing findings means:
 
@@ -192,7 +204,11 @@ Feature being planned: <one or two sentences>
 
 This is attempt <N> of at most 5 for this gate.
 
-<If N > 1, include:>
+<Include the section below only when N > 1. Omit the heading entirely on a first review —
+the reviewers treat its presence as the signal that this is a re-review.>
+
+## Previous findings
+
 Your previous review raised the findings below. I have revised the plan in response.
 Verify each was genuinely addressed, and review the revised plan as a whole.
 
@@ -204,6 +220,34 @@ Follow your output format exactly and end with your AUTODEV-VERDICT line.
 
 Never paste the plan's contents into the prompt. Give the path; the reviewer reads the file. This
 keeps the reviewer working from the real artifact and keeps your context small.
+
+### When the `task` call itself fails
+
+A tool error — the call errors out, times out, or returns no reviewer response at all — is not a
+verdict. Do not read it as `ISSUES`, and never read it as a pass.
+
+Retry the same gate once. If the retry also fails, what you do next depends on whether any gate
+has started yet in this session, because that determines what the tracker will let you do:
+
+- **No gate has started yet** (the very first invocation failed). Nothing is gating, so you can
+  still talk to the user. Tell them the reviewer cannot be reached, and stop — do not carry on to
+  WRAPUP or present the plan as reviewed when no review happened.
+- **A gate has already started.** You are mid-gating: `ask_user` is denied and you cannot end
+  your turn cleanly, so stopping is not available to you. Keep retrying the gate. Each retry that
+  actually starts the reviewer counts toward the 5-attempt cap, and reaching it escalates and
+  unlocks `ask_user` so you can bring in the user properly. If the retries keep failing *before*
+  the reviewer starts, no attempt accrues and the cap cannot be reached — the tracker will
+  release you after several blocked stops, and you should then report the failure plainly in your
+  final message. Never describe a gate that never ran as passed.
+
+One consequence worth knowing: **you cannot un-count an attempt.** If the reviewer sub-agent
+started at all, the tracker counted it and nothing you do afterwards will return it. That is
+deliberate — it is what stops a retry loop from running forever. A call that failed before the
+sub-agent started costs nothing.
+
+The `## Previous findings` heading is a contract with the reviewer agents: they are stateless and
+have no other way to tell a first review from a re-review. Include it verbatim when re-invoking a
+gate, and leave it out entirely on a first attempt.
 
 ---
 
@@ -253,8 +297,33 @@ following:
 Anything else — wording, formatting, reordering, added explanation, clarified detail, adjusted
 estimates — is **not** material and does not require re-gating.
 
-When a change is material, re-run every gate from the first one affected onward, in order. When
-in doubt, re-run: a wasted gate costs a few minutes, while a stale verdict defeats the workflow.
+### Where to restart the cascade
+
+Gates always run in the order architecture → security → privacy, and starting any gate
+invalidates the gates after it. So the only decision is **which gate is the earliest one
+affected**; everything downstream re-runs automatically.
+
+| The material change… | Restart from |
+| --- | --- |
+| adds or removes a component, service, module, or process | architecture |
+| adds, removes, or redirects a data flow | architecture |
+| adds or removes an external dependency, integration, or third-party service | architecture |
+| changes the concurrency or failure-handling model | architecture |
+| changes the migration or rollout approach | architecture |
+| changes a trust boundary, authentication, authorization, or the permission model | security |
+| adds an entry point, input, parser, or attack surface without changing structure | security |
+| changes how secrets or credentials are handled | security |
+| changes which personal data is collected or stored | security |
+| changes logging or telemetry content | security |
+| changes only data retention, deletion, or consent behavior | privacy |
+
+Two rules cover anything the table does not:
+
+- **When in doubt, restart earlier.** Starting too early costs one extra gate; starting too late
+  leaves a stale verdict on a plan that changed, which is the failure this whole workflow exists
+  to prevent.
+- **A change that fits several rows starts at the earliest of them.** Architecture beats
+  security, security beats privacy.
 
 **Converge, do not gold-plate.** Re-gate cascades are the main way this workflow wastes the
 user's time and money. Two rules keep them short:

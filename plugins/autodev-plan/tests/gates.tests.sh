@@ -109,6 +109,10 @@ VERDICT_CASES=(
   "wrapped in a code fence|PASS|text\n$FENCE\nAUTODEV-VERDICT: PASS\n$FENCE"
   "bold markdown|PASS|text\n\n**AUTODEV-VERDICT: PASS**"
   "trailing period|PASS|text\n\nAUTODEV-VERDICT: PASS."
+  "indented verdict line|PASS|text\n\n    AUTODEV-VERDICT: PASS"
+  # The reviewer templates show the verdict as a placeholder. If a model ever copies it
+  # literally that must fail safe rather than read as a pass.
+  "literal template placeholder is not a pass|ISSUES|Summary.\n\nAUTODEV-VERDICT: <PASS or ISSUES>"
   "mid-body PASS with no final verdict|ISSUES|I would say AUTODEV-VERDICT: PASS if fixed.\n\n### blocker Missing authz"
   "mid-body PASS then final ISSUES|ISSUES|AUTODEV-VERDICT: PASS maybe\n\nAUTODEV-VERDICT: ISSUES"
   "commentary after the verdict|ISSUES|AUTODEV-VERDICT: PASS\nBut actually I am unsure."
