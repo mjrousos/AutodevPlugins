@@ -226,20 +226,24 @@ keeps the reviewer working from the real artifact and keeps your context small.
 A tool error — the call errors out, times out, or returns no reviewer response at all — is not a
 verdict. Do not read it as `ISSUES`, and never read it as a pass.
 
-Retry the same gate once. If the second attempt also fails with a tool error, say so plainly to
-the user in your next message and stop invoking that gate; a reviewer you cannot reach is a
-broken workflow, not a plan defect.
+Retry the same gate once. If the retry also fails, what you do next depends on whether any gate
+has started yet in this session, because that determines what the tracker will let you do:
 
-Two things about failed calls are worth knowing, because they constrain what you can do:
+- **No gate has started yet** (the very first invocation failed). Nothing is gating, so you can
+  still talk to the user. Tell them the reviewer cannot be reached, and stop — do not carry on to
+  WRAPUP or present the plan as reviewed when no review happened.
+- **A gate has already started.** You are mid-gating: `ask_user` is denied and you cannot end
+  your turn cleanly, so stopping is not available to you. Keep retrying the gate. Each retry that
+  actually starts the reviewer counts toward the 5-attempt cap, and reaching it escalates and
+  unlocks `ask_user` so you can bring in the user properly. If the retries keep failing *before*
+  the reviewer starts, no attempt accrues and the cap cannot be reached — the tracker will
+  release you after several blocked stops, and you should then report the failure plainly in your
+  final message. Never describe a gate that never ran as passed.
 
-- **You may be unable to ask the user.** Once any gate has started, `ask_user` is denied until
-  the gates finish or a cap escalates. If you are mid-gating, report the failure in your normal
-  output rather than trying to open a dialogue, and keep retrying — repeated failures walk the
-  gate to its attempt cap, which unlocks escalation for you.
-- **You cannot un-count an attempt.** If the reviewer sub-agent started at all, the tracker has
-  already counted that attempt, and nothing you do afterwards will return it. This is deliberate:
-  it is what stops a retry loop from running forever. A call that failed *before* the sub-agent
-  started costs nothing.
+One consequence worth knowing: **you cannot un-count an attempt.** If the reviewer sub-agent
+started at all, the tracker counted it and nothing you do afterwards will return it. That is
+deliberate — it is what stops a retry loop from running forever. A call that failed before the
+sub-agent started costs nothing.
 
 The `## Previous findings` heading is a contract with the reviewer agents: they are stateless and
 have no other way to tell a first review from a re-review. Include it verbatim when re-invoking a
