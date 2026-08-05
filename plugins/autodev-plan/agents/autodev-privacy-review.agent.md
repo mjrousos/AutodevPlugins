@@ -1,6 +1,7 @@
 ---
 name: autodev-privacy-review
 description: Reviews an implementation plan for privacy and data-protection concerns. Invoked programmatically by the autodev-plan orchestrator as an isolated review gate; not intended for direct use.
+model: gpt-5.6-terra
 user-invocable: false
 tools: ["read", "search"]
 ---

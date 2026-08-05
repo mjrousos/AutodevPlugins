@@ -44,12 +44,17 @@ The plan is written to `./.autodev/plan.md` by default. The orchestrator offers 
 
 ## Agents
 
-| Agent | Invocable by | Tools | Role |
-| --- | --- | --- | --- |
-| `autodev-plan` | user | all | Orchestrator and the only agent you talk to |
-| `autodev-architecture-review` | orchestrator only | read, search | Decomposition, coupling, failure modes, testability |
-| `autodev-security-review` | orchestrator only | read, search, web | Authn/authz, injection, secrets, supply chain, trust boundaries |
-| `autodev-privacy-review` | orchestrator only | read, search | Data inventory, minimization, retention, telemetry leakage |
+| Agent | Invocable by | Model | Tools | Role |
+| --- | --- | --- | --- | --- |
+| `autodev-plan` | user | Claude Opus 5 | all | Orchestrator and the only agent you talk to |
+| `autodev-architecture-review` | orchestrator only | GPT-5.6 Terra | read, search | Decomposition, coupling, failure modes, testability |
+| `autodev-security-review` | orchestrator only | GPT-5.6 Terra | read, search, web | Authn/authz, injection, secrets, supply chain, trust boundaries |
+| `autodev-privacy-review` | orchestrator only | GPT-5.6 Terra | read, search | Data inventory, minimization, retention, telemetry leakage |
+
+Each agent pins its own model via the `model` frontmatter key, so they run on the intended
+model regardless of the model selected for your session. Using a different model family for the
+reviewers than for the orchestrator is deliberate: a reviewer is more likely to catch what the
+author missed when it does not share the author's blind spots.
 
 The reviewers are `user-invocable: false`, so they stay out of your agent picker. Their tool
 allowlists deliberately exclude `ask_user` and `edit`: reviewers *report*, the orchestrator

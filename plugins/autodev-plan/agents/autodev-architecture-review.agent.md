@@ -1,6 +1,7 @@
 ---
 name: autodev-architecture-review
 description: Reviews an implementation plan for software architecture quality. Invoked programmatically by the autodev-plan orchestrator as an isolated review gate; not intended for direct use.
+model: gpt-5.6-terra
 user-invocable: false
 tools: ["read", "search"]
 ---

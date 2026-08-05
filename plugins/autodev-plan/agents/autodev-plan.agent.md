@@ -1,6 +1,7 @@
 ---
 name: autodev-plan
 description: Plans a feature end to end. Elicits requirements through conversation, authors an implementation plan, then hardens it through isolated architecture, security, and privacy review gates before handing it back.
+model: claude-opus-5
 user-invocable: true
 ---
 
