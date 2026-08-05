@@ -56,12 +56,42 @@ model regardless of the model selected for your session. Using a different model
 reviewers than for the orchestrator is deliberate: a reviewer is more likely to catch what the
 author missed when it does not share the author's blind spots.
 
-The reviewers are `user-invocable: false`, so they stay out of your agent picker. Their tool
-allowlists deliberately exclude `ask_user` and `edit`: reviewers *report*, the orchestrator
-*fixes*.
+The reviewers are `user-invocable: false`, so they stay out of your agent picker while remaining
+invocable by the orchestrator. They are prefixed `autodev-` because the CLI already ships
+built-in `security-review` and `code-review` agents that would otherwise collide.
 
-They are prefixed `autodev-` because the CLI already ships built-in `security-review` and
-`code-review` agents that would otherwise collide.
+### Why the reviewers list `tools` and the orchestrator does not
+
+This asymmetry is deliberate and load-bearing, and it is easy to misread as an oversight when
+skimming the agent files.
+
+The `tools` frontmatter key is an **allowlist**: omit it and the agent gets every tool; specify
+it and the agent gets *only* what is listed. So on a reviewer, the interesting part of
+`tools: ["read", "search"]` is not what it grants — it is what it leaves out.
+
+The omissions that matter:
+
+- **`ask_user` and any other elicitation tool.** This is the primary reason the key is present
+  at all. Requirement: the review gates must complete with no human interaction. An agent that
+  cannot reach the user cannot stall waiting on one, cannot quietly turn a judgment call back
+  into a question, and cannot interrupt an otherwise unattended run. The `preToolUse` hook
+  denies `ask_user` during gating as well, but that hook is a *runtime* backstop; the allowlist
+  means the tool is never offered to the reviewer in the first place.
+- **`edit`, `create` and the write tools.** Reviewers report, the orchestrator fixes. A reviewer
+  that could edit the plan could quietly resolve its own findings, and the verdict would then
+  describe a document nobody agreed to.
+- **`task`.** A reviewer cannot spawn further sub-agents, so a gate cannot fan out into work the
+  tracker never sees.
+
+The orchestrator does the opposite and **omits `tools` entirely**, which grants everything. That
+is also intentional: it genuinely needs `ask_user` for the clarifying and wrap-up phases, and
+`ask_user` is not among the documented tool aliases, so naming an explicit allowlist risks
+silently dropping the one tool the workflow depends on most. Leaving the key off is the safer
+failure mode.
+
+The net effect is that each agent's tool surface encodes its role: reviewers *cannot* talk to
+the user or change the plan even if their prompt were ignored, while the orchestrator retains
+the full surface and is instead constrained at runtime by the hooks.
 
 ## Enforcement
 
