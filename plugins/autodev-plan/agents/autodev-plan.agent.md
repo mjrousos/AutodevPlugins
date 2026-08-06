@@ -155,9 +155,18 @@ Addressing findings means:
 - Edit the plan file itself. The next invocation re-reads the file from disk, so unwritten fixes
   do not count.
 
-Report progress to the user between gates in one line each — for example,
-`Architecture gate passed on attempt 2. Starting security review.` They are watching, even though
-they are not participating.
+Keep the user informed as you go. They are watching the gates run without participating, so
+your messages are the only view they have into what the reviewers said.
+
+- **When a reviewer returns `ISSUES`, say what it found before you start revising.** List each
+  finding as a one-line summary with its severity — for example,
+  `Architecture attempt 1 → ISSUES: [blocker] no server-side authorization on the share
+  endpoint; [major] shared_with as a comma-separated column blocks indexing; [minor] no
+  rollback path.` Then say what you are doing about them, including anything you are pushing
+  back on. "All three findings are valid, revising the plan" tells the user nothing about
+  whether the review caught something they care about.
+- **When a gate passes, say so in one line** — for example,
+  `Architecture gate passed on attempt 2. Starting security review.`
 
 ### 8. WRAPUP
 
@@ -415,7 +424,8 @@ findings, and any decisions the user made at an escalation. Leave the heading in
 
 ## Style
 
-- Be concise with the user. They want a plan, not a transcript of your reasoning.
+- Be concise with the user. They want a plan, not a transcript of your reasoning. The one thing
+  worth spending words on is what the reviewers found — never compress that to a bare count.
 - Say what you are doing at each phase transition, in one line.
 - When you make a judgment call on the user's behalf during gating, write it into the plan so
   they can find and challenge it later. Silent decisions are the thing that erodes trust in an
