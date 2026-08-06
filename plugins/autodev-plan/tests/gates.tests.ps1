@@ -6,7 +6,9 @@
     Runs the hook script as a separate process for every case, exactly as the CLI does, feeding
     the hook payload on stdin and asserting on the single JSON object it writes to stdout.
 
-    Tests run against an isolated COPILOT_HOME so real session state is never touched.
+    Tests run against an isolated COPILOT_HOME, and each test gets its own temporary working
+    directory, so real session state is never touched. The tracker writes into
+    '<cwd>/.autodev/', so a per-test cwd is what keeps tests isolated from each other.
 
     Usage:  powershell -NoProfile -ExecutionPolicy Bypass -File tests/gates.tests.ps1
     Exit code is 0 when every test passes, 1 otherwise.
@@ -24,8 +26,42 @@ if (-not (Test-Path -LiteralPath $script:GateScript)) {
     exit 1
 }
 
+function Get-SessionCwd {
+    param([string]$SessionId)
+    $dir = Join-Path $script:Root $SessionId
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Get-StatePath {
+    param([string]$SessionId)
+    # Enforcement state is keyed by session and lives outside the workspace.
+    return (Join-Path (Join-Path $script:Root 'autodev-plan\gates') "$SessionId.json")
+}
+
+function Get-MirrorPath {
+    param([string]$SessionId)
+    return (Join-Path (Join-Path (Get-SessionCwd $SessionId) '.autodev') 'gate-status.json')
+}
+
+function Get-AuditPath {
+    param([string]$SessionId)
+    return (Join-Path (Join-Path (Get-SessionCwd $SessionId) '.autodev') 'gate-audit.md')
+}
+
+function Get-FeedbackPath {
+    param([string]$SessionId)
+    return (Join-Path (Join-Path (Get-SessionCwd $SessionId) '.autodev') 'feedback-log.md')
+}
+
 function Invoke-Hook {
     param([string]$EventName, [hashtable]$Payload)
+    # The tracker keys its files off the session working directory, so give every session its
+    # own. Tests that need to model two sessions sharing a directory pass 'cwd' explicitly.
+    if ($Payload.ContainsKey('sessionId') -and -not $Payload.ContainsKey('cwd')) {
+        $Payload = $Payload.Clone()
+        $Payload['cwd'] = Get-SessionCwd $Payload['sessionId']
+    }
     $json = $Payload | ConvertTo-Json -Compress -Depth 5
     $out = $json | powershell -NoProfile -ExecutionPolicy Bypass -File $script:GateScript $EventName
     return ($out | Out-String).Trim()
@@ -82,6 +118,9 @@ function Assert-Match {
 }
 
 $env:COPILOT_HOME = $script:Root
+# The CLI writes the hook payload as UTF-8, so the harness must too, or a non-ASCII test case
+# would be mangled before it ever reached the script.
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 if (Test-Path -LiteralPath $script:Root) { Remove-Item -LiteralPath $script:Root -Recurse -Force }
 New-Item -ItemType Directory -Path $script:Root -Force | Out-Null
 
@@ -99,6 +138,9 @@ $verdictCases = @(
     @{ Name = 'clean ISSUES'; Body = "Findings.`n`nAUTODEV-VERDICT: ISSUES"; Expect = 'ISSUES' }
     @{ Name = 'trailing blank lines'; Body = "AUTODEV-VERDICT: PASS`n`n`n"; Expect = 'PASS' }
     @{ Name = 'wrapped in a code fence'; Body = "text`n$fence`nAUTODEV-VERDICT: PASS`n$fence"; Expect = 'PASS' }
+    # A fence sharing the verdict's line is the one input where the two implementations used to
+    # disagree, closing a gate on Windows and failing it on Linux.
+    @{ Name = 'fence and verdict share a line'; Body = "text`n${fence}AUTODEV-VERDICT: PASS${fence}"; Expect = 'PASS' }
     @{ Name = 'bold markdown'; Body = "text`n`n**AUTODEV-VERDICT: PASS**"; Expect = 'PASS' }
     @{ Name = 'trailing period'; Body = "text`n`nAUTODEV-VERDICT: PASS."; Expect = 'PASS' }
     @{ Name = 'indented verdict line'; Body = "text`n`n    AUTODEV-VERDICT: PASS"; Expect = 'PASS' }
@@ -144,9 +186,22 @@ foreach ($agent in @('explore', 'general-purpose', 'security-review', 'code-revi
 
 Test-Case 'corrupt state file does not deny ask_user or block stopping' {
     $sid = New-SessionId
-    $dir = Join-Path $script:Root 'autodev-plan\gates'
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $dir "$sid.json") -Value '{{{ not json'
+    $statePath = Get-StatePath $sid
+    New-Item -ItemType Directory -Path (Split-Path $statePath -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $statePath -Value '{{{ not json'
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
+}
+
+Test-Case 'a state file with no owner is never adopted' {
+    # preToolUse is fail-closed, so a hand-edited or truncated file must not be able to deny
+    # tools in a session it has nothing to do with.
+    $sid = New-SessionId
+    $statePath = Get-StatePath $sid
+    New-Item -ItemType Directory -Path (Split-Path $statePath -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $statePath -Value '{"totalInvocations":30,"architectureAttempts":10,"architectureVerdict":"ISSUES","securityVerdict":"pending","privacyVerdict":"pending"}'
+    $args_ = '{"agent_type":"autodev-plan:autodev-architecture-review"}'
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $args_ })
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
     Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
 }
@@ -163,10 +218,13 @@ Test-Case 'empty stdin returns empty JSON and exits 0' {
     Assert-Equal '{}' ($out | Out-String).Trim()
 }
 
-Test-Case 'a hostile session id cannot escape the gates directory' {
-    Invoke-Hook 'subagentStart' @{ sessionId = '../../evil'; agentName = 'autodev-plan:autodev-security-review' } | Out-Null
-    if (Test-Path -LiteralPath (Join-Path $script:Root 'evil.json')) {
-        throw 'state file was written outside the gates directory'
+Test-Case 'a hostile session id cannot escape the state directory' {
+    $sid = '../../evil'
+    Invoke-Hook 'subagentStart' @{ sessionId = $sid; agentName = 'autodev-plan:autodev-security-review'; cwd = (Get-SessionCwd 'hostile-id-cwd') } | Out-Null
+    foreach ($stray in @('evil.json', 'evil.md')) {
+        if (Test-Path -LiteralPath (Join-Path $script:Root $stray)) {
+            throw "state file '$stray' was written outside the state directory"
+        }
     }
 }
 
@@ -192,13 +250,21 @@ Test-Case 'ask_user is denied while gating' {
 foreach ($tool in @('view', 'edit', 'create', 'task', 'bash', 'powershell', 'grep', 'glob')) {
     $t = $tool
     Test-Case "'$t' is NOT denied while gating" {
-        # Defense in depth. hooks.json scopes this hook to ask_user, but if that matcher were
-        # ever broadened the orchestrator would be denied the task tool it needs to invoke the
-        # next gate, and would then deadlock against the agentStop block.
+        # Defense in depth. hooks.json scopes this hook to ask_user and task, but if that
+        # matcher were ever broadened the orchestrator would be denied the tools it needs to
+        # revise the plan and invoke the next gate, and would then deadlock against the
+        # agentStop block. 'task' must stay allowed while a gate still has attempts left.
         $sid = New-SessionId
         Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
         Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = $t })
     }.GetNewClosure()
+}
+
+Test-Case 'invoking a reviewer is permitted while the gate still has attempts left' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+    $args_ = '{"agent_type":"autodev-plan:autodev-architecture-review","prompt":"review"}'
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $args_ })
 }
 
 Test-Case 'agentStop names the next gate once one passes' {
@@ -221,16 +287,24 @@ Test-Case 'all gates passing releases the block and permits ask_user' {
 Write-Host "`nLoop bounds" -ForegroundColor Cyan
 # ------------------------------------------------------------------------------------------
 
-Test-Case 'a gate escalates after 5 failed attempts and unlocks the human' {
+Test-Case 'a gate escalates after 10 failed attempts and unlocks the human' {
     $sid = New-SessionId
-    1..5 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
     Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' }) 'escalation must release the stop block'
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' }) 'escalation must re-permit ask_user'
 }
 
+Test-Case 'a gate does NOT escalate one attempt short of the budget' {
+    # Guards the off-by-one directly: 9 failures must still be a live gate.
+    $sid = New-SessionId
+    1..9 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    $parsed = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $parsed.decision 'the gate still has an attempt left, so stopping must still be blocked'
+}
+
 Test-Case 'escalation names the gate that is actually stuck' {
     $sid = New-SessionId
-    1..5 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
     # A different gate reports next; the footer must still point at architecture.
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'security' -Verdict 'ISSUES')
     Assert-Match 'architecture gate' $footer
@@ -241,7 +315,7 @@ Test-Case 're-gating a passed gate starts a fresh attempt budget' {
     1..3 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES')
-    Assert-Match 'Attempt 1 of 5' $footer 'a re-gate must not inherit the previous pass count'
+    Assert-Match 'Attempt 1 of 10' $footer 'a re-gate must not inherit the previous pass count'
 }
 
 Test-Case 'the block counter stops fighting the CLI runaway guard' {
@@ -257,14 +331,91 @@ Test-Case 'the block counter stops fighting the CLI runaway guard' {
 Test-Case 'the session-wide invocation ceiling escalates a runaway cascade' {
     $sid = New-SessionId
     $escalated = $false
-    foreach ($i in 1..10) {
+    foreach ($i in 1..20) {
         foreach ($gate in @('architecture', 'security', 'privacy')) {
             $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate $gate -Verdict 'PASS')
             if ($footer -match 'permitted reviewer invocations') { $escalated = $true; break }
         }
         if ($escalated) { break }
     }
-    if (-not $escalated) { throw 'cascade never hit the 20-invocation ceiling' }
+    if (-not $escalated) { throw 'cascade never hit the session-wide invocation ceiling' }
+}
+
+Test-Case 'the session-wide ceiling leaves room for every gate to spend its budget' {
+    # If the ceiling were at or below (gates * per-gate budget) it would silently become the
+    # real limit and the per-gate budget would never be reachable on the last gate.
+    $sid = New-SessionId
+    foreach ($gate in @('architecture', 'security')) {
+        1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate $gate -Verdict 'ISSUES' | Out-Null }
+        Invoke-Round -SessionId $sid -Gate $gate -Verdict 'PASS' | Out-Null
+    }
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'privacy' -Verdict 'ISSUES')
+    Assert-Match 'Attempt 1 of 10' $footer
+    Assert-Match '9 attempt\(s\) remain' $footer 'the last gate must still get a full budget'
+}
+
+# ------------------------------------------------------------------------------------------
+Write-Host "`nBudget exhaustion actually stops the loop" -ForegroundColor Cyan
+# ------------------------------------------------------------------------------------------
+
+function Invoke-ReviewerTask {
+    param([string]$SessionId, [string]$Gate)
+    $args_ = "{`"agent_type`":`"autodev-plan:autodev-$Gate-review`",`"prompt`":`"review`"}"
+    return Invoke-Hook 'preToolUse' @{ sessionId = $SessionId; toolName = 'task'; toolArgs = $args_ }
+}
+
+Test-Case 'once a gate is out of attempts, re-invoking any reviewer is refused' {
+    # The footer only *asks* the orchestrator to stop. This is what makes the cap real: an
+    # orchestrator that ignores the escalation instruction still cannot start an 11th review.
+    $sid = New-SessionId
+    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    $parsed = (Invoke-ReviewerTask -SessionId $sid -Gate 'architecture') | ConvertFrom-Json
+    Assert-Equal 'deny' $parsed.permissionDecision
+    Assert-Match 'out of budget' $parsed.permissionDecisionReason
+    Assert-Match 'architecture' $parsed.permissionDecisionReason
+}
+
+Test-Case 'a stuck gate also blocks moving on to a different reviewer' {
+    # Skipping ahead to the next gate would produce a plan that never cleared architecture.
+    $sid = New-SessionId
+    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    $parsed = (Invoke-ReviewerTask -SessionId $sid -Gate 'security') | ConvertFrom-Json
+    Assert-Equal 'deny' $parsed.permissionDecision
+}
+
+Test-Case 'the refusal does not spill over onto non-reviewer sub-agents' {
+    # The orchestrator may still need explore or general-purpose agents to write up the
+    # escalation, so only reviewer invocations are refused.
+    $sid = New-SessionId
+    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    foreach ($agent in @('explore', 'general-purpose', 'code-review', 'security-review')) {
+        $args_ = "{`"agent_type`":`"$agent`",`"prompt`":`"go`"}"
+        Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $args_ }) "'$agent' must still be allowed"
+    }
+}
+
+Test-Case 'malformed task arguments never deny the tool call' {
+    $sid = New-SessionId
+    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    foreach ($bad in @('', 'not json at all', '{"no_agent_type":1}', '[]')) {
+        Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $bad }) "toolArgs '$bad' must fail open"
+    }
+}
+
+Test-Case 'reviewers are refused once the session-wide ceiling is reached' {
+    $sid = New-SessionId
+    $hit = $false
+    foreach ($i in 1..20) {
+        foreach ($gate in @('architecture', 'security', 'privacy')) {
+            $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate $gate -Verdict 'PASS')
+            if ($footer -match 'permitted reviewer invocations') { $hit = $true; break }
+        }
+        if ($hit) { break }
+    }
+    if (-not $hit) { throw 'never reached the session-wide ceiling' }
+    $parsed = (Invoke-ReviewerTask -SessionId $sid -Gate 'architecture') | ConvertFrom-Json
+    Assert-Equal 'deny' $parsed.permissionDecision
+    Assert-Match 'permitted reviewer invocations' $parsed.permissionDecisionReason
 }
 
 # ------------------------------------------------------------------------------------------
@@ -294,7 +445,7 @@ Test-Case 'every reviewer invocation is recorded' {
     $sid = New-SessionId
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
-    $audit = Join-Path $script:Root "autodev-plan\gates\$sid.md"
+    $audit = Get-AuditPath $sid
     if (-not (Test-Path -LiteralPath $audit)) { throw "no audit trail at $audit" }
     $rows = @((Get-Content -LiteralPath $audit) | Where-Object { $_ -match '^\|\s+\d{4}-' })
     Assert-Equal 4 $rows.Count 'expected two invoked rows and two completed rows'
@@ -305,8 +456,187 @@ Test-Case 'every reviewer invocation is recorded' {
 Test-Case 'state writes leave no orphaned temp files' {
     $sid = New-SessionId
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
-    $stray = @(Get-ChildItem -LiteralPath (Join-Path $script:Root 'autodev-plan\gates') -Filter '*.tmp' -ErrorAction SilentlyContinue)
+    $stray = @(Get-ChildItem -LiteralPath (Split-Path (Get-StatePath $sid) -Parent) -Filter '*.tmp' -ErrorAction SilentlyContinue)
     Assert-Equal 0 $stray.Count 'temp files must be renamed away or cleaned up'
+}
+
+# ------------------------------------------------------------------------------------------
+Write-Host "`nDeveloper-visible artifacts under .autodev/" -ForegroundColor Cyan
+# ------------------------------------------------------------------------------------------
+
+Test-Case 'state, mirror, audit trail and feedback log are all reachable' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+    foreach ($path in @((Get-StatePath $sid), (Get-MirrorPath $sid), (Get-AuditPath $sid), (Get-FeedbackPath $sid))) {
+        if (-not (Test-Path -LiteralPath $path)) { throw "expected $path to exist" }
+    }
+}
+
+Test-Case 'enforcement state lives outside the workspace, the mirror inside it' {
+    # The orchestrator may edit workspace files while gating, so anything it could rewrite is
+    # not enforcement. Only a read-only view belongs in .autodev.
+    $sid = New-SessionId
+    $cwd = Get-SessionCwd $sid
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+    if ((Get-StatePath $sid).StartsWith($cwd, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'enforcement state must not live inside the workspace'
+    }
+    $mirror = (Get-Content -LiteralPath (Get-MirrorPath $sid) -Raw | ConvertFrom-Json)
+    Assert-Equal 1 $mirror.architectureAttempts 'the mirror must reflect the real state'
+    Assert-Equal 'ISSUES' $mirror.architectureVerdict
+}
+
+Test-Case 'tampering with the mirror does not weaken a gate' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+    Set-Content -LiteralPath (Get-MirrorPath $sid) -Value '{"sessionId":"x","architectureVerdict":"PASS","securityVerdict":"PASS","privacyVerdict":"PASS","architectureAttempts":1,"securityAttempts":1,"privacyAttempts":1,"totalInvocations":3,"blocks":0}'
+    $parsed = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $parsed.decision 'rewriting the mirror must not release the gate'
+}
+
+Test-Case 'two sessions in one directory keep independent attempt counters' {
+    # This is what makes the caps real. If sessions shared one state file they would reset each
+    # other and no gate would ever reach its limit.
+    $shared = Get-SessionCwd (New-SessionId)
+    $a = New-SessionId
+    $b = New-SessionId
+    foreach ($i in 1..6) {
+        foreach ($sid in @($a, $b)) {
+            Invoke-Hook 'subagentStart' @{ sessionId = $sid; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+            Invoke-Hook 'subagentStop' @{ sessionId = $sid; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "finding`n`nAUTODEV-VERDICT: ISSUES" } | Out-Null
+        }
+    }
+    foreach ($sid in @($a, $b)) {
+        $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+        Assert-Equal 6 $state.architectureAttempts "session $sid lost attempts to the other session"
+        # Both are past the 10-attempt cap only after 10; at 6 they are still gating.
+        $args_ = '{"agent_type":"autodev-plan:autodev-architecture-review"}'
+        Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; cwd = $shared; toolName = 'task'; toolArgs = $args_ })
+    }
+    # Take one session all the way to its cap; the other must be unaffected.
+    foreach ($i in 1..4) {
+        Invoke-Hook 'subagentStart' @{ sessionId = $a; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+        Invoke-Hook 'subagentStop' @{ sessionId = $a; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "finding`n`nAUTODEV-VERDICT: ISSUES" } | Out-Null
+    }
+    $args2 = '{"agent_type":"autodev-plan:autodev-architecture-review"}'
+    $denied = Invoke-Hook 'preToolUse' @{ sessionId = $a; cwd = $shared; toolName = 'task'; toolArgs = $args2 } | ConvertFrom-Json
+    Assert-Equal 'deny' $denied.permissionDecision 'the session at its cap must be refused'
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $b; cwd = $shared; toolName = 'task'; toolArgs = $args2 }) 'the other session must keep its own budget'
+}
+
+Test-Case 'the audit trail is reset once per session, not on every invocation' {
+    $sid = New-SessionId
+    1..3 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    $rows = @((Get-Content -LiteralPath (Get-AuditPath $sid)) | Where-Object { $_ -match '^\|\s+\d{4}-' })
+    Assert-Equal 6 $rows.Count 'three rounds must leave six rows, not one'
+    $entries = @((Get-Content -LiteralPath (Get-FeedbackPath $sid)) | Where-Object { $_ -match '^# \w+ - attempt ' })
+    Assert-Equal 3 $entries.Count 'three rounds must leave three feedback entries'
+}
+
+Test-Case 'the feedback log records each reviewer response verbatim' {
+    $sid = New-SessionId
+    Start-Gate -SessionId $sid -Gate 'architecture'
+    Stop-Gate -SessionId $sid -Gate 'architecture' `
+        -Response "### blocker Unbounded retry loop`nThe worker never gives up.`n`nAUTODEV-VERDICT: ISSUES" | Out-Null
+    $log = Get-Content -LiteralPath (Get-FeedbackPath $sid) -Raw
+    Assert-Match 'blocker Unbounded retry loop' $log 'the reviewer findings must be preserved'
+    Assert-Match 'The worker never gives up\.' $log
+    Assert-Match '(?m)^# architecture - attempt 1 - ISSUES\r?$' $log 'entries must be labelled with gate, attempt and verdict'
+}
+
+Test-Case 'the feedback log accumulates every attempt of every gate' {
+    $sid = New-SessionId
+    Start-Gate -SessionId $sid -Gate 'architecture'
+    Stop-Gate -SessionId $sid -Gate 'architecture' -Response "First round finding.`n`nAUTODEV-VERDICT: ISSUES" | Out-Null
+    Start-Gate -SessionId $sid -Gate 'architecture'
+    Stop-Gate -SessionId $sid -Gate 'architecture' -Response "Now resolved.`n`nAUTODEV-VERDICT: PASS" | Out-Null
+    Start-Gate -SessionId $sid -Gate 'security'
+    Stop-Gate -SessionId $sid -Gate 'security' -Response "Secrets in logs.`n`nAUTODEV-VERDICT: ISSUES" | Out-Null
+    $log = Get-Content -LiteralPath (Get-FeedbackPath $sid) -Raw
+    foreach ($needle in @('First round finding', 'Now resolved', 'Secrets in logs')) {
+        Assert-Match $needle $log "the log must keep every round, missing '$needle'"
+    }
+    Assert-Match '(?m)^# security - attempt 1 - ISSUES\r?$' $log
+}
+
+Test-Case 'the footer points the orchestrator at the feedback log when gating finishes' {
+    $sid = New-SessionId
+    foreach ($gate in @('architecture', 'security')) {
+        Invoke-Round -SessionId $sid -Gate $gate -Verdict 'PASS' | Out-Null
+    }
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'privacy' -Verdict 'PASS')
+    Assert-Match 'feedback-log\.md' $footer
+    Assert-Match 'gate-audit\.md' $footer
+}
+
+Test-Case 'a new session does not inherit a previous run left in the same directory' {
+    # The files sit at fixed paths now, so a stale run must never hand a fresh session three
+    # passing gates or append its rows to the old session's audit trail.
+    $shared = Get-SessionCwd (New-SessionId)
+    $first = New-SessionId
+    foreach ($gate in @('architecture', 'security', 'privacy')) {
+        Invoke-Hook 'subagentStart' @{ sessionId = $first; cwd = $shared; agentName = "autodev-plan:autodev-$gate-review" } | Out-Null
+        Invoke-Hook 'subagentStop' @{ sessionId = $first; cwd = $shared; agentName = "autodev-plan:autodev-$gate-review"; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
+    }
+
+    $second = New-SessionId
+    # Before the new session runs anything, its gates must read as untouched.
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $second; cwd = $shared; stopReason = 'end_turn' }) 'an idle session must not be blocked'
+
+    Invoke-Hook 'subagentStart' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    Invoke-Hook 'subagentStop' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
+
+    # Count before the agentStop below, which legitimately adds its own blocked-stop row.
+    $audit = Join-Path (Join-Path $shared '.autodev') 'gate-audit.md'
+    $rows = @((Get-Content -LiteralPath $audit) | Where-Object { $_ -match '^\|\s+\d{4}-' })
+    Assert-Equal 2 $rows.Count 'the audit trail must restart for the new session'
+
+    $parsed = Invoke-Hook 'agentStop' @{ sessionId = $second; cwd = $shared; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $parsed.decision 'the old session''s security and privacy passes must not carry over'
+}
+
+Test-Case 'the feedback log stamps each entry with a readable timestamp' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+    $log = Get-Content -LiteralPath (Get-FeedbackPath $sid) -Raw
+    Assert-Match '_\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}Z_' $log 'each entry needs a timestamp, not an empty marker'
+}
+
+Test-Case 'non-ASCII reviewer text survives the round trip' {
+    # Reviewers routinely emit en dashes and curly quotes. Decoding stdin with the console code
+    # page corrupts them in both the feedback log and the footer handed back to the orchestrator.
+    $sid = New-SessionId
+    $dash = [char]0x2013
+    $quote = [char]0x2019
+    Start-Gate -SessionId $sid -Gate 'architecture'
+    $out = Stop-Gate -SessionId $sid -Gate 'architecture' `
+        -Response "Rows 4${dash}6 use the client${quote}s token.`n`nAUTODEV-VERDICT: ISSUES"
+    $footer = Get-Footer $out
+    Assert-Match "4${dash}6" $footer 'the footer must preserve the reviewer text verbatim'
+    $log = [IO.File]::ReadAllText((Get-FeedbackPath $sid), [Text.Encoding]::UTF8)
+    Assert-Match "4${dash}6" $log 'the feedback log must preserve the reviewer text verbatim'
+    Assert-Match "client${quote}s" $log
+}
+
+Test-Case 'unrelated tool calls and sub-agents do not create a .autodev directory' {
+    # The hooks fire in every session once the plugin is installed. Creating the state directory
+    # eagerly would litter an empty '.autodev' into any repo where someone merely used the task
+    # tool. It must appear only when a real review gate starts.
+    $sid = New-SessionId
+    $cwd = Get-SessionCwd $sid
+    Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = '{"agent_type":"explore"}' } | Out-Null
+    Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' } | Out-Null
+    Invoke-Hook 'subagentStart' @{ sessionId = $sid; agentName = 'explore' } | Out-Null
+    Invoke-Hook 'subagentStop' @{ sessionId = $sid; agentName = 'explore'; response = 'done' } | Out-Null
+    Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | Out-Null
+    if (Test-Path -LiteralPath (Join-Path $cwd '.autodev')) {
+        throw '.autodev was created by a session that never ran a review gate'
+    }
+    # ...but a real gate does create it.
+    Invoke-Hook 'subagentStart' @{ sessionId = $sid; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    if (-not (Test-Path -LiteralPath (Join-Path $cwd '.autodev'))) {
+        throw '.autodev was not created when a review gate started'
+    }
 }
 
 # ------------------------------------------------------------------------------------------
@@ -384,11 +714,14 @@ Test-Case 'the subagentStart matcher ignores unrelated sub-agents' {
     }
 }
 
-Test-Case 'the preToolUse matcher is scoped to ask_user only' {
+Test-Case 'the preToolUse matcher covers ask_user and task, and nothing else' {
     $pattern = $script:Hooks.hooks.preToolUse[0].matcher
     if (-not $pattern) { throw 'preToolUse has no matcher; it would fire for every tool call' }
-    if (-not (Test-Matcher $pattern 'ask_user')) { throw "matcher does not match 'ask_user'" }
-    foreach ($tool in @('view', 'edit', 'create', 'task', 'bash', 'powershell', 'grep', 'glob', 'web_fetch')) {
+    foreach ($tool in @('ask_user', 'task')) {
+        # 'task' must reach the hook so budget exhaustion can refuse further reviewer runs.
+        if (-not (Test-Matcher $pattern $tool)) { throw "matcher does not match '$tool'" }
+    }
+    foreach ($tool in @('view', 'edit', 'create', 'bash', 'powershell', 'grep', 'glob', 'web_fetch')) {
         if (Test-Matcher $pattern $tool) { throw "matcher wrongly matches '$tool'" }
     }
 }

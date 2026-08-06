@@ -5,10 +5,14 @@
 # writes exactly one JSON object to stdout.
 #
 #   subagentStart - record that a review gate was invoked; increment its attempt counter.
-#   subagentStop  - parse the reviewer's verdict, record it, and append a tracker footer to
-#                   the response the orchestrator receives.
+#   subagentStop  - parse the reviewer's verdict, record it, log the reviewer's full feedback,
+#                   and append a tracker footer to the response the orchestrator receives.
 #   agentStop     - block the orchestrator from ending its turn while gates are outstanding.
-#   preToolUse    - deny ask_user while gating, so the gate phase stays autonomous.
+#   preToolUse    - deny ask_user while gating, so the gate phase stays autonomous, and deny
+#                   further reviewer invocations once the attempt budget is spent.
+#
+# All three artifacts are written into '<session cwd>/.autodev/' so a developer can watch a run
+# in progress and read the reviews afterwards, next to the plan the gates are reviewing.
 #
 # SAFETY: preToolUse command hooks are fail-closed - any non-zero exit or crash denies the
 # tool call. A bug here would permanently break ask_user, so this script never uses `set -e`,
@@ -32,26 +36,54 @@ printf '%s' "$RAW_INPUT" | jq -e . >/dev/null 2>&1 || emit_empty
 
 GATE_ORDER="architecture security privacy"
 # Per gate, per pass. A gate that is re-run after previously passing starts a fresh budget.
-MAX_ATTEMPTS=5
+MAX_ATTEMPTS=10
 # Kept below the CLI's own 8-block runaway guard so we surrender first.
 MAX_BLOCKS=5
 # Absolute ceiling across all gates and all re-gate passes. Because a re-gate resets a gate's
-# per-pass budget, this is what makes an unbounded re-gate cascade impossible.
-MAX_TOTAL_INVOCATIONS=20
-
-COPILOT_HOME_DIR="${COPILOT_HOME:-$HOME/.copilot}"
-STATE_DIR="$COPILOT_HOME_DIR/autodev-plan/gates"
-mkdir -p "$STATE_DIR" 2>/dev/null || emit_empty
+# per-pass budget, this is what makes an unbounded re-gate cascade impossible. Must stay above
+# (number of gates * MAX_ATTEMPTS), or it would fire before a single pass could spend the
+# per-gate budget and would silently become the real limit.
+MAX_TOTAL_INVOCATIONS=40
 
 json_get() { printf '%s' "$RAW_INPUT" | jq -r "$1 // \"\"" 2>/dev/null; }
 
 SESSION_ID="$(json_get '.sessionId')"
+SESSION_CWD="$(json_get '.cwd')"
+
+# Enforcement state lives at '<COPILOT_HOME>/autodev-plan/gates/<sessionId>.json', outside the
+# workspace and keyed by session. That matters for two reasons: concurrent sessions in one
+# repository must not clobber each other's attempt counters, and the orchestrator is allowed to
+# edit files in the workspace, so state it could rewrite would not be enforcement at all.
+#
+# A mirror of that state, the audit trail and the reviewer feedback log are written into
+# '<session cwd>/.autodev/' so a developer can watch a run in progress and read the reviews
+# afterwards. Those three files are a *view*: nothing reads them back, so tampering with them
+# cannot weaken a gate.
+#
+# Paths are resolved here but nothing is created; see ensure_dir. The hook runs on every matching
+# event in every session, and creating directories eagerly would litter an empty '.autodev' into
+# any repository where an unrelated session happened to call the task tool.
+COPILOT_HOME_DIR="${COPILOT_HOME:-$HOME/.copilot}"
+STATE_DIR="$COPILOT_HOME_DIR/autodev-plan/gates"
+
+if [ -n "$SESSION_CWD" ] && [ -d "$SESSION_CWD" ]; then
+  VIEW_DIR="$SESSION_CWD/.autodev"
+else
+  VIEW_DIR="$STATE_DIR"
+fi
+
+# Called only once a real review gate has been identified, so directories appear exactly when the
+# workflow starts using them.
+ensure_dir() { [ -d "$1" ] || mkdir -p "$1" 2>/dev/null; }
+
 # Defend against path traversal via a hostile session id.
 SAFE_SESSION_ID="$(printf '%s' "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')"
 [ -n "$SAFE_SESSION_ID" ] || SAFE_SESSION_ID="unknown-session"
 
 STATE_PATH="$STATE_DIR/$SAFE_SESSION_ID.json"
-AUDIT_PATH="$STATE_DIR/$SAFE_SESSION_ID.md"
+MIRROR_PATH="$VIEW_DIR/gate-status.json"
+AUDIT_PATH="$VIEW_DIR/gate-audit.md"
+FEEDBACK_PATH="$VIEW_DIR/feedback-log.md"
 
 default_state() {
   jq -n --arg sid "$SAFE_SESSION_ID" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
@@ -64,6 +96,15 @@ default_state() {
 
 read_state() {
   if [ -f "$STATE_PATH" ] && jq -e . "$STATE_PATH" >/dev/null 2>&1; then
+    # State is keyed by session id in its filename, so a mismatch should be impossible. Require
+    # an exact match anyway: adopting a file whose owner is unknown or missing would let a
+    # hand-edited or truncated file drive enforcement in a session it has nothing to do with.
+    local owner
+    owner="$(jq -r '.sessionId // ""' "$STATE_PATH" 2>/dev/null)"
+    if [ "$owner" != "$SAFE_SESSION_ID" ]; then
+      default_state
+      return
+    fi
     # Merge over defaults so a partial or older state file still yields every field.
     jq -s '.[0] * .[1]' <(default_state) "$STATE_PATH" 2>/dev/null || default_state
   else
@@ -81,6 +122,11 @@ write_state() {
     | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.updatedAt = $now' \
     > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE_PATH" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
+  # Best-effort human-facing copy. Nothing ever reads this back, so a failure here must not
+  # affect enforcement.
+  [ -f "$STATE_PATH" ] && [ "$MIRROR_PATH" != "$STATE_PATH" ] &&
+    cp -f "$STATE_PATH" "$MIRROR_PATH" 2>/dev/null
+  return 0
 }
 
 state_num() { printf '%s' "$1" | jq -r ".$2 // 0" 2>/dev/null; }
@@ -104,9 +150,42 @@ add_audit_row() {
     >> "$AUDIT_PATH" 2>/dev/null
 }
 
-# agentName arrives namespaced, e.g. "autodev-plan:autodev-privacy-review".
+add_feedback_entry() {
+  local gate="$1" attempt="$2" verdict="$3" response="$4"
+  if [ ! -f "$FEEDBACK_PATH" ]; then
+    {
+      printf '# autodev-plan reviewer feedback log\n\n'
+      printf 'Session: `%s`\n' "$SAFE_SESSION_ID"
+      printf 'Started: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+      printf "Each entry is the reviewer sub-agent's verbatim response, captured by a hook as the\n"
+      printf 'sub-agent finished. The orchestrator cannot edit this file, so it records what the\n'
+      printf 'reviewers actually said rather than what the orchestrator chose to relay.\n'
+    } > "$FEEDBACK_PATH" 2>/dev/null
+  fi
+  [ -n "$response" ] || response='_(the reviewer returned no content)_'
+  {
+    printf '\n---\n\n'
+    # Level 1: reviewers use '##' and '###' for their own sections, so an entry header at the
+    # same level would be indistinguishable from the content it introduces.
+    printf '# %s - attempt %s - %s\n\n' "$gate" "$attempt" "$verdict"
+    printf '_%s_\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    printf '%s\n' "$response"
+  } >> "$FEEDBACK_PATH" 2>/dev/null
+}
+
+# toolArgs arrives as a JSON *string* rather than an object, so it needs a second parse.
+get_task_agent_type() {
+  printf '%s' "$RAW_INPUT" \
+    | jq -r '(.toolArgs // "") | if type == "string" then (fromjson? // {}) else . end
+             | .agent_type // ""' 2>/dev/null
+}
+
+# agentName arrives namespaced, e.g. "autodev-plan:autodev-privacy-review". Trailing whitespace
+# is tolerated to match the PowerShell implementation.
 resolve_gate() {
-  case "$1" in
+  local name
+  name="$(printf '%s' "$1" | sed 's/[[:space:]]*$//')"
+  case "$name" in
     *autodev-architecture-review) printf 'architecture' ;;
     *autodev-security-review)     printf 'security' ;;
     *autodev-privacy-review)      printf 'privacy' ;;
@@ -160,14 +239,14 @@ get_gate_status_line() {
 # The contract requires the verdict on the FINAL line. Scanning the whole body would let a
 # reviewer that merely mentions a verdict mid-sentence ("I would say AUTODEV-VERDICT: PASS if X
 # were fixed") be recorded as a pass. Judge only the last meaningful line, ignoring blank lines
-# and a trailing code fence; anything unexpected falls through to ISSUES.
+# and a fence occupying a line by itself; anything unexpected falls through to ISSUES.
 read_verdict() {
   local last
   last="$(printf '%s\n' "$1" \
     | tr -d '\r' \
     | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
     | grep -v '^$' \
-    | grep -v '^```' \
+    | grep -vE '^`{3,}[A-Za-z0-9]*$' \
     | tail -n 1)"
   if printf '%s' "$last" \
     | grep -qiE '^[*`>_-]*[[:space:]]*AUTODEV-VERDICT:[[:space:]]*PASS[*`.[:space:]]*$'; then
@@ -196,6 +275,14 @@ case "$EVENT_NAME" in
   subagentStart)
     GATE="$(resolve_gate "$(json_get '.agentName')")"
     [ -n "$GATE" ] || emit_empty
+    ensure_dir "$STATE_DIR" || emit_empty
+    ensure_dir "$VIEW_DIR"
+    if [ "$(state_num "$STATE" 'totalInvocations')" -eq 0 ] 2>/dev/null; then
+      # First gate of this session. The developer-facing artifacts live at fixed paths in the
+      # workspace, so clear anything an earlier run left behind rather than appending this
+      # session's rows to a stale file. State is per session, so this fires exactly once.
+      rm -f "$AUDIT_PATH" "$FEEDBACK_PATH" 2>/dev/null
+    fi
     if [ "$(state_str "$STATE" "${GATE}Verdict")" = "PASS" ]; then
       # This gate already passed, so this is a re-gate after a material change.
       # Start a fresh per-pass budget rather than charging it the old pass's attempts.
@@ -226,6 +313,8 @@ case "$EVENT_NAME" in
     # subagentStop does not support a matcher, so filter here.
     GATE="$(resolve_gate "$(json_get '.agentName')")"
     [ -n "$GATE" ] || emit_empty
+    ensure_dir "$STATE_DIR"
+    ensure_dir "$VIEW_DIR"
 
     RESPONSE="$(json_get '.response')"
     VERDICT="$(read_verdict "$RESPONSE")"
@@ -237,20 +326,26 @@ case "$EVENT_NAME" in
       ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
+    # Capture the review itself, not just that it happened, so the findings survive the session
+    # and a developer can see what each gate actually objected to.
+    add_feedback_entry "$GATE" "$ATTEMPTS" "$VERDICT" "$RESPONSE"
 
     PHASE="$(get_phase "$STATE")"
     STATUS_LINE="$(get_gate_status_line "$STATE")"
 
     if [ "$PHASE" = "complete" ]; then
       NEXT_ACTION="Next required action: all three gates have passed. Proceed to WRAPUP.
-Audit trail: $AUDIT_PATH"
+Audit trail: $AUDIT_PATH
+Reviewer feedback log: $FEEDBACK_PATH"
     elif [ "$PHASE" = "escalated" ]; then
       if [ "$(state_num "$STATE" 'totalInvocations')" -ge "$MAX_TOTAL_INVOCATIONS" ] 2>/dev/null; then
-        NEXT_ACTION="Next required action: the review gates have used all $MAX_TOTAL_INVOCATIONS permitted reviewer invocations for this session without reaching a clean state. Stop looping and escalate to the user now, per your escalation protocol. ask_user is permitted again.
-Audit trail: $AUDIT_PATH"
+        NEXT_ACTION="Next required action: the review gates have used all $MAX_TOTAL_INVOCATIONS permitted reviewer invocations for this session without reaching a clean state. Stop looping and escalate to the user now, per your escalation protocol. ask_user is permitted again, and further reviewer invocations are now refused.
+Audit trail: $AUDIT_PATH
+Reviewer feedback log: $FEEDBACK_PATH"
       else
-        NEXT_ACTION="Next required action: the $(get_stuck_gates "$STATE") gate(s) reached the $MAX_ATTEMPTS-attempt limit without passing. Stop looping and escalate to the user now, per your escalation protocol. ask_user is permitted again. This session can no longer reach a clean 'all gates passed' state; say so plainly at wrap-up.
-Audit trail: $AUDIT_PATH"
+        NEXT_ACTION="Next required action: the $(get_stuck_gates "$STATE") gate(s) reached the $MAX_ATTEMPTS-attempt limit without passing. Stop looping and escalate to the user now, per your escalation protocol. ask_user is permitted again, and further reviewer invocations are now refused. This session can no longer reach a clean 'all gates passed' state; say so plainly at wrap-up.
+Audit trail: $AUDIT_PATH
+Reviewer feedback log: $FEEDBACK_PATH"
       fi
     elif [ "$VERDICT" = "PASS" ]; then
       NEXT_GATE="$(get_next_gate "$STATE")"
@@ -299,17 +394,44 @@ $FOOTER" '{modifiedResponse: $r}'
     ;;
 
   preToolUse)
-    # hooks.json restricts this hook to ask_user via a matcher, but do not rely on that alone:
-    # without this check a broadened or missing matcher would deny *every* tool while gating,
-    # including the task tool the orchestrator needs to invoke the next gate, deadlocking it
+    # hooks.json restricts this hook to ask_user and task via a matcher, but do not rely on that
+    # alone: without this check a broadened or missing matcher would deny *every* tool while
+    # gating, including the tools the orchestrator needs to revise the plan, deadlocking it
     # against the agentStop block.
-    case "$(json_get '.toolName')" in
-      ask_user | AskUserQuestion) ;;
+    TOOL_NAME="$(json_get '.toolName')"
+    # Lower-cased to match the PowerShell implementation's case-insensitive comparison.
+    case "$(printf '%s' "$TOOL_NAME" | tr 'A-Z' 'a-z')" in
+      ask_user | askuserquestion | task) ;;
       *) emit_empty ;;
     esac
 
     [ -f "$STATE_PATH" ] || emit_empty
-    [ "$(get_phase "$STATE")" = "gating" ] || emit_empty
+    PHASE="$(get_phase "$STATE")"
+
+    if [ "$(printf '%s' "$TOOL_NAME" | tr 'A-Z' 'a-z')" = "task" ]; then
+      # Everything else in this plugin only *asks* the orchestrator to stop looping once a gate
+      # is out of attempts. This is the part that actually stops it: once the budget is spent,
+      # refuse to start another reviewer. Without it an orchestrator that ignores the escalation
+      # instruction can keep re-invoking a gate past its cap, which is exactly what the cap
+      # exists to prevent.
+      [ "$PHASE" = "escalated" ] || emit_empty
+
+      TARGET_GATE="$(resolve_gate "$(get_task_agent_type)")"
+      [ -n "$TARGET_GATE" ] || emit_empty
+
+      STUCK="$(get_stuck_gates "$STATE")"
+      if [ -n "$STUCK" ]; then
+        LIMIT_REASON="the $STUCK gate(s) have used all $MAX_ATTEMPTS permitted attempts"
+      else
+        LIMIT_REASON="this session has used all $MAX_TOTAL_INVOCATIONS permitted reviewer invocations"
+      fi
+      REASON="The autodev-plan review gates are out of budget: $LIMIT_REASON. Further reviewer invocations are refused, so re-running the $TARGET_GATE gate cannot succeed. Stop looping and escalate to the user now, per your escalation protocol: say which gate is stuck, summarise its outstanding findings, point at the plan file and the feedback log, and state plainly that this session did not reach a clean 'all gates passed' state. ask_user is available again."
+
+      jq -cn --arg r "$REASON" '{permissionDecision: "deny", permissionDecisionReason: $r}'
+      exit 0
+    fi
+
+    [ "$PHASE" = "gating" ] || emit_empty
 
     NEXT_GATE="$(get_next_gate "$STATE")"
     REASON="The autodev-plan review gates run without human interaction. The $NEXT_GATE gate is still outstanding, so ask_user is unavailable. Resolve reviewer feedback yourself using your best engineering judgement and record the decision in the plan's 'Review notes' section. If you truly cannot proceed, keep looping until the gate reaches its attempt limit, at which point escalation to the user is unlocked automatically."
