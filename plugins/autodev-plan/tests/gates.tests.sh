@@ -45,6 +45,10 @@ new_session_id() {
 }
 
 hook() { # event json
+  # A malformed payload makes the hook fail open, so a test that expects '{}' would pass for
+  # entirely the wrong reason. Emit an obviously-wrong marker instead so the assertion fails
+  # loudly and names the cause.
+  printf '%s' "$2" | jq -e . >/dev/null 2>&1 || { printf 'MALFORMED-TEST-PAYLOAD'; return 1; }
   printf '%s\n' "$2" | bash "$GATE_SCRIPT" "$1"
 }
 
@@ -88,9 +92,15 @@ ask_user() { # sid
 }
 
 reviewer_task() { # sid gate
-  hook preToolUse "$(jq -cn --arg s "$1" --arg g "$2" --arg c "$(session_cwd "$1")" \
-    '{sessionId:$s, cwd:$c, toolName:"task",
-      toolArgs:("{\"agent_type\":\"autodev-plan:autodev-" + $g + "-review\",\"prompt\":\"review\"}")}')"
+  # Build the nested JSON in a variable first. macOS ships bash 3.2, whose $( ) parser
+  # mishandles parentheses inside an embedded single-quoted program, which silently produced a
+  # malformed payload -- and a malformed payload is fail-open, so the assertion that mattered
+  # (a deny) turned into a pass-through.
+  local cwd args
+  cwd="$(session_cwd "$1")"
+  args="$(jq -cn --arg a "autodev-plan:autodev-$2-review" '{agent_type:$a, prompt:"review"}')"
+  hook preToolUse "$(jq -cn --arg s "$1" --arg c "$cwd" --arg t "$args" \
+    '{sessionId:$s, cwd:$c, toolName:"task", toolArgs:$t}')"
 }
 
 fail() { CURRENT_ERROR="$1"; return 1; }
@@ -428,13 +438,14 @@ run_test "a stuck gate also blocks moving on to a different reviewer" t_refuse_o
 t_refusal_scoped_to_reviewers() {
   # The orchestrator may still need explore or general-purpose agents to write up the
   # escalation, so only reviewer invocations are refused.
-  local sid i agent out
+  local sid i agent out args cwd
   sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
   for i in $(seq 1 10); do round "$sid" architecture ISSUES > /dev/null; done
   for agent in explore general-purpose code-review security-review; do
-    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg a "$agent" --arg c "$(session_cwd "$sid")" \
-      '{sessionId:$s, cwd:$c, toolName:"task",
-        toolArgs:("{\"agent_type\":\"" + $a + "\",\"prompt\":\"go\"}")}')")"
+    args="$(jq -cn --arg a "$agent" '{agent_type:$a, prompt:"go"}')"
+    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg c "$cwd" --arg t "$args" \
+      '{sessionId:$s, cwd:$c, toolName:"task", toolArgs:$t}')")"
     assert_equal '{}' "$out" "'$agent' must still be allowed" || return 1
   done
 }
