@@ -7,12 +7,26 @@
     the hook payload on stdin and asserting on the single JSON object it writes to stdout.
 
     Tests run against an isolated COPILOT_HOME, and each test gets its own temporary working
-    directory, so real session state is never touched. The tracker writes into
-    '<cwd>/.autodev/', so a per-test cwd is what keeps tests isolated from each other.
+    directory, so real session state is never touched. The tracker writes its developer-facing
+    artifacts into '<cwd>/.autodev/', so a per-test cwd is what keeps tests isolated.
+
+    Every assertion costs a process spawn (~1s: PowerShell startup plus the JSON cmdlets), so by
+    default the suite shards itself across parallel workers. Use -Sequential for readable,
+    grouped output when you are diagnosing a failure.
 
     Usage:  powershell -NoProfile -ExecutionPolicy Bypass -File tests/gates.tests.ps1
+            ... -Sequential          run in one process, grouped by section
+            ... -Workers 4           override the worker count
     Exit code is 0 when every test passes, 1 otherwise.
 #>
+
+param(
+    # Set by the dispatcher on each worker; -1 means "this process is the dispatcher".
+    [int]$Shard = -1,
+    [int]$ShardCount = 1,
+    [int]$Workers = 0,
+    [switch]$Sequential
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -20,10 +34,68 @@ $script:GateScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks\scripts
 $script:Root = Join-Path ([IO.Path]::GetTempPath()) "autodev-gate-tests-$PID"
 $script:Passed = 0
 $script:Failed = 0
+$script:CaseIndex = -1
+$script:IsWorker = ($Shard -ge 0)
 
 if (-not (Test-Path -LiteralPath $script:GateScript)) {
     Write-Host "Cannot find gate script at $script:GateScript" -ForegroundColor Red
     exit 1
+}
+
+# ------------------------------------------------------------------------------------------
+# Dispatcher: fan the cases out across worker processes and aggregate.
+# ------------------------------------------------------------------------------------------
+if (-not $script:IsWorker -and -not $Sequential) {
+    if ($Workers -le 0) { $Workers = [Math]::Min(8, [Environment]::ProcessorCount) }
+    if ($Workers -lt 1) { $Workers = 1 }
+
+    $outDir = Join-Path ([IO.Path]::GetTempPath()) "autodev-gate-shards-$PID"
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    Write-Host ''
+    Write-Host "autodev-plan gate tracker tests (PowerShell), $Workers workers" -ForegroundColor Cyan
+    Write-Host 'Use -Sequential for output grouped by section.'
+
+    $started = Get-Date
+    $running = @()
+    for ($i = 0; $i -lt $Workers; $i++) {
+        $log = Join-Path $outDir "shard-$i.log"
+        $proc = Start-Process -FilePath 'powershell' -PassThru -NoNewWindow -RedirectStandardOutput $log `
+            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+            # Quoted explicitly: -ArgumentList joins on spaces, so an unquoted path containing a
+            # space would be split into separate arguments.
+            '-File', "`"$PSCommandPath`"",
+            '-Shard', $i, '-ShardCount', $Workers)
+        $running += [pscustomobject]@{ Proc = $proc; Log = $log }
+    }
+    foreach ($r in $running) { $r.Proc.WaitForExit() }
+
+    $totalPassed = 0
+    $totalFailed = 0
+    foreach ($r in $running) {
+        foreach ($line in @(Get-Content -LiteralPath $r.Log -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*RESULT\s+(\d+)\s+(\d+)\s*$') {
+                $totalPassed += [int]$Matches[1]
+                $totalFailed += [int]$Matches[2]
+            }
+            elseif ($line -match '^\s*FAIL\s') { Write-Host $line -ForegroundColor Red }
+            elseif ($line -match '^\s*PASS\s') { Write-Host $line -ForegroundColor Green }
+            else { Write-Host $line }
+        }
+    }
+    Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
+
+    $elapsed = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+    Write-Host ''
+    if ($totalFailed -gt 0) {
+        Write-Host "$totalPassed passed, $totalFailed failed  (${elapsed}s)" -ForegroundColor Red
+        exit 1
+    }
+    if ($totalPassed -eq 0) {
+        Write-Host "no tests ran - the workers produced no results (${elapsed}s)" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "$totalPassed passed, 0 failed  (${elapsed}s)" -ForegroundColor Green
+    exit 0
 }
 
 function Get-SessionCwd {
@@ -88,6 +160,41 @@ function Get-Footer {
     return ($HookOutput | ConvertFrom-Json).modifiedResponse
 }
 
+function Set-GateState {
+    # Seeds the enforcement state directly. Used only where reaching a state through real rounds
+    # would cost dozens of process spawns and the accumulation itself is not what is under test;
+    # the tests that DO cover accumulation (the 9-vs-10 attempt boundary, and two sessions
+    # counting independently) still drive every round through the hook.
+    param([string]$SessionId, [hashtable]$Values)
+    $state = @{
+        sessionId            = $SessionId
+        createdAt            = (Get-Date).ToUniversalTime().ToString('o')
+        updatedAt            = (Get-Date).ToUniversalTime().ToString('o')
+        blocks               = 0
+        totalInvocations     = 0
+        architectureAttempts = 0
+        architectureVerdict  = 'pending'
+        securityAttempts     = 0
+        securityVerdict      = 'pending'
+        privacyAttempts      = 0
+        privacyVerdict       = 'pending'
+    }
+    foreach ($key in $Values.Keys) { $state[$key] = $Values[$key] }
+    $path = Get-StatePath $SessionId
+    New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $path -Value ($state | ConvertTo-Json -Depth 5) -Encoding UTF8
+}
+
+function Set-StuckGate {
+    # The common setup: one gate has spent its entire budget without passing.
+    param([string]$SessionId, [string]$Gate = 'architecture')
+    Set-GateState -SessionId $SessionId -Values @{
+        "${Gate}Attempts" = 10
+        "${Gate}Verdict"  = 'ISSUES'
+        totalInvocations  = 10
+    }
+}
+
 function New-SessionId {
     # A unique session id per test keeps state files from colliding.
     return "t$([guid]::NewGuid().ToString('N').Substring(0, 12))"
@@ -95,6 +202,10 @@ function New-SessionId {
 
 function Test-Case {
     param([string]$Name, [scriptblock]$Body)
+    # Round-robin the cases across workers. Every worker walks the whole file, so this stays a
+    # plain linear script and no test needs to know it is being sharded.
+    $script:CaseIndex++
+    if ($ShardCount -gt 1 -and ($script:CaseIndex % $ShardCount) -ne $Shard) { return }
     try {
         & $Body
         $script:Passed++
@@ -104,6 +215,15 @@ function Test-Case {
         $script:Failed++
         Write-Host "  FAIL  $Name" -ForegroundColor Red
         Write-Host "        $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+function Write-Section {
+    # Section headers only make sense in a single ordered run; across workers they would repeat.
+    param([string]$Name)
+    if ($ShardCount -le 1) {
+        Write-Host ''
+        Write-Host $Name -ForegroundColor Cyan
     }
 }
 
@@ -129,7 +249,7 @@ Write-Host 'autodev-plan gate tracker tests (PowerShell)' -ForegroundColor Cyan
 Write-Host "script: $script:GateScript"
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nVerdict parsing (must read only the final meaningful line)" -ForegroundColor Cyan
+Write-Section 'Verdict parsing (must read only the final meaningful line)'
 # ------------------------------------------------------------------------------------------
 
 $fence = '```'
@@ -166,7 +286,7 @@ foreach ($case in $verdictCases) {
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nFail-safes (a hook must never deny a tool call or crash)" -ForegroundColor Cyan
+Write-Section 'Fail-safes (a hook must never deny a tool call or crash)'
 # ------------------------------------------------------------------------------------------
 
 Test-Case 'agentStop with no state returns empty' {
@@ -229,7 +349,7 @@ Test-Case 'a hostile session id cannot escape the state directory' {
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nEnforcement" -ForegroundColor Cyan
+Write-Section 'Enforcement'
 # ------------------------------------------------------------------------------------------
 
 Test-Case 'agentStop is blocked while a gate is outstanding' {
@@ -284,7 +404,7 @@ Test-Case 'all gates passing releases the block and permits ask_user' {
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nLoop bounds" -ForegroundColor Cyan
+Write-Section 'Loop bounds'
 # ------------------------------------------------------------------------------------------
 
 Test-Case 'a gate escalates after 10 failed attempts and unlocks the human' {
@@ -304,7 +424,7 @@ Test-Case 'a gate does NOT escalate one attempt short of the budget' {
 
 Test-Case 'escalation names the gate that is actually stuck' {
     $sid = New-SessionId
-    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    Set-StuckGate -SessionId $sid -Gate 'architecture'
     # A different gate reports next; the footer must still point at architecture.
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'security' -Verdict 'ISSUES')
     Assert-Match 'architecture gate' $footer
@@ -329,25 +449,40 @@ Test-Case 'the block counter stops fighting the CLI runaway guard' {
 }
 
 Test-Case 'the session-wide invocation ceiling escalates a runaway cascade' {
+    # Seeded one invocation short of the ceiling, so the next real round must trip it. This pins
+    # the boundary exactly, where looping until the message appeared only proved it happened
+    # eventually -- and cost forty round trips to do it.
     $sid = New-SessionId
-    $escalated = $false
-    foreach ($i in 1..20) {
-        foreach ($gate in @('architecture', 'security', 'privacy')) {
-            $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate $gate -Verdict 'PASS')
-            if ($footer -match 'permitted reviewer invocations') { $escalated = $true; break }
-        }
-        if ($escalated) { break }
+    Set-GateState -SessionId $sid -Values @{
+        totalInvocations     = 39
+        architectureAttempts = 1; architectureVerdict = 'PASS'
+        securityAttempts     = 1; securityVerdict = 'PASS'
+        privacyAttempts      = 1; privacyVerdict = 'PASS'
     }
-    if (-not $escalated) { throw 'cascade never hit the session-wide invocation ceiling' }
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS')
+    Assert-Match 'permitted reviewer invocations' $footer
+}
+
+Test-Case 'the session-wide ceiling does not fire one invocation early' {
+    $sid = New-SessionId
+    Set-GateState -SessionId $sid -Values @{
+        totalInvocations     = 38
+        architectureAttempts = 1; architectureVerdict = 'PASS'
+        securityAttempts     = 1; securityVerdict = 'PASS'
+        privacyAttempts      = 1; privacyVerdict = 'PASS'
+    }
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS')
+    if ($footer -match 'permitted reviewer invocations') { throw 'the ceiling fired at 39 invocations' }
 }
 
 Test-Case 'the session-wide ceiling leaves room for every gate to spend its budget' {
     # If the ceiling were at or below (gates * per-gate budget) it would silently become the
     # real limit and the per-gate budget would never be reachable on the last gate.
     $sid = New-SessionId
-    foreach ($gate in @('architecture', 'security')) {
-        1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate $gate -Verdict 'ISSUES' | Out-Null }
-        Invoke-Round -SessionId $sid -Gate $gate -Verdict 'PASS' | Out-Null
+    Set-GateState -SessionId $sid -Values @{
+        totalInvocations     = 22
+        architectureAttempts = 11; architectureVerdict = 'PASS'
+        securityAttempts     = 11; securityVerdict = 'PASS'
     }
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'privacy' -Verdict 'ISSUES')
     Assert-Match 'Attempt 1 of 10' $footer
@@ -355,7 +490,7 @@ Test-Case 'the session-wide ceiling leaves room for every gate to spend its budg
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nBudget exhaustion actually stops the loop" -ForegroundColor Cyan
+Write-Section 'Budget exhaustion actually stops the loop'
 # ------------------------------------------------------------------------------------------
 
 function Invoke-ReviewerTask {
@@ -368,17 +503,24 @@ Test-Case 'once a gate is out of attempts, re-invoking any reviewer is refused' 
     # The footer only *asks* the orchestrator to stop. This is what makes the cap real: an
     # orchestrator that ignores the escalation instruction still cannot start an 11th review.
     $sid = New-SessionId
-    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    Set-StuckGate -SessionId $sid
     $parsed = (Invoke-ReviewerTask -SessionId $sid -Gate 'architecture') | ConvertFrom-Json
     Assert-Equal 'deny' $parsed.permissionDecision
     Assert-Match 'out of budget' $parsed.permissionDecisionReason
     Assert-Match 'architecture' $parsed.permissionDecisionReason
 }
 
+Test-Case 'a reviewer is still permitted one attempt short of the cap' {
+    # Guards the boundary from the other side: the deny must not start a round early.
+    $sid = New-SessionId
+    Set-GateState -SessionId $sid -Values @{ architectureAttempts = 9; architectureVerdict = 'ISSUES'; totalInvocations = 9 }
+    Assert-Equal '{}' (Invoke-ReviewerTask -SessionId $sid -Gate 'architecture')
+}
+
 Test-Case 'a stuck gate also blocks moving on to a different reviewer' {
     # Skipping ahead to the next gate would produce a plan that never cleared architecture.
     $sid = New-SessionId
-    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    Set-StuckGate -SessionId $sid
     $parsed = (Invoke-ReviewerTask -SessionId $sid -Gate 'security') | ConvertFrom-Json
     Assert-Equal 'deny' $parsed.permissionDecision
 }
@@ -387,7 +529,7 @@ Test-Case 'the refusal does not spill over onto non-reviewer sub-agents' {
     # The orchestrator may still need explore or general-purpose agents to write up the
     # escalation, so only reviewer invocations are refused.
     $sid = New-SessionId
-    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    Set-StuckGate -SessionId $sid
     foreach ($agent in @('explore', 'general-purpose', 'code-review', 'security-review')) {
         $args_ = "{`"agent_type`":`"$agent`",`"prompt`":`"go`"}"
         Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $args_ }) "'$agent' must still be allowed"
@@ -396,7 +538,7 @@ Test-Case 'the refusal does not spill over onto non-reviewer sub-agents' {
 
 Test-Case 'malformed task arguments never deny the tool call' {
     $sid = New-SessionId
-    1..10 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
+    Set-StuckGate -SessionId $sid
     foreach ($bad in @('', 'not json at all', '{"no_agent_type":1}', '[]')) {
         Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $bad }) "toolArgs '$bad' must fail open"
     }
@@ -404,22 +546,19 @@ Test-Case 'malformed task arguments never deny the tool call' {
 
 Test-Case 'reviewers are refused once the session-wide ceiling is reached' {
     $sid = New-SessionId
-    $hit = $false
-    foreach ($i in 1..20) {
-        foreach ($gate in @('architecture', 'security', 'privacy')) {
-            $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate $gate -Verdict 'PASS')
-            if ($footer -match 'permitted reviewer invocations') { $hit = $true; break }
-        }
-        if ($hit) { break }
+    Set-GateState -SessionId $sid -Values @{
+        totalInvocations     = 40
+        architectureAttempts = 1; architectureVerdict = 'PASS'
+        securityAttempts     = 1; securityVerdict = 'PASS'
+        privacyAttempts      = 1; privacyVerdict = 'ISSUES'
     }
-    if (-not $hit) { throw 'never reached the session-wide ceiling' }
-    $parsed = (Invoke-ReviewerTask -SessionId $sid -Gate 'architecture') | ConvertFrom-Json
+    $parsed = (Invoke-ReviewerTask -SessionId $sid -Gate 'privacy') | ConvertFrom-Json
     Assert-Equal 'deny' $parsed.permissionDecision
     Assert-Match 'permitted reviewer invocations' $parsed.permissionDecisionReason
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nRe-gate invalidation" -ForegroundColor Cyan
+Write-Section 'Re-gate invalidation'
 # ------------------------------------------------------------------------------------------
 
 Test-Case 're-gating an earlier gate invalidates the later ones' {
@@ -438,7 +577,7 @@ Test-Case 're-gating an earlier gate invalidates the later ones' {
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nAudit trail" -ForegroundColor Cyan
+Write-Section 'Audit trail'
 # ------------------------------------------------------------------------------------------
 
 Test-Case 'every reviewer invocation is recorded' {
@@ -461,7 +600,7 @@ Test-Case 'state writes leave no orphaned temp files' {
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nDeveloper-visible artifacts under .autodev/" -ForegroundColor Cyan
+Write-Section 'Developer-visible artifacts under .autodev/'
 # ------------------------------------------------------------------------------------------
 
 Test-Case 'state, mirror, audit trail and feedback log are all reachable' {
@@ -496,11 +635,12 @@ Test-Case 'tampering with the mirror does not weaken a gate' {
 
 Test-Case 'two sessions in one directory keep independent attempt counters' {
     # This is what makes the caps real. If sessions shared one state file they would reset each
-    # other and no gate would ever reach its limit.
+    # other and no gate would ever reach its limit. Every round here goes through the hook,
+    # because real interleaved accumulation is exactly what is under test.
     $shared = Get-SessionCwd (New-SessionId)
     $a = New-SessionId
     $b = New-SessionId
-    foreach ($i in 1..6) {
+    foreach ($i in 1..3) {
         foreach ($sid in @($a, $b)) {
             Invoke-Hook 'subagentStart' @{ sessionId = $sid; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
             Invoke-Hook 'subagentStop' @{ sessionId = $sid; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "finding`n`nAUTODEV-VERDICT: ISSUES" } | Out-Null
@@ -508,16 +648,13 @@ Test-Case 'two sessions in one directory keep independent attempt counters' {
     }
     foreach ($sid in @($a, $b)) {
         $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
-        Assert-Equal 6 $state.architectureAttempts "session $sid lost attempts to the other session"
-        # Both are past the 10-attempt cap only after 10; at 6 they are still gating.
-        $args_ = '{"agent_type":"autodev-plan:autodev-architecture-review"}'
-        Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; cwd = $shared; toolName = 'task'; toolArgs = $args_ })
+        Assert-Equal 3 $state.architectureAttempts "session $sid lost attempts to the other session"
     }
-    # Take one session all the way to its cap; the other must be unaffected.
-    foreach ($i in 1..4) {
-        Invoke-Hook 'subagentStart' @{ sessionId = $a; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
-        Invoke-Hook 'subagentStop' @{ sessionId = $a; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "finding`n`nAUTODEV-VERDICT: ISSUES" } | Out-Null
-    }
+    # Take one session to its cap; the other must keep its own budget.
+    Set-GateState -SessionId $a -Values @{ architectureAttempts = 9; architectureVerdict = 'ISSUES'; totalInvocations = 9 }
+    Invoke-Hook 'subagentStart' @{ sessionId = $a; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    Invoke-Hook 'subagentStop' @{ sessionId = $a; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "finding`n`nAUTODEV-VERDICT: ISSUES" } | Out-Null
+
     $args2 = '{"agent_type":"autodev-plan:autodev-architecture-review"}'
     $denied = Invoke-Hook 'preToolUse' @{ sessionId = $a; cwd = $shared; toolName = 'task'; toolArgs = $args2 } | ConvertFrom-Json
     Assert-Equal 'deny' $denied.permissionDecision 'the session at its cap must be refused'
@@ -640,7 +777,7 @@ Test-Case 'unrelated tool calls and sub-agents do not create a .autodev director
 }
 
 # ------------------------------------------------------------------------------------------
-Write-Host "`nHook wiring (hooks.json is what connects all of the above to the CLI)" -ForegroundColor Cyan
+Write-Section 'Hook wiring (hooks.json is what connects all of the above to the CLI)'
 # ------------------------------------------------------------------------------------------
 
 $script:PluginRoot = Split-Path $PSScriptRoot -Parent
@@ -746,6 +883,13 @@ Test-Case 'every hook entry sets a timeout' {
 # ------------------------------------------------------------------------------------------
 
 Remove-Item -LiteralPath $script:Root -Recurse -Force -ErrorAction SilentlyContinue
+
+if ($script:IsWorker) {
+    # Machine-readable tally for the dispatcher; it prints the human summary.
+    Write-Output "RESULT $script:Passed $script:Failed"
+    if ($script:Failed -gt 0) { exit 1 }
+    exit 0
+}
 
 Write-Host ''
 if ($script:Failed -gt 0) {

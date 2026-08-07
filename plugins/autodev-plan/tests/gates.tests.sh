@@ -5,11 +5,30 @@
 # the hook payload on stdin and asserting on the single JSON object it writes to stdout.
 #
 # Tests run against an isolated COPILOT_HOME, and each test gets its own temporary working
-# directory, so real session state is never touched. The tracker writes into '<cwd>/.autodev/',
-# so a per-test cwd is what keeps tests isolated from each other.
+# directory, so real session state is never touched. The tracker writes its developer-facing
+# artifacts into '<cwd>/.autodev/', so a per-test cwd is what keeps tests isolated.
+#
+# Every assertion costs a process spawn, so by default the suite shards itself across parallel
+# workers. Use --sequential for readable, grouped output when diagnosing a failure.
 #
 # Usage:  bash tests/gates.tests.sh
+#         bash tests/gates.tests.sh --sequential     one process, grouped by section
+#         bash tests/gates.tests.sh --workers 4      override the worker count
 # Exit code is 0 when every test passes, 1 otherwise.
+
+SHARD=-1
+SHARD_COUNT=1
+WORKERS=0
+SEQUENTIAL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --shard) SHARD="$2"; shift 2 ;;
+    --of) SHARD_COUNT="$2"; shift 2 ;;
+    --workers) WORKERS="$2"; shift 2 ;;
+    --sequential) SEQUENTIAL=1; shift ;;
+    *) shift ;;
+  esac
+done
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE_SCRIPT="$(cd "$TESTS_DIR/.." && pwd)/hooks/scripts/autodev-gates.sh"
@@ -26,6 +45,55 @@ fi
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required to run these tests (the hook itself degrades to a no-op without it)" >&2
   exit 1
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Dispatcher: fan the cases out across worker processes and aggregate.
+# ---------------------------------------------------------------------------------------------
+if [ "$SHARD" -lt 0 ] && [ "$SEQUENTIAL" -eq 0 ]; then
+  if [ "$WORKERS" -le 0 ]; then
+    WORKERS="$( (nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4) )"
+    [ "$WORKERS" -gt 8 ] 2>/dev/null && WORKERS=8
+    [ "$WORKERS" -ge 1 ] 2>/dev/null || WORKERS=4
+  fi
+  OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/autodev-gate-shards-XXXXXX")"
+  echo
+  echo "autodev-plan gate tracker tests (bash), $WORKERS workers"
+  echo "Use --sequential for output grouped by section."
+  START_TS=$(date +%s)
+  i=0
+  while [ "$i" -lt "$WORKERS" ]; do
+    bash "${BASH_SOURCE[0]}" --shard "$i" --of "$WORKERS" > "$OUT_DIR/shard-$i.log" 2>&1 &
+    i=$((i + 1))
+  done
+  wait
+  TOTAL_PASSED=0
+  TOTAL_FAILED=0
+  for log in "$OUT_DIR"/shard-*.log; do
+    while IFS= read -r line; do
+      case "$line" in
+        RESULT\ *)
+          set -- $line
+          TOTAL_PASSED=$((TOTAL_PASSED + $2))
+          TOTAL_FAILED=$((TOTAL_FAILED + $3))
+          ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$log"
+  done
+  rm -rf "$OUT_DIR"
+  ELAPSED=$(( $(date +%s) - START_TS ))
+  echo
+  if [ "$TOTAL_FAILED" -gt 0 ]; then
+    echo "$TOTAL_PASSED passed, $TOTAL_FAILED failed  (${ELAPSED}s)"
+    exit 1
+  fi
+  if [ "$TOTAL_PASSED" -eq 0 ]; then
+    echo "no tests ran - the workers produced no results (${ELAPSED}s)"
+    exit 1
+  fi
+  echo "$TOTAL_PASSED passed, 0 failed  (${ELAPSED}s)"
+  exit 0
 fi
 
 COPILOT_HOME="$(mktemp -d "${TMPDIR:-/tmp}/autodev-gate-tests-XXXXXX")"
@@ -113,7 +181,15 @@ assert_match() { # pattern actual because
   printf '%s' "$2" | grep -qE "$1" || fail "expected match for '$1' but got '$2'. ${3:-}"
 }
 
+CASE_INDEX=-1
+
 run_test() { # name function
+  # Round-robin the cases across workers. Every worker walks the whole file, so this stays a
+  # plain linear script and no test needs to know it is being sharded.
+  CASE_INDEX=$((CASE_INDEX + 1))
+  if [ "$SHARD_COUNT" -gt 1 ] && [ $((CASE_INDEX % SHARD_COUNT)) -ne "$SHARD" ]; then
+    return
+  fi
   CURRENT_ERROR=""
   if "$2" 2>/dev/null; then
     PASSED=$((PASSED + 1))
@@ -125,13 +201,40 @@ run_test() { # name function
   fi
 }
 
-echo
-echo "autodev-plan gate tracker tests (bash)"
-echo "script: $GATE_SCRIPT"
+section() {
+  # Section headers only make sense in a single ordered run; across workers they would repeat.
+  [ "$SHARD_COUNT" -le 1 ] || return 0
+  echo
+  echo "$1"
+}
+
+# Seeds the enforcement state directly. Used only where reaching a state through real rounds
+# would cost dozens of process spawns and the accumulation itself is not what is under test; the
+# tests that DO cover accumulation (the 9-vs-10 attempt boundary, and two sessions counting
+# independently) still drive every round through the hook.
+seed_state() { # sid  jq-assignment-expression
+  local sid="$1" expr="${2:-.}" path
+  path="$(state_path "$sid")"
+  mkdir -p "$(dirname "$path")"
+  jq -n --arg sid "$sid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    sessionId: $sid, createdAt: $now, updatedAt: $now, blocks: 0, totalInvocations: 0,
+    architectureAttempts: 0, architectureVerdict: "pending",
+    securityAttempts: 0,     securityVerdict: "pending",
+    privacyAttempts: 0,      privacyVerdict: "pending"
+  }' | jq "$expr" > "$path"
+}
+
+# The common setup: one gate has spent its entire budget without passing.
+seed_stuck_gate() { # sid [gate]
+  local gate="${2:-architecture}"
+  seed_state "$1" ".${gate}Attempts = 10 | .${gate}Verdict = \"ISSUES\" | .totalInvocations = 10"
+}
+
+section "autodev-plan gate tracker tests (bash)"
+[ "$SHARD_COUNT" -le 1 ] && echo "script: $GATE_SCRIPT"
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Verdict parsing (must read only the final meaningful line)"
+section "Verdict parsing (must read only the final meaningful line)"
 # --------------------------------------------------------------------------------------------
 
 FENCE='```'
@@ -172,8 +275,7 @@ for CASE in "${VERDICT_CASES[@]}"; do
 done
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Fail-safes (a hook must never deny a tool call or crash)"
+section "Fail-safes (a hook must never deny a tool call or crash)"
 # --------------------------------------------------------------------------------------------
 
 t_stop_no_state() { assert_equal '{}' "$(agent_stop "$(new_session_id)")"; }
@@ -257,8 +359,7 @@ t_path_traversal() {
 run_test "a hostile session id cannot escape the state directory" t_path_traversal
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Enforcement"
+section "Enforcement"
 # --------------------------------------------------------------------------------------------
 
 t_block_while_outstanding() {
@@ -322,8 +423,7 @@ t_all_pass_releases() {
 run_test "all gates passing releases the block and permits ask_user" t_all_pass_releases
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Loop bounds"
+section "Loop bounds"
 # --------------------------------------------------------------------------------------------
 
 t_escalate_after_budget() {
@@ -346,9 +446,9 @@ t_no_escalate_one_short() {
 run_test "a gate does NOT escalate one attempt short of the budget" t_no_escalate_one_short
 
 t_escalation_names_stuck() {
-  local sid i footer
+  local sid footer
   sid="$(new_session_id)"
-  for i in $(seq 1 10); do round "$sid" architecture ISSUES > /dev/null; done
+  seed_stuck_gate "$sid"
   # A different gate reports next; the footer must still point at architecture.
   footer="$(round "$sid" security ISSUES)"
   assert_match 'architecture gate' "$footer"
@@ -381,27 +481,42 @@ t_block_guard() {
 run_test "the block counter stops fighting the CLI runaway guard" t_block_guard
 
 t_total_ceiling() {
-  local sid i gate footer
+  # Seeded one invocation short of the ceiling, so the next real round must trip it. This pins
+  # the boundary exactly, where looping until the message appeared only proved it happened
+  # eventually -- and cost forty round trips to do it.
+  local sid footer
   sid="$(new_session_id)"
-  for i in $(seq 1 20); do
-    for gate in architecture security privacy; do
-      footer="$(round "$sid" "$gate" PASS)"
-      case "$footer" in *"permitted reviewer invocations"*) return 0 ;; esac
-    done
-  done
-  fail 'cascade never hit the session-wide invocation ceiling'
+  seed_state "$sid" '.totalInvocations = 39
+    | .architectureAttempts = 1 | .architectureVerdict = "PASS"
+    | .securityAttempts = 1     | .securityVerdict = "PASS"
+    | .privacyAttempts = 1      | .privacyVerdict = "PASS"'
+  footer="$(round "$sid" architecture PASS)"
+  assert_match 'permitted reviewer invocations' "$footer"
 }
 run_test "the session-wide invocation ceiling escalates a runaway cascade" t_total_ceiling
+
+t_ceiling_not_early() {
+  local sid footer
+  sid="$(new_session_id)"
+  seed_state "$sid" '.totalInvocations = 38
+    | .architectureAttempts = 1 | .architectureVerdict = "PASS"
+    | .securityAttempts = 1     | .securityVerdict = "PASS"
+    | .privacyAttempts = 1      | .privacyVerdict = "PASS"'
+  footer="$(round "$sid" architecture PASS)"
+  case "$footer" in
+    *"permitted reviewer invocations"*) fail 'the ceiling fired at 39 invocations'; return 1 ;;
+  esac
+}
+run_test "the session-wide ceiling does not fire one invocation early" t_ceiling_not_early
 
 t_ceiling_leaves_room() {
   # If the ceiling were at or below (gates * per-gate budget) it would silently become the real
   # limit and the per-gate budget would never be reachable on the last gate.
-  local sid gate i footer
+  local sid footer
   sid="$(new_session_id)"
-  for gate in architecture security; do
-    for i in $(seq 1 10); do round "$sid" "$gate" ISSUES > /dev/null; done
-    round "$sid" "$gate" PASS > /dev/null
-  done
+  seed_state "$sid" '.totalInvocations = 22
+    | .architectureAttempts = 11 | .architectureVerdict = "PASS"
+    | .securityAttempts = 11     | .securityVerdict = "PASS"'
   footer="$(round "$sid" privacy ISSUES)"
   assert_match 'Attempt 1 of 10' "$footer" || return 1
   assert_match '9 attempt\(s\) remain' "$footer" 'the last gate must still get a full budget'
@@ -409,16 +524,15 @@ t_ceiling_leaves_room() {
 run_test "the session-wide ceiling leaves room for every gate to spend its budget" t_ceiling_leaves_room
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Budget exhaustion actually stops the loop"
+section "Budget exhaustion actually stops the loop"
 # --------------------------------------------------------------------------------------------
 
 t_refuse_after_budget() {
   # The footer only *asks* the orchestrator to stop. This is what makes the cap real: an
   # orchestrator that ignores the escalation instruction still cannot start an 11th review.
-  local sid i out
+  local sid out
   sid="$(new_session_id)"
-  for i in $(seq 1 10); do round "$sid" architecture ISSUES > /dev/null; done
+  seed_stuck_gate "$sid"
   out="$(reviewer_task "$sid" architecture)"
   assert_equal 'deny' "$(printf '%s' "$out" | jq -r '.permissionDecision // ""')" || return 1
   assert_match 'out of budget' "$(printf '%s' "$out" | jq -r '.permissionDecisionReason // ""')" || return 1
@@ -426,11 +540,20 @@ t_refuse_after_budget() {
 }
 run_test "once a gate is out of attempts, re-invoking any reviewer is refused" t_refuse_after_budget
 
+t_allowed_one_short_of_cap() {
+  # Guards the boundary from the other side: the deny must not start a round early.
+  local sid
+  sid="$(new_session_id)"
+  seed_state "$sid" '.architectureAttempts = 9 | .architectureVerdict = "ISSUES" | .totalInvocations = 9'
+  assert_equal '{}' "$(reviewer_task "$sid" architecture)"
+}
+run_test "a reviewer is still permitted one attempt short of the cap" t_allowed_one_short_of_cap
+
 t_refuse_other_gate_too() {
   # Skipping ahead to the next gate would produce a plan that never cleared architecture.
-  local sid i
+  local sid
   sid="$(new_session_id)"
-  for i in $(seq 1 10); do round "$sid" architecture ISSUES > /dev/null; done
+  seed_stuck_gate "$sid"
   assert_equal 'deny' "$(reviewer_task "$sid" security | jq -r '.permissionDecision // ""')"
 }
 run_test "a stuck gate also blocks moving on to a different reviewer" t_refuse_other_gate_too
@@ -438,10 +561,10 @@ run_test "a stuck gate also blocks moving on to a different reviewer" t_refuse_o
 t_refusal_scoped_to_reviewers() {
   # The orchestrator may still need explore or general-purpose agents to write up the
   # escalation, so only reviewer invocations are refused.
-  local sid i agent out args cwd
+  local sid agent out args cwd
   sid="$(new_session_id)"
   cwd="$(session_cwd "$sid")"
-  for i in $(seq 1 10); do round "$sid" architecture ISSUES > /dev/null; done
+  seed_stuck_gate "$sid"
   for agent in explore general-purpose code-review security-review; do
     args="$(jq -cn --arg a "$agent" '{agent_type:$a, prompt:"go"}')"
     out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg c "$cwd" --arg t "$args" \
@@ -452,11 +575,12 @@ t_refusal_scoped_to_reviewers() {
 run_test "the refusal does not spill over onto non-reviewer sub-agents" t_refusal_scoped_to_reviewers
 
 t_malformed_task_args() {
-  local sid i bad out
+  local sid bad out cwd
   sid="$(new_session_id)"
-  for i in $(seq 1 10); do round "$sid" architecture ISSUES > /dev/null; done
+  cwd="$(session_cwd "$sid")"
+  seed_stuck_gate "$sid"
   for bad in '' 'not json at all' '{"no_agent_type":1}' '[]'; do
-    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg a "$bad" --arg c "$(session_cwd "$sid")" \
+    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg a "$bad" --arg c "$cwd" \
       '{sessionId:$s, cwd:$c, toolName:"task", toolArgs:$a}')")"
     assert_equal '{}' "$out" "toolArgs '$bad' must fail open" || return 1
   done
@@ -464,24 +588,19 @@ t_malformed_task_args() {
 run_test "malformed task arguments never deny the tool call" t_malformed_task_args
 
 t_refuse_at_session_ceiling() {
-  local sid i gate footer hit=0
+  local sid
   sid="$(new_session_id)"
-  for i in $(seq 1 20); do
-    for gate in architecture security privacy; do
-      footer="$(round "$sid" "$gate" PASS)"
-      case "$footer" in *"permitted reviewer invocations"*) hit=1; break ;; esac
-    done
-    [ "$hit" -eq 1 ] && break
-  done
-  [ "$hit" -eq 1 ] || fail 'never reached the session-wide ceiling' || return 1
+  seed_state "$sid" '.totalInvocations = 40
+    | .architectureAttempts = 1 | .architectureVerdict = "PASS"
+    | .securityAttempts = 1     | .securityVerdict = "PASS"
+    | .privacyAttempts = 1      | .privacyVerdict = "ISSUES"'
   assert_match 'permitted reviewer invocations' \
-    "$(reviewer_task "$sid" architecture | jq -r '.permissionDecisionReason // ""')"
+    "$(reviewer_task "$sid" privacy | jq -r '.permissionDecisionReason // ""')"
 }
 run_test "reviewers are refused once the session-wide ceiling is reached" t_refuse_at_session_ceiling
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Re-gate invalidation"
+section "Re-gate invalidation"
 # --------------------------------------------------------------------------------------------
 
 t_regate_invalidates_downstream() {
@@ -501,8 +620,7 @@ t_regate_invalidates_downstream() {
 run_test "re-gating an earlier gate invalidates the later ones" t_regate_invalidates_downstream
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Audit trail"
+section "Audit trail"
 # --------------------------------------------------------------------------------------------
 
 t_audit_rows() {
@@ -529,8 +647,7 @@ t_no_temp_files() {
 run_test "state writes leave no orphaned temp files" t_no_temp_files
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Developer-visible artifacts under .autodev/"
+section "Developer-visible artifacts under .autodev/"
 # --------------------------------------------------------------------------------------------
 
 t_artifacts_reachable() {
@@ -572,12 +689,13 @@ run_test "tampering with the mirror does not weaken a gate" t_mirror_tampering_i
 
 t_two_sessions_independent() {
   # This is what makes the caps real. If sessions shared one state file they would reset each
-  # other and no gate would ever reach its limit.
+  # other and no gate would ever reach its limit. Every round here goes through the hook,
+  # because real interleaved accumulation is exactly what is under test.
   local shared a b i sid
   shared="$(session_cwd "$(new_session_id)")"
   a="$(new_session_id)"
   b="$(new_session_id)"
-  for i in $(seq 1 6); do
+  for i in 1 2 3; do
     for sid in "$a" "$b"; do
       hook subagentStart "$(jq -cn --arg s "$sid" --arg c "$shared" \
         '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
@@ -587,20 +705,17 @@ t_two_sessions_independent() {
     done
   done
   for sid in "$a" "$b"; do
-    assert_equal 6 "$(jq -r '.architectureAttempts' "$(state_path "$sid")")" \
+    assert_equal 3 "$(jq -r '.architectureAttempts' "$(state_path "$sid")")" \
       "session $sid lost attempts to the other session" || return 1
-    assert_equal '{}' "$(hook preToolUse "$(jq -cn --arg s "$sid" --arg c "$shared" \
-      '{sessionId:$s, cwd:$c, toolName:"task",
-        toolArgs:"{\"agent_type\":\"autodev-plan:autodev-architecture-review\"}"}')")" || return 1
   done
-  # Take one session all the way to its cap; the other must be unaffected.
-  for i in $(seq 1 4); do
-    hook subagentStart "$(jq -cn --arg s "$a" --arg c "$shared" \
-      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
-    hook subagentStop "$(jq -cn --arg s "$a" --arg c "$shared" \
-      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
-        response:"finding\n\nAUTODEV-VERDICT: ISSUES"}')" > /dev/null
-  done
+  # Take one session to its cap; the other must keep its own budget.
+  seed_state "$a" '.architectureAttempts = 9 | .architectureVerdict = "ISSUES" | .totalInvocations = 9'
+  hook subagentStart "$(jq -cn --arg s "$a" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
+  hook subagentStop "$(jq -cn --arg s "$a" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+      response:"finding\n\nAUTODEV-VERDICT: ISSUES"}')" > /dev/null
+
   assert_equal 'deny' "$(hook preToolUse "$(jq -cn --arg s "$a" --arg c "$shared" \
     '{sessionId:$s, cwd:$c, toolName:"task",
       toolArgs:"{\"agent_type\":\"autodev-plan:autodev-architecture-review\"}"}')" | jq -r '.permissionDecision // ""')" \
@@ -757,8 +872,7 @@ t_no_stray_autodev_dir() {
 run_test "unrelated tool calls and sub-agents do not create a .autodev directory" t_no_stray_autodev_dir
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Hook wiring (hooks.json is what connects all of the above to the CLI)"
+section "Hook wiring (hooks.json is what connects all of the above to the CLI)"
 # --------------------------------------------------------------------------------------------
 
 PLUGIN_ROOT_DIR="$(cd "$TESTS_DIR/.." && pwd)"
@@ -875,6 +989,13 @@ t_hooks_timeouts() {
 run_test "every hook entry sets a timeout" t_hooks_timeouts
 
 # --------------------------------------------------------------------------------------------
+
+if [ "$SHARD" -ge 0 ]; then
+  # Machine-readable tally for the dispatcher; it prints the human summary.
+  printf 'RESULT %s %s\n' "$PASSED" "$FAILED"
+  [ "$FAILED" -gt 0 ] && exit 1
+  exit 0
+fi
 
 echo
 if [ "$FAILED" -gt 0 ]; then

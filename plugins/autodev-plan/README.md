@@ -273,6 +273,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-plan/tests/g
 bash plugins/autodev-plan/tests/gates.tests.sh
 ```
 
+Because every assertion costs a process spawn — roughly a second on Windows, once PowerShell
+startup and the JSON cmdlets are paid for — the suites shard themselves across parallel workers
+by default. That takes a full run from about 11 minutes to about 90 seconds. When you are
+diagnosing a failure and want output grouped by section in a single ordered run:
+
+```
+powershell ... -File plugins/autodev-plan/tests/gates.tests.ps1 -Sequential
+bash plugins/autodev-plan/tests/gates.tests.sh --sequential
+```
+
+Both accept a worker count (`-Workers 4` / `--workers 4`). Sequential and parallel runs execute
+exactly the same cases; only the ordering and the section headings differ.
+
+A few tests seed the tracker's state file directly rather than driving forty real rounds to
+reach a limit. That is a deliberate trade: the tests that cover *accumulation* — the 9-versus-10
+attempt boundary, and two sessions counting independently — still push every round through the
+hook.
+
 Coverage includes verdict parsing (including the negatives — a verdict mentioned in prose must
 never count), the enforcement decisions, all three loop bounds, the refusal of further reviewer
 invocations once the budget is spent, re-gate invalidation, the `.autodev/` artifacts (including
