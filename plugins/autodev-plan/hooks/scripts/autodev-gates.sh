@@ -105,6 +105,31 @@ read_state_file() {
   printf '%s' "$snapshot" | jq -e . >/dev/null 2>&1 || return 1
   owner="$(printf '%s' "$snapshot" | jq -r '.sessionId // ""' 2>/dev/null)"
   [ "$owner" = "$SAFE_SESSION_ID" ] || return 1
+  # Reject semantic corruption before it reaches shell arithmetic. Missing fields are allowed
+  # for legacy state and are supplied by default_state; present counters must be non-negative
+  # integers (JSON numbers or legacy numeric strings), and verdicts must be known values.
+  printf '%s' "$snapshot" | jq -e '
+    def nonnegint:
+      (type == "number"
+       and . >= 0 and . <= 2147483647 and floor == .
+       and (tostring | test("^[0-9]+$")))
+      or (type == "string"
+          and test("^[0-9]+$")
+          and (tonumber <= 2147483647));
+    def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    def verdict_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
+    counter_ok("blocks")
+    and counter_ok("totalInvocations")
+    and counter_ok("architectureAttempts")
+    and counter_ok("securityAttempts")
+    and counter_ok("privacyAttempts")
+    and verdict_ok("architectureVerdict")
+    and verdict_ok("securityVerdict")
+    and verdict_ok("privacyVerdict")
+  ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
 }

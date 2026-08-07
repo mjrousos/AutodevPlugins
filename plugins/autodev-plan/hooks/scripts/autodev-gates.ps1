@@ -121,7 +121,6 @@ function New-DefaultState {
 
 function Read-State {
     param([string]$Path, [string]$RecoveryPath, [string]$SessionId)
-    $state = New-DefaultState -SessionId $SessionId
     # The out-of-workspace file is authoritative. The workspace copy is also a recovery
     # checkpoint: if the authoritative directory is deleted mid-run, the next reviewer must
     # restore the same session rather than look like a new session and erase the audit trail.
@@ -131,35 +130,61 @@ function Read-State {
         $candidates += $RecoveryPath
     }
     foreach ($candidate in $candidates) {
+        # Start clean for every candidate. A corrupt authoritative file must not partially
+        # mutate defaults that are then reused while processing the recovery checkpoint.
+        $state = New-DefaultState -SessionId $SessionId
         if (-not (Test-Path -LiteralPath $candidate)) { continue }
         try {
             $raw = Get-Content -LiteralPath $candidate -Raw -ErrorAction Stop
             if ([string]::IsNullOrWhiteSpace($raw)) { continue }
             $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+            $ownerProp = $parsed.PSObject.Properties['sessionId']
+            if ($null -eq $ownerProp -or [string]$ownerProp.Value -ne $SessionId) { continue }
+
+            $numericKeys = @('blocks', 'totalInvocations')
+            foreach ($gate in $script:GateOrder) { $numericKeys += "${gate}Attempts" }
+            foreach ($key in $numericKeys) {
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
+                $normalized = 0
+                $rendered = [Convert]::ToString(
+                    $prop.Value,
+                    [Globalization.CultureInfo]::InvariantCulture)
+                if ($rendered -notmatch '^[0-9]+$' -or
+                    -not [int]::TryParse($rendered, [ref]$normalized) -or
+                    $normalized -lt 0) {
+                    throw "Invalid state counter '$key'."
+                }
+                $state[$key] = $normalized
+            }
+
+            foreach ($gate in $script:GateOrder) {
+                $key = "${gate}Verdict"
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
+                $verdict = [string]$prop.Value
+                if ($verdict -notin @('pending', 'running', 'PASS', 'ISSUES')) {
+                    throw "Invalid state verdict '$key'."
+                }
+                $state[$key] = $verdict
+            }
+
+            foreach ($key in @('createdAt', 'updatedAt')) {
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -ne $prop -and $null -ne $prop.Value) {
+                    $state[$key] = [string]$prop.Value
+                }
+            }
+            return $state
         }
         catch {
-            # Try the recovery checkpoint before treating state as absent.
+            # Syntax, merge and normalization failures corrupt only this candidate. Try the
+            # exact-session recovery checkpoint before treating state as absent.
             continue
         }
-        $ownerProp = $parsed.PSObject.Properties['sessionId']
-        if ($null -eq $ownerProp -or [string]$ownerProp.Value -ne $SessionId) { continue }
-
-        foreach ($key in @($state.Keys)) {
-            $prop = $parsed.PSObject.Properties[$key]
-            if ($null -ne $prop -and $null -ne $prop.Value) {
-                $state[$key] = $prop.Value
-            }
-        }
-        # Normalize numeric fields that may have round-tripped as strings.
-        $state['blocks'] = [int]$state['blocks']
-        $state['totalInvocations'] = [int]$state['totalInvocations']
-        foreach ($gate in $script:GateOrder) {
-            $state["${gate}Attempts"] = [int]$state["${gate}Attempts"]
-        }
-        return $state
     }
 
-    return $state
+    return (New-DefaultState -SessionId $SessionId)
 }
 
 function Write-State {

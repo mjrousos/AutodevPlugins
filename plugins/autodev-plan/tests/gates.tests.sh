@@ -338,6 +338,51 @@ t_no_owner_state_not_adopted() {
 }
 run_test "a state file with no owner is never adopted" t_no_owner_state_not_adopted
 
+t_semantic_corruption_uses_mirror() {
+  local spec name filter sid state stop restored
+  for spec in \
+    'non-numeric counter|.blocks = "bad"' \
+    'negative counter|.architectureAttempts = -1' \
+    'exponent-sized counter|.totalInvocations = 1e30' \
+    'signed numeric string|.blocks = "+5"' \
+    'unknown verdict|.architectureVerdict = "PASSING"'; do
+    name="${spec%%|*}"
+    filter="${spec#*|}"
+    sid="$(new_session_id)"
+    round "$sid" architecture PASS > /dev/null
+    state="$(state_path "$sid")"
+    jq "$filter" "$state" > "$state.corrupt" && mv -f "$state.corrupt" "$state"
+
+    stop="$(agent_stop "$sid")"
+    assert_equal 'block' "$(printf '%s' "$stop" | jq -r '.decision // ""')" \
+      "$name prevented mirror recovery" || return 1
+    assert_match 'autodev-plan:autodev-security-review' \
+      "$(printf '%s' "$stop" | jq -r '.reason // ""')" || return 1
+    restored="$(cat "$state")"
+    assert_equal 'PASS' "$(printf '%s' "$restored" | jq -r '.architectureVerdict')" || return 1
+    assert_equal 1 "$(printf '%s' "$restored" | jq -r '.blocks')" || return 1
+  done
+}
+run_test "semantically corrupt authoritative state falls back to the valid mirror" t_semantic_corruption_uses_mirror
+
+t_partial_legacy_state() {
+  local sid path stop
+  sid="$(new_session_id)"
+  path="$(state_path "$sid")"
+  mkdir -p "$(dirname "$path")"
+  jq -n --arg sid "$sid" '{
+    sessionId:$sid,
+    architectureAttempts:"1",
+    architectureVerdict:"PASS",
+    totalInvocations:"1"
+  }' > "$path"
+  stop="$(agent_stop "$sid")"
+  assert_equal 'block' "$(printf '%s' "$stop" | jq -r '.decision // ""')" || return 1
+  assert_match 'autodev-plan:autodev-security-review' \
+    "$(printf '%s' "$stop" | jq -r '.reason // ""')"
+}
+run_test "partial legacy state receives missing defaults" t_partial_legacy_state
+
 t_state_file_is_snapshotted_once() {
   # The workspace mirror is shared by sessions. Validation, owner checking and merging must all
   # use one captured value, not reopen a path another session can atomically replace.

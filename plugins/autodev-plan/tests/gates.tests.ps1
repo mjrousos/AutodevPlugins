@@ -346,6 +346,45 @@ Test-Case 'a state file with no owner is never adopted' {
     Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
 }
 
+Test-Case 'semantically corrupt authoritative state falls back to the valid mirror' {
+    $cases = @(
+        @{ Name = 'non-numeric counter'; Property = 'blocks'; Value = 'bad' }
+        @{ Name = 'negative counter'; Property = 'architectureAttempts'; Value = -1 }
+        @{ Name = 'exponent-sized counter'; Property = 'totalInvocations'; Value = 1e30 }
+        @{ Name = 'signed numeric string'; Property = 'blocks'; Value = '+5' }
+        @{ Name = 'unknown verdict'; Property = 'architectureVerdict'; Value = 'PASSING' }
+    )
+    foreach ($case in $cases) {
+        $sid = New-SessionId
+        Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+        $corrupt = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+        $corrupt.PSObject.Properties[$case.Property].Value = $case.Value
+        Set-Content -LiteralPath (Get-StatePath $sid) -Value ($corrupt | ConvertTo-Json -Depth 5) -Encoding UTF8
+
+        $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+        Assert-Equal 'block' $stop.decision "$($case.Name) prevented mirror recovery"
+        Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+        $restored = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+        Assert-Equal 'PASS' $restored.architectureVerdict
+        Assert-Equal 1 $restored.blocks
+    }
+}
+
+Test-Case 'partial legacy state receives missing defaults' {
+    $sid = New-SessionId
+    $path = Get-StatePath $sid
+    New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $path -Encoding UTF8 -Value (@{
+            sessionId = $sid
+            architectureAttempts = '1'
+            architectureVerdict = 'PASS'
+            totalInvocations = '1'
+        } | ConvertTo-Json)
+    $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $stop.decision
+    Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+}
+
 Test-Case 'garbage stdin returns empty JSON and exits 0' {
     $out = 'this is not json' | powershell -NoProfile -ExecutionPolicy Bypass -File $script:GateScript preToolUse
     Assert-Equal 0 $LASTEXITCODE 'hook must exit 0'
