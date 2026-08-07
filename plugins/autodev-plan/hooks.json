@@ -29,7 +29,7 @@
     "preToolUse": [
       {
         "type": "command",
-        "matcher": "ask_user",
+        "matcher": "^(?:ask_user|AskUserQuestion|task)$",
         "bash": "bash \"${PLUGIN_ROOT}/hooks/scripts/autodev-gates.sh\" preToolUse",
         "powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/scripts/autodev-gates.ps1\" preToolUse",
         "timeoutSec": 20

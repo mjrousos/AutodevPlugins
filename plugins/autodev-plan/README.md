@@ -33,7 +33,7 @@ copilot --agent autodev-plan:autodev-plan
 | 5 | **GATE: architecture** — loops until clean | **no** |
 | 6 | **GATE: security** — loops until clean | **no** |
 | 7 | **GATE: privacy** — loops until clean | **no** |
-| 8 | **WRAPUP** — reports plan path, audit trail, and what the reviews changed | yes |
+| 8 | **WRAPUP** — reports plan path, tracker artifacts, and what the reviews changed | yes |
 
 Steps 5–7 run sequentially and **fully autonomously**. Each reviewer returns a verdict; anything
 other than a pass sends the orchestrator back to revise the plan and re-invoke that same
@@ -124,18 +124,66 @@ malfunctioning reviewer can never wave a plan through.
 
 Three independent layers make an infinite loop impossible:
 
-1. **5 attempts per gate, per pass.** A gate re-run after a material change starts a fresh
+1. **10 attempts per gate, per pass.** A gate re-run after a material change starts a fresh
    budget rather than inheriting the previous pass's count.
-2. **20 total reviewer invocations per session**, which bounds re-gate cascades.
+2. **40 total reviewer invocations per session**, which bounds re-gate cascades.
 3. **The CLI's own runaway guard** on forced continuations, which this plugin stays below.
 
 On hitting a limit the workflow **escalates**: blocking stops, `ask_user` is re-permitted, and
 the orchestrator brings you in with an explanation of why it is not converging.
 
-### Audit trail
+Escalation is enforced, not merely requested. Once a gate is out of attempts the `preToolUse`
+hook **denies any further `task` call to a reviewer agent**, so an orchestrator that ignores the
+instruction to stop still cannot start another review. Non-reviewer sub-agents stay available so
+it can still write up the escalation.
 
-Written to `<COPILOT_HOME>/autodev-plan/gates/<sessionId>.md` (`COPILOT_HOME` defaults to
-`~/.copilot`), alongside a `.json` state file. Nothing is written into your repository.
+### Watching a run: the `.autodev/` directory
+
+Everything the tracker records is mirrored next to the plan, in the same `.autodev/` directory,
+so you can follow a run while it happens and read the reviews afterwards:
+
+| File | What it holds |
+| --- | --- |
+| `.autodev/plan.md` | The plan itself, written by the orchestrator |
+| `.autodev/gate-status.json` | Per-gate attempt counts and verdicts, refreshed on every event |
+| `.autodev/gate-audit.md` | One row per reviewer lifecycle event |
+| `.autodev/feedback-log.md` | Every reviewer response, verbatim |
+
+`.autodev/` is gitignored (the orchestrator offers to add it on first use), so none of this ends
+up in version control.
+
+These four files are a **read-only view**. The state that actually enforces the gates lives at
+`<COPILOT_HOME>/autodev-plan/gates/<sessionId>.json`, outside the workspace and keyed by session.
+That split is deliberate:
+
+- The orchestrator is allowed to edit files in the workspace while gating, so state it could
+  rewrite would not be enforcement at all. Editing `.autodev/gate-status.json` changes nothing.
+- Two sessions running in the same repository keep independent attempt budgets, so they cannot
+  reset each other's counters and quietly disable every cap.
+
+The three tracker files are written **only** by hooks — the orchestrator does not write them and
+is instructed not to edit them. If you run two autodev-plan sessions in one directory they will
+share these files (as they would share `plan.md`), so the logs interleave; the enforcement state
+behind them stays separate. One plan per directory at a time is the intended usage.
+
+#### `gate-status.json`
+
+Refreshed on every reviewer start and finish, so `cat`-ing it mid-run tells you exactly where a
+session is:
+
+```json
+{
+  "sessionId": "549a2b9c-e26b-4d38-8b8a-6ac7d0b012d4",
+  "architectureAttempts": 2, "architectureVerdict": "PASS",
+  "securityAttempts": 1,     "securityVerdict": "running",
+  "privacyAttempts": 0,      "privacyVerdict": "pending",
+  "totalInvocations": 3, "blocks": 0
+}
+```
+
+A verdict is `pending` (not yet run), `running` (in flight), `PASS`, or `ISSUES`.
+
+#### `gate-audit.md`
 
 ```
 | Time (UTC)          | Gate         | Attempt | Event     | Verdict |
@@ -145,8 +193,41 @@ Written to `<COPILOT_HOME>/autodev-plan/gates/<sessionId>.md` (`COPILOT_HOME` de
 | 2026-08-04 20:31:24 | architecture | 2       | invoked   | -       |
 ```
 
-Every row is written by a hook observing a real sub-agent lifecycle event — the orchestrator
-cannot write to this file. If the gates did not genuinely run, the trail will show it.
+Every row is written by a hook observing a real sub-agent lifecycle event. If the gates did not
+genuinely run, the trail will show it.
+
+#### `feedback-log.md`
+
+The audit trail tells you *that* a gate objected; this tells you *what* it objected to. Each
+entry is the reviewer's full response, exactly as written. Entry headers are level 1, because
+reviewers use `##` and `###` for their own sections:
+
+```markdown
+---
+
+# architecture - attempt 1 - ISSUES
+
+_2026-08-04 20:26:13 UTC_
+
+## Summary
+...
+
+### blocker Undo bypasses the server's move pipeline
+...
+```
+
+This exists because the orchestrator summarises reviewer findings as it goes, and a summary is
+lossy. When you want to audit a decision — or disagree with one — read this file.
+
+All three files are reset when a new session starts a gate in the same directory, so they always
+describe the current run rather than accumulating across sessions.
+
+### Escalation is enforced by refusing the tool call
+
+Once a gate is out of attempts the `preToolUse` hook denies any further `task` call to a reviewer
+agent. That refusal is driven by the out-of-workspace state, so an orchestrator cannot lift it by
+editing `.autodev/`. Non-reviewer sub-agents stay available so it can still write up the
+escalation.
 
 ## Requirements
 
@@ -184,8 +265,9 @@ permanently break `ask_user`. Every path is wrapped, always emits valid JSON, an
 
 The two gate tracker implementations have to stay behaviorally identical, so both are covered by
 an equivalent suite. Each test runs the hook script as a real subprocess — feeding a payload on
-stdin and asserting on the single JSON object it writes to stdout — against an isolated
-`COPILOT_HOME`, so running them never touches real session state.
+stdin and asserting on the single JSON object it writes to stdout. Every test gets its own
+temporary working directory (and an isolated `COPILOT_HOME`), so running them never touches real
+session state.
 
 ```
 # Windows
@@ -195,10 +277,30 @@ powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-plan/tests/g
 bash plugins/autodev-plan/tests/gates.tests.sh
 ```
 
+Because every assertion costs a process spawn — roughly a second on Windows, once PowerShell
+startup and the JSON cmdlets are paid for — the suites shard themselves across parallel workers
+by default. That takes a full run from about 11 minutes to about 90 seconds. When you are
+diagnosing a failure and want output grouped by section in a single ordered run:
+
+```
+powershell ... -File plugins/autodev-plan/tests/gates.tests.ps1 -Sequential
+bash plugins/autodev-plan/tests/gates.tests.sh --sequential
+```
+
+Both accept a worker count (`-Workers 4` / `--workers 4`). Sequential and parallel runs execute
+exactly the same cases; only the ordering and the section headings differ.
+
+A few tests seed the tracker's state file directly rather than driving forty real rounds to
+reach a limit. That is a deliberate trade: the tests that cover *accumulation* — the 9-versus-10
+attempt boundary, and two sessions counting independently — still push every round through the
+hook.
+
 Coverage includes verdict parsing (including the negatives — a verdict mentioned in prose must
-never count), the enforcement decisions, all three loop bounds, re-gate invalidation, the audit
-trail, and the fail-safe paths: corrupt state, empty and garbage stdin, non-reviewer sub-agents,
-a hostile session id, and a missing `jq`.
+never count), the enforcement decisions, all three loop bounds, the refusal of further reviewer
+invocations once the budget is spent, re-gate invalidation, the `.autodev/` artifacts (including
+that a new session does not inherit a previous run left in the same directory), and the
+fail-safe paths: corrupt state, empty and garbage stdin, malformed `task` arguments,
+non-reviewer sub-agents, a hostile session id, and a missing `jq`.
 
 The suites also assert on `hooks.json` itself, because that file is what connects everything
 above to the CLI and a typo there would disable enforcement entirely while every other test
@@ -252,9 +354,9 @@ copilot -C /tmp/autodev-e2e --plugin-dir /path/to/plugins/autodev-plan \
 Describe the feature and let the workflow run. To keep an unattended run short you can
 pre-answer the clarifying questions in the initial prompt and tell it to skip the approval step.
 
-**3. Check the audit trail**, at `<COPILOT_HOME>/autodev-plan/gates/<sessionId>.md`
-(`COPILOT_HOME` defaults to `~/.copilot`). This is the primary artifact: it is written by hooks
-observing real sub-agent events, so the orchestrator cannot fake it.
+**3. Check the tracker artifacts**, in `/tmp/autodev-e2e/.autodev/`. These are the primary
+evidence: they are written by hooks observing real sub-agent events, so the orchestrator cannot
+fake them. Start with `gate-audit.md`.
 
 Expect to see, in order:
 
@@ -263,6 +365,12 @@ Expect to see, in order:
 - attempt numbers incrementing within a gate whenever a verdict was `ISSUES`
 - every gate ending on `PASS` (or an escalation you were asked about)
 
+Then open `feedback-log.md` and compare it against what the orchestrator told you in the
+transcript. Every `ISSUES` round should have a corresponding entry, and the findings the
+orchestrator described should be recognisably the ones the reviewer actually raised.
+
+Tailing `gate-status.json` during the run is the easiest way to watch progress live.
+
 **4. Confirm the things that are easy to get wrong.**
 
 | Check | What you are confirming |
@@ -270,8 +378,9 @@ Expect to see, in order:
 | A `premature-stop-blocked` row appears if the agent tried to stop early | `agentStop` enforcement is live |
 | The plan file exists at the agreed path and reflects reviewer feedback | Findings were applied, not just acknowledged |
 | You were not asked anything between approval and wrap-up | The gate phase stayed autonomous |
-| Wrap-up reports both the plan path and the audit trail path | The orchestrator followed through |
+| Wrap-up reports the plan path, the audit trail and the feedback log | The orchestrator followed through |
 | Reviewer responses carry a `[autodev-plan gate tracker]` footer | The hooks are loaded and rewriting responses |
+| The orchestrator listed each finding, with severity, before revising | Reviewer feedback is visible to you, not just summarised away |
 
 If the footer never appears, the plugin's hooks are not loading — everything else in the run is
 then unverified, whatever the transcript claims.
@@ -281,9 +390,16 @@ would have raised them. The gates are only worth their cost if they catch real p
 where all three pass on the first attempt with a substantial feature is a signal the reviewers
 have gone toothless, not a success.
 
-**6. Clean up.**
+**6. Optionally, prove the cap holds.** Escalation is the hardest path to reach naturally. To
+force it, edit the session's enforcement state at
+`<COPILOT_HOME>/autodev-plan/gates/<sessionId>.json` mid-run and set `architectureAttempts` to
+`10` with `architectureVerdict` as `ISSUES`. The next reviewer invocation must be **denied** with
+an "out of budget" message, and the orchestrator must escalate to you rather than retrying.
+Editing `.autodev/gate-status.json` instead must have no effect at all — that file is only a
+mirror.
+
+**7. Clean up.**
 
 ```
 rm -rf /tmp/autodev-e2e
-rm -rf ~/.copilot/autodev-plan/gates   # optional: discards the audit trails
 ```

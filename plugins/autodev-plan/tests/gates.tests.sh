@@ -4,10 +4,31 @@
 # Runs the hook script as a separate process for every case, exactly as the CLI does, feeding
 # the hook payload on stdin and asserting on the single JSON object it writes to stdout.
 #
-# Tests run against an isolated COPILOT_HOME so real session state is never touched.
+# Tests run against an isolated COPILOT_HOME, and each test gets its own temporary working
+# directory, so real session state is never touched. The tracker writes its developer-facing
+# artifacts into '<cwd>/.autodev/', so a per-test cwd is what keeps tests isolated.
+#
+# Every assertion costs a process spawn, so by default the suite shards itself across parallel
+# workers. Use --sequential for readable, grouped output when diagnosing a failure.
 #
 # Usage:  bash tests/gates.tests.sh
+#         bash tests/gates.tests.sh --sequential     one process, grouped by section
+#         bash tests/gates.tests.sh --workers 4      override the worker count
 # Exit code is 0 when every test passes, 1 otherwise.
+
+SHARD=-1
+SHARD_COUNT=1
+WORKERS=0
+SEQUENTIAL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --shard) SHARD="$2"; shift 2 ;;
+    --of) SHARD_COUNT="$2"; shift 2 ;;
+    --workers) WORKERS="$2"; shift 2 ;;
+    --sequential) SEQUENTIAL=1; shift ;;
+    *) shift ;;
+  esac
+done
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE_SCRIPT="$(cd "$TESTS_DIR/.." && pwd)/hooks/scripts/autodev-gates.sh"
@@ -26,9 +47,78 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------------------------
+# Dispatcher: fan the cases out across worker processes and aggregate.
+# ---------------------------------------------------------------------------------------------
+if [ "$SHARD" -lt 0 ] && [ "$SEQUENTIAL" -eq 0 ]; then
+  if [ "$WORKERS" -le 0 ]; then
+    WORKERS="$( (nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4) )"
+    [ "$WORKERS" -gt 8 ] 2>/dev/null && WORKERS=8
+    [ "$WORKERS" -ge 1 ] 2>/dev/null || WORKERS=4
+  fi
+  OUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/autodev-gate-shards-XXXXXX")"
+  echo
+  echo "autodev-plan gate tracker tests (bash), $WORKERS workers"
+  echo "Use --sequential for output grouped by section."
+  START_TS=$(date +%s)
+  i=0
+  while [ "$i" -lt "$WORKERS" ]; do
+    bash "${BASH_SOURCE[0]}" --shard "$i" --of "$WORKERS" > "$OUT_DIR/shard-$i.log" 2>&1 &
+    i=$((i + 1))
+  done
+  wait
+  TOTAL_PASSED=0
+  TOTAL_FAILED=0
+  MISSING=""
+  i=0
+  while [ "$i" -lt "$WORKERS" ]; do
+    log="$OUT_DIR/shard-$i.log"
+    SAW_RESULT=0
+    if [ -f "$log" ]; then
+      while IFS= read -r line; do
+        case "$line" in
+          RESULT\ *)
+            SAW_RESULT=1
+            set -- $line
+            TOTAL_PASSED=$((TOTAL_PASSED + $2))
+            TOTAL_FAILED=$((TOTAL_FAILED + $3))
+            ;;
+          *) printf '%s\n' "$line" ;;
+        esac
+      done < "$log"
+    fi
+    # A worker that dies before printing its tally takes its whole share of the cases with it.
+    # Without this the run would report only the surviving shards' results and pass.
+    [ "$SAW_RESULT" -eq 1 ] || MISSING="$MISSING $i"
+    i=$((i + 1))
+  done
+  rm -rf "$OUT_DIR"
+  ELAPSED=$(( $(date +%s) - START_TS ))
+  echo
+  if [ -n "$MISSING" ]; then
+    for s in $MISSING; do
+      echo "  worker shard $s produced no result summary (crashed or was killed); its cases did not run"
+    done
+    echo "$TOTAL_PASSED passed, $TOTAL_FAILED failed, worker(s)$MISSING did not report  (${ELAPSED}s)"
+    exit 1
+  fi
+  if [ "$TOTAL_FAILED" -gt 0 ]; then
+    echo "$TOTAL_PASSED passed, $TOTAL_FAILED failed  (${ELAPSED}s)"
+    exit 1
+  fi
+  if [ "$TOTAL_PASSED" -eq 0 ]; then
+    echo "no tests ran - the workers produced no results (${ELAPSED}s)"
+    exit 1
+  fi
+  echo "$TOTAL_PASSED passed, 0 failed  (${ELAPSED}s)"
+  exit 0
+fi
+
 COPILOT_HOME="$(mktemp -d "${TMPDIR:-/tmp}/autodev-gate-tests-XXXXXX")"
 export COPILOT_HOME
 GATES_DIR="$COPILOT_HOME/autodev-plan/gates"
+WORKDIRS="$COPILOT_HOME/work"
+mkdir -p "$WORKDIRS"
 trap 'rm -rf "$COPILOT_HOME"' EXIT
 
 SESSION_SEQ=0
@@ -41,17 +131,33 @@ new_session_id() {
 }
 
 hook() { # event json
+  # A malformed payload makes the hook fail open, so a test that expects '{}' would pass for
+  # entirely the wrong reason. Emit an obviously-wrong marker instead so the assertion fails
+  # loudly and names the cause.
+  printf '%s' "$2" | jq -e . >/dev/null 2>&1 || { printf 'MALFORMED-TEST-PAYLOAD'; return 1; }
   printf '%s\n' "$2" | bash "$GATE_SCRIPT" "$1"
 }
 
+# The tracker keys its files off the session working directory, so give every session its own.
+session_cwd() { # sid
+  local d="$WORKDIRS/$1"
+  mkdir -p "$d" 2>/dev/null
+  printf '%s' "$d"
+}
+
+state_path()    { printf '%s/autodev-plan/gates/%s.json' "$COPILOT_HOME" "$1"; }
+mirror_path()   { printf '%s/.autodev/gate-status.json' "$(session_cwd "$1")"; }
+audit_path()    { printf '%s/.autodev/gate-audit.md' "$(session_cwd "$1")"; }
+feedback_path() { printf '%s/.autodev/feedback-log.md' "$(session_cwd "$1")"; }
+
 start_gate() { # sid gate
-  hook subagentStart "$(jq -cn --arg s "$1" --arg g "$2" \
-    '{sessionId:$s, agentName:("autodev-plan:autodev-" + $g + "-review")}')" > /dev/null
+  hook subagentStart "$(jq -cn --arg s "$1" --arg g "$2" --arg c "$(session_cwd "$1")" \
+    '{sessionId:$s, cwd:$c, agentName:("autodev-plan:autodev-" + $g + "-review")}')" > /dev/null
 }
 
 stop_gate() { # sid gate response
-  hook subagentStop "$(jq -cn --arg s "$1" --arg g "$2" --arg r "$3" \
-    '{sessionId:$s, agentName:("autodev-plan:autodev-" + $g + "-review"), response:$r}')"
+  hook subagentStop "$(jq -cn --arg s "$1" --arg g "$2" --arg r "$3" --arg c "$(session_cwd "$1")" \
+    '{sessionId:$s, cwd:$c, agentName:("autodev-plan:autodev-" + $g + "-review"), response:$r}')"
 }
 
 round() { # sid gate verdict -> footer text
@@ -62,11 +168,25 @@ AUTODEV-VERDICT: $3" | jq -r '.modifiedResponse // ""'
 }
 
 agent_stop() { # sid
-  hook agentStop "$(jq -cn --arg s "$1" '{sessionId:$s, stopReason:"end_turn"}')"
+  hook agentStop "$(jq -cn --arg s "$1" --arg c "$(session_cwd "$1")" \
+    '{sessionId:$s, cwd:$c, stopReason:"end_turn"}')"
 }
 
 ask_user() { # sid
-  hook preToolUse "$(jq -cn --arg s "$1" '{sessionId:$s, toolName:"ask_user"}')"
+  hook preToolUse "$(jq -cn --arg s "$1" --arg c "$(session_cwd "$1")" \
+    '{sessionId:$s, cwd:$c, toolName:"ask_user"}')"
+}
+
+reviewer_task() { # sid gate
+  # Build the nested JSON in a variable first. macOS ships bash 3.2, whose $( ) parser
+  # mishandles parentheses inside an embedded single-quoted program, which silently produced a
+  # malformed payload -- and a malformed payload is fail-open, so the assertion that mattered
+  # (a deny) turned into a pass-through.
+  local cwd args
+  cwd="$(session_cwd "$1")"
+  args="$(jq -cn --arg a "autodev-plan:autodev-$2-review" '{agent_type:$a, prompt:"review"}')"
+  hook preToolUse "$(jq -cn --arg s "$1" --arg c "$cwd" --arg t "$args" \
+    '{sessionId:$s, cwd:$c, toolName:"task", toolArgs:$t}')"
 }
 
 fail() { CURRENT_ERROR="$1"; return 1; }
@@ -79,7 +199,15 @@ assert_match() { # pattern actual because
   printf '%s' "$2" | grep -qE "$1" || fail "expected match for '$1' but got '$2'. ${3:-}"
 }
 
+CASE_INDEX=-1
+
 run_test() { # name function
+  # Round-robin the cases across workers. Every worker walks the whole file, so this stays a
+  # plain linear script and no test needs to know it is being sharded.
+  CASE_INDEX=$((CASE_INDEX + 1))
+  if [ "$SHARD_COUNT" -gt 1 ] && [ $((CASE_INDEX % SHARD_COUNT)) -ne "$SHARD" ]; then
+    return
+  fi
   CURRENT_ERROR=""
   if "$2" 2>/dev/null; then
     PASSED=$((PASSED + 1))
@@ -91,13 +219,40 @@ run_test() { # name function
   fi
 }
 
-echo
-echo "autodev-plan gate tracker tests (bash)"
-echo "script: $GATE_SCRIPT"
+section() {
+  # Section headers only make sense in a single ordered run; across workers they would repeat.
+  [ "$SHARD_COUNT" -le 1 ] || return 0
+  echo
+  echo "$1"
+}
+
+# Seeds the enforcement state directly. Used only where reaching a state through real rounds
+# would cost dozens of process spawns and the accumulation itself is not what is under test; the
+# tests that DO cover accumulation (the 9-vs-10 attempt boundary, and two sessions counting
+# independently) still drive every round through the hook.
+seed_state() { # sid  jq-assignment-expression
+  local sid="$1" expr="${2:-.}" path
+  path="$(state_path "$sid")"
+  mkdir -p "$(dirname "$path")"
+  jq -n --arg sid "$sid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+    sessionId: $sid, createdAt: $now, updatedAt: $now, blocks: 0, totalInvocations: 0,
+    architectureAttempts: 0, architectureVerdict: "pending",
+    securityAttempts: 0,     securityVerdict: "pending",
+    privacyAttempts: 0,      privacyVerdict: "pending"
+  }' | jq "$expr" > "$path"
+}
+
+# The common setup: one gate has spent its entire budget without passing.
+seed_stuck_gate() { # sid [gate]
+  local gate="${2:-architecture}"
+  seed_state "$1" ".${gate}Attempts = 10 | .${gate}Verdict = \"ISSUES\" | .totalInvocations = 10"
+}
+
+section "autodev-plan gate tracker tests (bash)"
+[ "$SHARD_COUNT" -le 1 ] && echo "script: $GATE_SCRIPT"
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Verdict parsing (must read only the final meaningful line)"
+section "Verdict parsing (must read only the final meaningful line)"
 # --------------------------------------------------------------------------------------------
 
 FENCE='```'
@@ -107,6 +262,7 @@ VERDICT_CASES=(
   "clean ISSUES|ISSUES|Findings.\n\nAUTODEV-VERDICT: ISSUES"
   "trailing blank lines|PASS|AUTODEV-VERDICT: PASS\n\n\n"
   "wrapped in a code fence|PASS|text\n$FENCE\nAUTODEV-VERDICT: PASS\n$FENCE"
+  "fence and verdict share a line|PASS|text\n${FENCE}AUTODEV-VERDICT: PASS${FENCE}"
   "bold markdown|PASS|text\n\n**AUTODEV-VERDICT: PASS**"
   "trailing period|PASS|text\n\nAUTODEV-VERDICT: PASS."
   "indented verdict line|PASS|text\n\n    AUTODEV-VERDICT: PASS"
@@ -137,8 +293,7 @@ for CASE in "${VERDICT_CASES[@]}"; do
 done
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Fail-safes (a hook must never deny a tool call or crash)"
+section "Fail-safes (a hook must never deny a tool call or crash)"
 # --------------------------------------------------------------------------------------------
 
 t_stop_no_state() { assert_equal '{}' "$(agent_stop "$(new_session_id)")"; }
@@ -159,14 +314,29 @@ for AGENT in explore general-purpose security-review code-review task; do
 done
 
 t_corrupt_state() {
-  local sid
+  local sid statep
   sid="$(new_session_id)"
-  mkdir -p "$GATES_DIR"
-  echo '{{{ not json' > "$GATES_DIR/$sid.json"
+  statep="$(state_path "$sid")"
+  mkdir -p "$(dirname "$statep")"
+  echo '{{{ not json' > "$statep"
   assert_equal '{}' "$(ask_user "$sid")" || return 1
   assert_equal '{}' "$(agent_stop "$sid")"
 }
 run_test "corrupt state file does not deny ask_user or block stopping" t_corrupt_state
+
+t_no_owner_state_not_adopted() {
+  # preToolUse is fail-closed, so a hand-edited or truncated file must not be able to deny tools
+  # in a session it has nothing to do with.
+  local sid statep
+  sid="$(new_session_id)"
+  statep="$(state_path "$sid")"
+  mkdir -p "$(dirname "$statep")"
+  echo '{"totalInvocations":30,"architectureAttempts":10,"architectureVerdict":"ISSUES","securityVerdict":"pending","privacyVerdict":"pending"}' > "$statep"
+  assert_equal '{}' "$(reviewer_task "$sid" architecture)" || return 1
+  assert_equal '{}' "$(ask_user "$sid")" || return 1
+  assert_equal '{}' "$(agent_stop "$sid")"
+}
+run_test "a state file with no owner is never adopted" t_no_owner_state_not_adopted
 
 t_garbage_stdin() {
   local out code
@@ -197,14 +367,17 @@ t_no_jq() {
 run_test "missing jq degrades to a no-op instead of denying" t_no_jq
 
 t_path_traversal() {
-  hook subagentStart '{"sessionId":"../../evil","agentName":"autodev-plan:autodev-security-review"}' > /dev/null
-  [ ! -f "$COPILOT_HOME/evil.json" ] || fail 'state file was written outside the gates directory'
+  local safe
+  safe="$(session_cwd "hostile-id-cwd")"
+  hook subagentStart "$(jq -cn --arg c "$safe" \
+    '{sessionId:"../../evil", cwd:$c, agentName:"autodev-plan:autodev-security-review"}')" > /dev/null
+  [ ! -f "$COPILOT_HOME/evil.json" ] || fail 'state file was written outside the state directory' || return 1
+  [ ! -f "$COPILOT_HOME/evil.md" ] || fail 'audit trail was written outside the state directory'
 }
-run_test "a hostile session id cannot escape the gates directory" t_path_traversal
+run_test "a hostile session id cannot escape the state directory" t_path_traversal
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Enforcement"
+section "Enforcement"
 # --------------------------------------------------------------------------------------------
 
 t_block_while_outstanding() {
@@ -226,19 +399,29 @@ t_deny_ask_user() {
 run_test "ask_user is denied while gating" t_deny_ask_user
 
 for TOOL in view edit create task bash powershell grep glob; do
-  # Defense in depth. hooks.json scopes this hook to ask_user, but if that matcher were ever
-  # broadened the orchestrator would be denied the task tool it needs to invoke the next gate,
-  # and would then deadlock against the agentStop block.
+  # Defense in depth. hooks.json scopes this hook to ask_user and task, but if that matcher
+  # were ever broadened the orchestrator would be denied the tools it needs to revise the plan
+  # and invoke the next gate, and would then deadlock against the agentStop block. 'task' must
+  # stay allowed while a gate still has attempts left.
   # shellcheck disable=SC2317
   t_other_tool_allowed() {
     local sid out
     sid="$(new_session_id)"
     round "$sid" architecture ISSUES > /dev/null
-    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg t "$TOOL" '{sessionId:$s, toolName:$t}')")"
+    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg t "$TOOL" --arg c "$(session_cwd "$sid")" \
+      '{sessionId:$s, cwd:$c, toolName:$t}')")"
     assert_equal '{}' "$out"
   }
   run_test "'$TOOL' is NOT denied while gating" t_other_tool_allowed
 done
+
+t_reviewer_allowed_with_budget() {
+  local sid
+  sid="$(new_session_id)"
+  round "$sid" architecture ISSUES > /dev/null
+  assert_equal '{}' "$(reviewer_task "$sid" architecture)"
+}
+run_test "invoking a reviewer is permitted while the gate still has attempts left" t_reviewer_allowed_with_budget
 
 t_names_next_gate() {
   local sid
@@ -258,23 +441,32 @@ t_all_pass_releases() {
 run_test "all gates passing releases the block and permits ask_user" t_all_pass_releases
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Loop bounds"
+section "Loop bounds"
 # --------------------------------------------------------------------------------------------
 
-t_escalate_after_5() {
+t_escalate_after_budget() {
   local sid i
   sid="$(new_session_id)"
-  for i in 1 2 3 4 5; do round "$sid" architecture ISSUES > /dev/null; done
+  for i in $(seq 1 10); do round "$sid" architecture ISSUES > /dev/null; done
   assert_equal '{}' "$(agent_stop "$sid")" 'escalation must release the stop block' || return 1
   assert_equal '{}' "$(ask_user "$sid")" 'escalation must re-permit ask_user'
 }
-run_test "a gate escalates after 5 failed attempts and unlocks the human" t_escalate_after_5
+run_test "a gate escalates after 10 failed attempts and unlocks the human" t_escalate_after_budget
+
+t_no_escalate_one_short() {
+  # Guards the off-by-one directly: 9 failures must still be a live gate.
+  local sid i
+  sid="$(new_session_id)"
+  for i in $(seq 1 9); do round "$sid" architecture ISSUES > /dev/null; done
+  assert_equal 'block' "$(agent_stop "$sid" | jq -r '.decision // ""')" \
+    'the gate still has an attempt left, so stopping must still be blocked'
+}
+run_test "a gate does NOT escalate one attempt short of the budget" t_no_escalate_one_short
 
 t_escalation_names_stuck() {
-  local sid i footer
+  local sid footer
   sid="$(new_session_id)"
-  for i in 1 2 3 4 5; do round "$sid" architecture ISSUES > /dev/null; done
+  seed_stuck_gate "$sid"
   # A different gate reports next; the footer must still point at architecture.
   footer="$(round "$sid" security ISSUES)"
   assert_match 'architecture gate' "$footer"
@@ -287,7 +479,7 @@ t_regate_resets_budget() {
   for i in 1 2 3; do round "$sid" architecture ISSUES > /dev/null; done
   round "$sid" architecture PASS > /dev/null
   footer="$(round "$sid" architecture ISSUES)"
-  assert_match 'Attempt 1 of 5' "$footer" 'a re-gate must not inherit the previous pass count'
+  assert_match 'Attempt 1 of 10' "$footer" 'a re-gate must not inherit the previous pass count'
 }
 run_test "re-gating a passed gate starts a fresh attempt budget" t_regate_resets_budget
 
@@ -307,21 +499,126 @@ t_block_guard() {
 run_test "the block counter stops fighting the CLI runaway guard" t_block_guard
 
 t_total_ceiling() {
-  local sid i gate footer
+  # Seeded one invocation short of the ceiling, so the next real round must trip it. This pins
+  # the boundary exactly, where looping until the message appeared only proved it happened
+  # eventually -- and cost forty round trips to do it.
+  local sid footer
   sid="$(new_session_id)"
-  for i in $(seq 1 10); do
-    for gate in architecture security privacy; do
-      footer="$(round "$sid" "$gate" PASS)"
-      case "$footer" in *"permitted reviewer invocations"*) return 0 ;; esac
-    done
-  done
-  fail 'cascade never hit the 20-invocation ceiling'
+  seed_state "$sid" '.totalInvocations = 39
+    | .architectureAttempts = 1 | .architectureVerdict = "PASS"
+    | .securityAttempts = 1     | .securityVerdict = "PASS"
+    | .privacyAttempts = 1      | .privacyVerdict = "PASS"'
+  footer="$(round "$sid" architecture PASS)"
+  assert_match 'permitted reviewer invocations' "$footer"
 }
 run_test "the session-wide invocation ceiling escalates a runaway cascade" t_total_ceiling
 
+t_ceiling_not_early() {
+  local sid footer
+  sid="$(new_session_id)"
+  seed_state "$sid" '.totalInvocations = 38
+    | .architectureAttempts = 1 | .architectureVerdict = "PASS"
+    | .securityAttempts = 1     | .securityVerdict = "PASS"
+    | .privacyAttempts = 1      | .privacyVerdict = "PASS"'
+  footer="$(round "$sid" architecture PASS)"
+  case "$footer" in
+    *"permitted reviewer invocations"*) fail 'the ceiling fired at 39 invocations'; return 1 ;;
+  esac
+}
+run_test "the session-wide ceiling does not fire one invocation early" t_ceiling_not_early
+
+t_ceiling_leaves_room() {
+  # If the ceiling were at or below (gates * per-gate budget) it would silently become the real
+  # limit and the per-gate budget would never be reachable on the last gate.
+  local sid footer
+  sid="$(new_session_id)"
+  seed_state "$sid" '.totalInvocations = 22
+    | .architectureAttempts = 11 | .architectureVerdict = "PASS"
+    | .securityAttempts = 11     | .securityVerdict = "PASS"'
+  footer="$(round "$sid" privacy ISSUES)"
+  assert_match 'Attempt 1 of 10' "$footer" || return 1
+  assert_match '9 attempt\(s\) remain' "$footer" 'the last gate must still get a full budget'
+}
+run_test "the session-wide ceiling leaves room for every gate to spend its budget" t_ceiling_leaves_room
+
 # --------------------------------------------------------------------------------------------
-echo
-echo "Re-gate invalidation"
+section "Budget exhaustion actually stops the loop"
+# --------------------------------------------------------------------------------------------
+
+t_refuse_after_budget() {
+  # The footer only *asks* the orchestrator to stop. This is what makes the cap real: an
+  # orchestrator that ignores the escalation instruction still cannot start an 11th review.
+  local sid out
+  sid="$(new_session_id)"
+  seed_stuck_gate "$sid"
+  out="$(reviewer_task "$sid" architecture)"
+  assert_equal 'deny' "$(printf '%s' "$out" | jq -r '.permissionDecision // ""')" || return 1
+  assert_match 'out of budget' "$(printf '%s' "$out" | jq -r '.permissionDecisionReason // ""')" || return 1
+  assert_match 'architecture' "$(printf '%s' "$out" | jq -r '.permissionDecisionReason // ""')"
+}
+run_test "once a gate is out of attempts, re-invoking any reviewer is refused" t_refuse_after_budget
+
+t_allowed_one_short_of_cap() {
+  # Guards the boundary from the other side: the deny must not start a round early.
+  local sid
+  sid="$(new_session_id)"
+  seed_state "$sid" '.architectureAttempts = 9 | .architectureVerdict = "ISSUES" | .totalInvocations = 9'
+  assert_equal '{}' "$(reviewer_task "$sid" architecture)"
+}
+run_test "a reviewer is still permitted one attempt short of the cap" t_allowed_one_short_of_cap
+
+t_refuse_other_gate_too() {
+  # Skipping ahead to the next gate would produce a plan that never cleared architecture.
+  local sid
+  sid="$(new_session_id)"
+  seed_stuck_gate "$sid"
+  assert_equal 'deny' "$(reviewer_task "$sid" security | jq -r '.permissionDecision // ""')"
+}
+run_test "a stuck gate also blocks moving on to a different reviewer" t_refuse_other_gate_too
+
+t_refusal_scoped_to_reviewers() {
+  # The orchestrator may still need explore or general-purpose agents to write up the
+  # escalation, so only reviewer invocations are refused.
+  local sid agent out args cwd
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  seed_stuck_gate "$sid"
+  for agent in explore general-purpose code-review security-review; do
+    args="$(jq -cn --arg a "$agent" '{agent_type:$a, prompt:"go"}')"
+    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg c "$cwd" --arg t "$args" \
+      '{sessionId:$s, cwd:$c, toolName:"task", toolArgs:$t}')")"
+    assert_equal '{}' "$out" "'$agent' must still be allowed" || return 1
+  done
+}
+run_test "the refusal does not spill over onto non-reviewer sub-agents" t_refusal_scoped_to_reviewers
+
+t_malformed_task_args() {
+  local sid bad out cwd
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  seed_stuck_gate "$sid"
+  for bad in '' 'not json at all' '{"no_agent_type":1}' '[]'; do
+    out="$(hook preToolUse "$(jq -cn --arg s "$sid" --arg a "$bad" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, toolName:"task", toolArgs:$a}')")"
+    assert_equal '{}' "$out" "toolArgs '$bad' must fail open" || return 1
+  done
+}
+run_test "malformed task arguments never deny the tool call" t_malformed_task_args
+
+t_refuse_at_session_ceiling() {
+  local sid
+  sid="$(new_session_id)"
+  seed_state "$sid" '.totalInvocations = 40
+    | .architectureAttempts = 1 | .architectureVerdict = "PASS"
+    | .securityAttempts = 1     | .securityVerdict = "PASS"
+    | .privacyAttempts = 1      | .privacyVerdict = "ISSUES"'
+  assert_match 'permitted reviewer invocations' \
+    "$(reviewer_task "$sid" privacy | jq -r '.permissionDecisionReason // ""')"
+}
+run_test "reviewers are refused once the session-wide ceiling is reached" t_refuse_at_session_ceiling
+
+# --------------------------------------------------------------------------------------------
+section "Re-gate invalidation"
 # --------------------------------------------------------------------------------------------
 
 t_regate_invalidates_downstream() {
@@ -341,8 +638,7 @@ t_regate_invalidates_downstream() {
 run_test "re-gating an earlier gate invalidates the later ones" t_regate_invalidates_downstream
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Audit trail"
+section "Audit trail"
 # --------------------------------------------------------------------------------------------
 
 t_audit_rows() {
@@ -350,7 +646,7 @@ t_audit_rows() {
   sid="$(new_session_id)"
   round "$sid" architecture ISSUES > /dev/null
   round "$sid" architecture PASS > /dev/null
-  audit="$GATES_DIR/$sid.md"
+  audit="$(audit_path "$sid")"
   [ -f "$audit" ] || fail "no audit trail at $audit" || return 1
   rows="$(grep -cE '^\| [0-9]{4}-' "$audit")"
   assert_equal 4 "$rows" 'expected two invoked rows and two completed rows' || return 1
@@ -363,14 +659,238 @@ t_no_temp_files() {
   local sid count
   sid="$(new_session_id)"
   round "$sid" architecture PASS > /dev/null
-  count="$(find "$GATES_DIR" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')"
+  count="$(find "$(dirname "$(state_path "$sid")")" -name '*.tmp' 2>/dev/null | wc -l | tr -d ' ')"
   assert_equal 0 "$count" 'temp files must be renamed away or cleaned up'
 }
 run_test "state writes leave no orphaned temp files" t_no_temp_files
 
 # --------------------------------------------------------------------------------------------
-echo
-echo "Hook wiring (hooks.json is what connects all of the above to the CLI)"
+section "Developer-visible artifacts under .autodev/"
+# --------------------------------------------------------------------------------------------
+
+t_artifacts_reachable() {
+  local sid p
+  sid="$(new_session_id)"
+  round "$sid" architecture ISSUES > /dev/null
+  for p in "$(state_path "$sid")" "$(mirror_path "$sid")" "$(audit_path "$sid")" "$(feedback_path "$sid")"; do
+    [ -f "$p" ] || fail "expected $p to exist" || return 1
+  done
+}
+run_test "state, mirror, audit trail and feedback log are all reachable" t_artifacts_reachable
+
+t_state_outside_workspace() {
+  # The orchestrator may edit workspace files while gating, so anything it could rewrite is not
+  # enforcement. Only a read-only view belongs in .autodev.
+  local sid cwd
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  round "$sid" architecture ISSUES > /dev/null
+  case "$(state_path "$sid")" in
+    "$cwd"*) fail 'enforcement state must not live inside the workspace'; return 1 ;;
+  esac
+  assert_equal 1 "$(jq -r '.architectureAttempts' "$(mirror_path "$sid")")" \
+    'the mirror must reflect the real state' || return 1
+  assert_equal 'ISSUES' "$(jq -r '.architectureVerdict' "$(mirror_path "$sid")")"
+}
+run_test "enforcement state lives outside the workspace, the mirror inside it" t_state_outside_workspace
+
+t_mirror_tampering_ignored() {
+  local sid
+  sid="$(new_session_id)"
+  round "$sid" architecture ISSUES > /dev/null
+  echo '{"sessionId":"x","architectureVerdict":"PASS","securityVerdict":"PASS","privacyVerdict":"PASS","architectureAttempts":1,"securityAttempts":1,"privacyAttempts":1,"totalInvocations":3,"blocks":0}' \
+    > "$(mirror_path "$sid")"
+  assert_equal 'block' "$(agent_stop "$sid" | jq -r '.decision // ""')" \
+    'rewriting the mirror must not release the gate'
+}
+run_test "tampering with the mirror does not weaken a gate" t_mirror_tampering_ignored
+
+t_two_sessions_independent() {
+  # This is what makes the caps real. If sessions shared one state file they would reset each
+  # other and no gate would ever reach its limit. Every round here goes through the hook,
+  # because real interleaved accumulation is exactly what is under test.
+  local shared a b i sid
+  shared="$(session_cwd "$(new_session_id)")"
+  a="$(new_session_id)"
+  b="$(new_session_id)"
+  for i in 1 2 3; do
+    for sid in "$a" "$b"; do
+      hook subagentStart "$(jq -cn --arg s "$sid" --arg c "$shared" \
+        '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
+      hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$shared" \
+        '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+          response:"finding\n\nAUTODEV-VERDICT: ISSUES"}')" > /dev/null
+    done
+  done
+  for sid in "$a" "$b"; do
+    assert_equal 3 "$(jq -r '.architectureAttempts' "$(state_path "$sid")")" \
+      "session $sid lost attempts to the other session" || return 1
+  done
+  # Take one session to its cap; the other must keep its own budget.
+  seed_state "$a" '.architectureAttempts = 9 | .architectureVerdict = "ISSUES" | .totalInvocations = 9'
+  hook subagentStart "$(jq -cn --arg s "$a" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
+  hook subagentStop "$(jq -cn --arg s "$a" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+      response:"finding\n\nAUTODEV-VERDICT: ISSUES"}')" > /dev/null
+
+  assert_equal 'deny' "$(hook preToolUse "$(jq -cn --arg s "$a" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, toolName:"task",
+      toolArgs:"{\"agent_type\":\"autodev-plan:autodev-architecture-review\"}"}')" | jq -r '.permissionDecision // ""')" \
+    'the session at its cap must be refused' || return 1
+  assert_equal '{}' "$(hook preToolUse "$(jq -cn --arg s "$b" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, toolName:"task",
+      toolArgs:"{\"agent_type\":\"autodev-plan:autodev-architecture-review\"}"}')")" \
+    'the other session must keep its own budget'
+}
+run_test "two sessions in one directory keep independent attempt counters" t_two_sessions_independent
+
+t_reset_once_per_session() {
+  local sid i rows entries
+  sid="$(new_session_id)"
+  for i in 1 2 3; do round "$sid" architecture ISSUES > /dev/null; done
+  rows="$(grep -cE '^\| [0-9]{4}-' "$(audit_path "$sid")")"
+  assert_equal 6 "$rows" 'three rounds must leave six rows, not one' || return 1
+  entries="$(grep -cE '^# [a-z]+ - attempt ' "$(feedback_path "$sid")")"
+  assert_equal 3 "$entries" 'three rounds must leave three feedback entries'
+}
+run_test "the audit trail is reset once per session, not on every invocation" t_reset_once_per_session
+
+t_feedback_verbatim() {
+  local sid log
+  sid="$(new_session_id)"
+  start_gate "$sid" architecture
+  stop_gate "$sid" architecture "### blocker Unbounded retry loop
+The worker never gives up.
+
+AUTODEV-VERDICT: ISSUES" > /dev/null
+  log="$(cat "$(feedback_path "$sid")")"
+  assert_match 'blocker Unbounded retry loop' "$log" 'the reviewer findings must be preserved' || return 1
+  assert_match 'The worker never gives up\.' "$log" || return 1
+  assert_match '^# architecture - attempt 1 - ISSUES$' "$log" \
+    'entries must be labelled with gate, attempt and verdict'
+}
+run_test "the feedback log records each reviewer response verbatim" t_feedback_verbatim
+
+t_feedback_accumulates() {
+  local sid log needle
+  sid="$(new_session_id)"
+  start_gate "$sid" architecture
+  stop_gate "$sid" architecture "First round finding.
+
+AUTODEV-VERDICT: ISSUES" > /dev/null
+  start_gate "$sid" architecture
+  stop_gate "$sid" architecture "Now resolved.
+
+AUTODEV-VERDICT: PASS" > /dev/null
+  start_gate "$sid" security
+  stop_gate "$sid" security "Secrets in logs.
+
+AUTODEV-VERDICT: ISSUES" > /dev/null
+  log="$(cat "$(feedback_path "$sid")")"
+  for needle in 'First round finding' 'Now resolved' 'Secrets in logs'; do
+    assert_match "$needle" "$log" "the log must keep every round, missing '$needle'" || return 1
+  done
+  assert_match '^# security - attempt 1 - ISSUES$' "$log"
+}
+run_test "the feedback log accumulates every attempt of every gate" t_feedback_accumulates
+
+t_footer_points_at_logs() {
+  local sid gate footer
+  sid="$(new_session_id)"
+  for gate in architecture security; do round "$sid" "$gate" PASS > /dev/null; done
+  footer="$(round "$sid" privacy PASS)"
+  assert_match 'feedback-log\.md' "$footer" || return 1
+  assert_match 'gate-audit\.md' "$footer"
+}
+run_test "the footer points the orchestrator at the feedback log when gating finishes" t_footer_points_at_logs
+
+t_new_session_does_not_inherit() {
+  # The files sit at fixed paths now, so a stale run must never hand a fresh session three
+  # passing gates or append its rows to the old session's audit trail.
+  local shared first second gate rows
+  shared="$(session_cwd "$(new_session_id)")"
+  first="$(new_session_id)"
+  for gate in architecture security privacy; do
+    hook subagentStart "$(jq -cn --arg s "$first" --arg c "$shared" --arg g "$gate" \
+      '{sessionId:$s, cwd:$c, agentName:("autodev-plan:autodev-" + $g + "-review")}')" > /dev/null
+    hook subagentStop "$(jq -cn --arg s "$first" --arg c "$shared" --arg g "$gate" \
+      '{sessionId:$s, cwd:$c, agentName:("autodev-plan:autodev-" + $g + "-review"),
+        response:"ok\n\nAUTODEV-VERDICT: PASS"}')" > /dev/null
+  done
+
+  second="$(new_session_id)"
+  # Before the new session runs anything, its gates must read as untouched.
+  assert_equal '{}' "$(hook agentStop "$(jq -cn --arg s "$second" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, stopReason:"end_turn"}')")" 'an idle session must not be blocked' || return 1
+
+  hook subagentStart "$(jq -cn --arg s "$second" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
+  hook subagentStop "$(jq -cn --arg s "$second" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+      response:"ok\n\nAUTODEV-VERDICT: PASS"}')" > /dev/null
+
+  # Count before the agentStop below, which legitimately adds its own blocked-stop row.
+  rows="$(grep -cE '^\| [0-9]{4}-' "$shared/.autodev/gate-audit.md")"
+  assert_equal 2 "$rows" 'the audit trail must restart for the new session' || return 1
+
+  assert_equal 'block' "$(hook agentStop "$(jq -cn --arg s "$second" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, stopReason:"end_turn"}')" | jq -r '.decision // ""')" \
+    "the old session's security and privacy passes must not carry over"
+}
+run_test "a new session does not inherit a previous run left in the same directory" t_new_session_does_not_inherit
+
+t_feedback_timestamp() {
+  local sid log
+  sid="$(new_session_id)"
+  round "$sid" architecture ISSUES > /dev/null
+  log="$(cat "$(feedback_path "$sid")")"
+  assert_match '_[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} UTC_' "$log" \
+    'each entry needs a timestamp, not an empty marker'
+}
+run_test "the feedback log stamps each entry with a readable timestamp" t_feedback_timestamp
+
+t_non_ascii_round_trip() {
+  # Reviewers routinely emit en dashes and curly quotes. These must survive into both the
+  # feedback log and the footer handed back to the orchestrator.
+  local sid out footer log
+  sid="$(new_session_id)"
+  start_gate "$sid" architecture
+  out="$(stop_gate "$sid" architecture "Rows 4–6 use the client’s token.
+
+AUTODEV-VERDICT: ISSUES")"
+  footer="$(printf '%s' "$out" | jq -r '.modifiedResponse // ""')"
+  assert_match '4–6' "$footer" 'the footer must preserve the reviewer text verbatim' || return 1
+  log="$(cat "$(feedback_path "$sid")")"
+  assert_match '4–6' "$log" 'the feedback log must preserve the reviewer text verbatim' || return 1
+  assert_match 'client’s' "$log"
+}
+run_test "non-ASCII reviewer text survives the round trip" t_non_ascii_round_trip
+
+t_no_stray_autodev_dir() {
+  # The hooks fire in every session once the plugin is installed. Creating the state directory
+  # eagerly would litter an empty '.autodev' into any repo where someone merely used the task
+  # tool. It must appear only when a real review gate starts.
+  local sid cwd
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  hook preToolUse "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+    '{sessionId:$s, cwd:$c, toolName:"task", toolArgs:"{\"agent_type\":\"explore\"}"}')" > /dev/null
+  hook preToolUse "$(jq -cn --arg s "$sid" --arg c "$cwd" '{sessionId:$s, cwd:$c, toolName:"ask_user"}')" > /dev/null
+  hook subagentStart "$(jq -cn --arg s "$sid" --arg c "$cwd" '{sessionId:$s, cwd:$c, agentName:"explore"}')" > /dev/null
+  hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+    '{sessionId:$s, cwd:$c, agentName:"explore", response:"done"}')" > /dev/null
+  hook agentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" '{sessionId:$s, cwd:$c, stopReason:"end_turn"}')" > /dev/null
+  [ ! -d "$cwd/.autodev" ] || fail '.autodev was created by a session that never ran a review gate' || return 1
+
+  # ...but a real gate does create it.
+  start_gate "$sid" architecture
+  [ -d "$cwd/.autodev" ] || fail '.autodev was not created when a review gate started'
+}
+run_test "unrelated tool calls and sub-agents do not create a .autodev directory" t_no_stray_autodev_dir
+
+# --------------------------------------------------------------------------------------------
+section "Hook wiring (hooks.json is what connects all of the above to the CLI)"
 # --------------------------------------------------------------------------------------------
 
 PLUGIN_ROOT_DIR="$(cd "$TESTS_DIR/.." && pwd)"
@@ -459,12 +979,15 @@ t_pretooluse_matcher_scope() {
   local pattern tool
   pattern="$(hooks_q '.hooks.preToolUse[0].matcher // ""')"
   [ -n "$pattern" ] || fail 'preToolUse has no matcher; it would fire for every tool call' || return 1
-  matches "$pattern" 'ask_user' || fail "matcher does not match 'ask_user'" || return 1
-  for tool in view edit create task bash powershell grep glob web_fetch; do
+  # 'task' must reach the hook so budget exhaustion can refuse further reviewer runs.
+  for tool in ask_user task; do
+    matches "$pattern" "$tool" || fail "matcher does not match '$tool'" || return 1
+  done
+  for tool in view edit create bash powershell grep glob web_fetch; do
     if matches "$pattern" "$tool"; then fail "matcher wrongly matches '$tool'"; return 1; fi
   done
 }
-run_test "the preToolUse matcher is scoped to ask_user only" t_pretooluse_matcher_scope
+run_test "the preToolUse matcher covers ask_user and task, and nothing else" t_pretooluse_matcher_scope
 
 t_subagentstop_no_matcher() {
   # The script filters on agentName in-process instead; if a matcher were added here the
@@ -484,6 +1007,13 @@ t_hooks_timeouts() {
 run_test "every hook entry sets a timeout" t_hooks_timeouts
 
 # --------------------------------------------------------------------------------------------
+
+if [ "$SHARD" -ge 0 ]; then
+  # Machine-readable tally for the dispatcher; it prints the human summary.
+  printf 'RESULT %s %s\n' "$PASSED" "$FAILED"
+  [ "$FAILED" -gt 0 ] && exit 1
+  exit 0
+fi
 
 echo
 if [ "$FAILED" -gt 0 ]; then

@@ -155,17 +155,26 @@ Addressing findings means:
 - Edit the plan file itself. The next invocation re-reads the file from disk, so unwritten fixes
   do not count.
 
-Report progress to the user between gates in one line each — for example,
-`Architecture gate passed on attempt 2. Starting security review.` They are watching, even though
-they are not participating.
+Keep the user informed as you go. They are watching the gates run without participating, so
+your messages are the only view they have into what the reviewers said.
+
+- **When a reviewer returns `ISSUES`, say what it found before you start revising.** List each
+  finding as a one-line summary with its severity — for example,
+  `Architecture attempt 1 → ISSUES: [blocker] no server-side authorization on the share
+  endpoint; [major] shared_with as a comma-separated column blocks indexing; [minor] no
+  rollback path.` Then say what you are doing about them, including anything you are pushing
+  back on. "All three findings are valid, revising the plan" tells the user nothing about
+  whether the review caught something they care about.
+- **When a gate passes, say so in one line** — for example,
+  `Architecture gate passed on attempt 2. Starting security review.`
 
 ### 8. WRAPUP
 
 Once all three gates hold a `PASS`:
 
 1. Tell the user the plan is complete and **state the absolute path to the plan file**.
-2. State the path to the audit trail (see *The gate tracker*), so they can verify the reviews
-   genuinely happened.
+2. State the paths to the audit trail and the reviewer feedback log (see *The gate tracker*), so
+   they can verify the reviews genuinely happened and read the findings in full.
 3. Summarize what the reviews changed — the two or three most substantive amendments across all
    three gates. This is often the most valuable thing you tell them.
 4. Note any unresolved disagreements or accepted risks recorded in *Review notes*.
@@ -234,7 +243,7 @@ has started yet in this session, because that determines what the tracker will l
   WRAPUP or present the plan as reviewed when no review happened.
 - **A gate has already started.** You are mid-gating: `ask_user` is denied and you cannot end
   your turn cleanly, so stopping is not available to you. Keep retrying the gate. Each retry that
-  actually starts the reviewer counts toward the 5-attempt cap, and reaching it escalates and
+  actually starts the reviewer counts toward the 10-attempt cap, and reaching it escalates and
   unlocks `ask_user` so you can bring in the user properly. If the retries keep failing *before*
   the reviewer starts, no attempt accrues and the cap cannot be reached — the tracker will
   release you after several blocked stops, and you should then report the failure plainly in your
@@ -253,7 +262,7 @@ gate, and leave it out entirely on a first attempt.
 
 ## Escalation — the loop is bounded
 
-Each gate is capped at **5 attempts**. On the 5th consecutive `ISSUES` for a single gate, stop
+Each gate is capped at **10 attempts**. On the 10th consecutive `ISSUES` for a single gate, stop
 looping and bring in the user:
 
 1. Tell them plainly which gate is stuck and that it has hit the attempt limit.
@@ -274,9 +283,13 @@ trail reflects that. Never describe an escalated gate as passed, waived, or reso
 
 A gate that passes on attempt 4 resets nothing — the cap is per gate, **per pass through that
 gate**. If a gate that already passed is re-run because of a material change (see *Re-gating*),
-its attempt budget starts fresh. A separate ceiling of **20 total reviewer invocations per
+its attempt budget starts fresh. A separate ceiling of **40 total reviewer invocations per
 session** bounds the whole workflow, including re-gate cascades; reaching it escalates the same
 way.
+
+You do not have to police these caps yourself. Once a limit is reached the tracker refuses any
+further `task` call to a reviewer, so the loop ends whether or not you notice. Treat that refusal
+as the signal to escalate.
 
 ---
 
@@ -348,11 +361,19 @@ manage this and cannot bypass it; you should simply know it exists:
   disagrees with your own reading, the footer wins.
 - If you try to end your turn while gates are still outstanding, you will be told to continue.
   That is not an error; it means you stopped early. Resume with the gate you were told to run.
-- A human-readable audit trail is written to
-  `<COPILOT_HOME>/autodev-plan/gates/<sessionId>.md` (`COPILOT_HOME` defaults to `~/.copilot`).
-  Report this path in WRAPUP, but **do not try to read the file** — it lives outside the
-  workspace and reading it will simply be denied. You do not need its contents; the tracker
-  footers already told you everything it records.
+- Once a gate runs out of attempts the tracker stops asking and starts refusing: further `task`
+  calls to any reviewer are denied outright. If you see that denial, the loop is over — go
+  straight to escalation. Do not try to work around it.
+- Two files are written next to the plan, in the same `.autodev/` directory:
+  - `.autodev/gate-audit.md` — one row per reviewer lifecycle event.
+  - `.autodev/feedback-log.md` — each reviewer's full response, verbatim.
+  - `.autodev/gate-status.json` — a live mirror of the tracker's state.
+
+  Report the first two paths in WRAPUP so the user can read the reviews for themselves. You may
+  read these files if you need to, but you should not need to: the tracker footers already tell
+  you everything they record. **Never edit them.** They exist so the user can see what the
+  reviewers actually said; rewriting them would only mislead the user, and it would not change a
+  gate — the state that enforces the gates is kept outside the workspace.
 
 If the tracker footer never appears, the plugin's hooks are not loaded. Say so plainly in
 WRAPUP — the workflow still ran, but the user has no independent evidence the gates executed, and
@@ -415,7 +436,8 @@ findings, and any decisions the user made at an escalation. Leave the heading in
 
 ## Style
 
-- Be concise with the user. They want a plan, not a transcript of your reasoning.
+- Be concise with the user. They want a plan, not a transcript of your reasoning. The one thing
+  worth spending words on is what the reviewers found — never compress that to a bare count.
 - Say what you are doing at each phase transition, in one line.
 - When you make a judgment call on the user's behalf during gating, write it into the plan so
   they can find and challenge it later. Silent decisions are the thing that erodes trust in an
