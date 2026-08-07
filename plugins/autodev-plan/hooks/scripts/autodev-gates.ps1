@@ -22,8 +22,9 @@
 
     A mirror of that state, the audit trail and the reviewer feedback log are written into
     '<session cwd>/.autodev/' so a developer can watch a run in progress and read the reviews
-    afterwards, next to the plan the gates are reviewing. Those three files are a *view*: nothing
-    reads them back, so tampering with them cannot weaken a gate.
+    afterwards, next to the plan the gates are reviewing. Audit and feedback are records only.
+    The state mirror is read only as an exact-session recovery checkpoint when authoritative
+    state is missing or corrupt; normal enforcement always prefers the external state.
 
     SAFETY: preToolUse command hooks are fail-closed - any non-zero exit or crash denies the
     tool call. A bug here would permanently break ask_user for the user, so every path is
@@ -119,38 +120,71 @@ function New-DefaultState {
 }
 
 function Read-State {
-    param([string]$Path, [string]$SessionId)
-    $state = New-DefaultState -SessionId $SessionId
-    if (-not (Test-Path -LiteralPath $Path)) { return $state }
-    try {
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $state }
-        $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+    param([string]$Path, [string]$RecoveryPath, [string]$SessionId)
+    # The out-of-workspace file is authoritative. The workspace copy is also a recovery
+    # checkpoint: if the authoritative directory is deleted mid-run, the next reviewer must
+    # restore the same session rather than look like a new session and erase the audit trail.
+    # An exact session-id match prevents a previous run in this workspace from being adopted.
+    $candidates = @($Path)
+    if (-not [string]::IsNullOrWhiteSpace($RecoveryPath) -and $RecoveryPath -ne $Path) {
+        $candidates += $RecoveryPath
     }
-    catch {
-        # Corrupt or unreadable state is treated as absent. Never fatal.
-        return $state
-    }
-    # State is keyed by session id in its filename, so a mismatch should be impossible. Require
-    # an exact match anyway: adopting a file whose owner is unknown or missing would let a
-    # hand-edited or truncated file drive enforcement in a session it has nothing to do with.
-    $ownerProp = $parsed.PSObject.Properties['sessionId']
-    if ($null -eq $ownerProp -or [string]$ownerProp.Value -ne $SessionId) {
-        return $state
-    }
-    foreach ($key in @($state.Keys)) {
-        $prop = $parsed.PSObject.Properties[$key]
-        if ($null -ne $prop -and $null -ne $prop.Value) {
-            $state[$key] = $prop.Value
+    foreach ($candidate in $candidates) {
+        # Start clean for every candidate. A corrupt authoritative file must not partially
+        # mutate defaults that are then reused while processing the recovery checkpoint.
+        $state = New-DefaultState -SessionId $SessionId
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        try {
+            $raw = Get-Content -LiteralPath $candidate -Raw -ErrorAction Stop
+            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+            $ownerProp = $parsed.PSObject.Properties['sessionId']
+            if ($null -eq $ownerProp -or [string]$ownerProp.Value -ne $SessionId) { continue }
+
+            $numericKeys = @('blocks', 'totalInvocations')
+            foreach ($gate in $script:GateOrder) { $numericKeys += "${gate}Attempts" }
+            foreach ($key in $numericKeys) {
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
+                $normalized = 0
+                $rendered = [Convert]::ToString(
+                    $prop.Value,
+                    [Globalization.CultureInfo]::InvariantCulture)
+                if ($rendered -notmatch '^[0-9]+$' -or
+                    -not [int]::TryParse($rendered, [ref]$normalized) -or
+                    $normalized -lt 0) {
+                    throw "Invalid state counter '$key'."
+                }
+                $state[$key] = $normalized
+            }
+
+            foreach ($gate in $script:GateOrder) {
+                $key = "${gate}Verdict"
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
+                $verdict = [string]$prop.Value
+                if ($verdict -notin @('pending', 'running', 'PASS', 'ISSUES')) {
+                    throw "Invalid state verdict '$key'."
+                }
+                $state[$key] = $verdict
+            }
+
+            foreach ($key in @('createdAt', 'updatedAt')) {
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -ne $prop -and $null -ne $prop.Value) {
+                    $state[$key] = [string]$prop.Value
+                }
+            }
+            return $state
+        }
+        catch {
+            # Syntax, merge and normalization failures corrupt only this candidate. Try the
+            # exact-session recovery checkpoint before treating state as absent.
+            continue
         }
     }
-    # Normalize numeric fields that may have round-tripped as strings.
-    $state['blocks'] = [int]$state['blocks']
-    $state['totalInvocations'] = [int]$state['totalInvocations']
-    foreach ($gate in $script:GateOrder) {
-        $state["${gate}Attempts"] = [int]$state["${gate}Attempts"]
-    }
-    return $state
+
+    return (New-DefaultState -SessionId $SessionId)
 }
 
 function Write-State {
@@ -164,6 +198,11 @@ function Write-State {
         Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
         Move-Item -LiteralPath $tmp -Destination $Path -Force
     }
+    catch {
+        # Do not let a persistence failure swallow an enforcement decision. The mirror write
+        # below may still preserve the updated state, and the hook can still return its block or
+        # deny response.
+    }
     finally {
         # If the rename failed (for example a transient lock) the temp file would otherwise be
         # orphaned in the gates directory, so clean it up unconditionally.
@@ -171,11 +210,21 @@ function Write-State {
             Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         }
     }
-    # Best-effort human-facing copy. Nothing ever reads this back, so a failure here must not
-    # affect enforcement.
+    # Human-facing copy and recovery checkpoint. Normal enforcement always reads the
+    # authoritative path first; this is consulted only when that file is missing or corrupt.
+    # It must be atomic too -- a torn checkpoint is indistinguishable from no recovery state.
     if (-not [string]::IsNullOrWhiteSpace($MirrorPath)) {
-        try { Set-Content -LiteralPath $MirrorPath -Value $json -Encoding UTF8 -ErrorAction Stop }
+        $mirrorTmp = "$MirrorPath.$PID.tmp"
+        try {
+            Set-Content -LiteralPath $mirrorTmp -Value $json -Encoding UTF8 -ErrorAction Stop
+            Move-Item -LiteralPath $mirrorTmp -Destination $MirrorPath -Force -ErrorAction Stop
+        }
         catch { }
+        finally {
+            if (Test-Path -LiteralPath $mirrorTmp) {
+                Remove-Item -LiteralPath $mirrorTmp -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
 
@@ -188,24 +237,50 @@ function Add-AuditRow {
         [string]$Action,
         [string]$Verdict
     )
-    if (-not (Test-Path -LiteralPath $Path)) {
-        $header = @(
-            '# autodev-plan review gate audit',
-            '',
-            "Session: ``$SessionId``",
-            "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
-            '',
-            'Every row below was written by a hook observing a real sub-agent lifecycle event.',
-            'The orchestrator does not write this file and is instructed not to edit it, but it',
-            'lives in your workspace, so treat it as a record rather than as proof.',
-            '',
-            '| Time (UTC) | Gate | Attempt | Event | Verdict |',
-            '| --- | --- | --- | --- | --- |'
-        )
-        Set-Content -LiteralPath $Path -Value ($header -join [Environment]::NewLine) -Encoding UTF8
+    try {
+        $sessionMarker = "Session: ``$SessionId``"
+        if (-not (Test-Path -LiteralPath $Path)) {
+            $header = @(
+                '# autodev-plan review gate audit',
+                '',
+                $sessionMarker,
+                "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
+                '',
+                'Every row below was written by a hook observing a real sub-agent lifecycle event.',
+                'The orchestrator does not write this file and is instructed not to edit it, but it',
+                'lives in your workspace, so treat it as a record rather than as proof.',
+                '',
+                '| Time (UTC) | Gate | Attempt | Event | Verdict |',
+                '| --- | --- | --- | --- | --- |'
+            )
+            Set-Content -LiteralPath $Path -Value ($header -join [Environment]::NewLine) -Encoding UTF8
+        }
+        else {
+            # Windows PowerShell returns $null for a zero-byte file. Coerce it to an empty
+            # string so a manually cleared or interrupted file self-heals with a new section.
+            $existing = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+            if ($null -eq $existing) { $existing = '' }
+            if (-not $existing.Contains($sessionMarker)) {
+                $sessionHeader = @(
+                    '',
+                    '---',
+                    '',
+                    $sessionMarker,
+                    "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
+                    '',
+                    '| Time (UTC) | Gate | Attempt | Event | Verdict |',
+                    '| --- | --- | --- | --- | --- |'
+                )
+                Add-Content -LiteralPath $Path -Value ($sessionHeader -join [Environment]::NewLine) -Encoding UTF8
+            }
+        }
+        $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        Add-Content -LiteralPath $Path -Value "| $ts | $Gate | $Attempt | $Action | $Verdict |" -Encoding UTF8
     }
-    $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
-    Add-Content -LiteralPath $Path -Value "| $ts | $Gate | $Attempt | $Action | $Verdict |" -Encoding UTF8
+    catch {
+        # Auditability must never control enforcement. A missing/read-only workspace still gets
+        # the block or deny response derived from authoritative state.
+    }
 }
 
 function Add-FeedbackEntry {
@@ -217,37 +292,58 @@ function Add-FeedbackEntry {
         [string]$Verdict,
         [string]$Response
     )
-    if (-not (Test-Path -LiteralPath $Path)) {
-        $header = @(
-            '# autodev-plan reviewer feedback log',
+    try {
+        $sessionMarker = "Session: ``$SessionId``"
+        if (-not (Test-Path -LiteralPath $Path)) {
+            $header = @(
+                '# autodev-plan reviewer feedback log',
+                '',
+                $sessionMarker,
+                "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
+                '',
+                'Each entry is the reviewer sub-agent''s verbatim response, captured by a hook as the',
+                'sub-agent finished. The orchestrator does not write this file and is instructed not',
+                'to edit it, so it records what the reviewers actually said rather than what the',
+                'orchestrator chose to relay. It lives in your workspace and is not read back by the',
+                'gate tracker, so editing it changes nothing except this record.'
+            )
+            Set-Content -LiteralPath $Path -Value ($header -join [Environment]::NewLine) -Encoding UTF8
+        }
+        else {
+            $existing = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+            if ($null -eq $existing) { $existing = '' }
+            if (-not $existing.Contains($sessionMarker)) {
+                $sessionHeader = @(
+                    '',
+                    '---',
+                    '',
+                    $sessionMarker,
+                    "Started: $((Get-Date).ToUniversalTime().ToString('u'))"
+                )
+                Add-Content -LiteralPath $Path -Value ($sessionHeader -join [Environment]::NewLine) -Encoding UTF8
+            }
+        }
+        $ts = (Get-Date).ToUniversalTime().ToString('u')
+        if ([string]::IsNullOrWhiteSpace($Response)) { $Response = '_(the reviewer returned no content)_' }
+        $entry = @(
             '',
-            "Session: ``$SessionId``",
-            "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
+            '---',
             '',
-            'Each entry is the reviewer sub-agent''s verbatim response, captured by a hook as the',
-            'sub-agent finished. The orchestrator does not write this file and is instructed not',
-            'to edit it, so it records what the reviewers actually said rather than what the',
-            'orchestrator chose to relay. It lives in your workspace and is not read back by the',
-            'gate tracker, so editing it changes nothing except this record.'
+            # Level 1: reviewers use '##' and '###' for their own sections, so an entry header at
+            # the same level would be indistinguishable from the content it introduces.
+            "# $Gate - attempt $Attempt - $Verdict",
+            '',
+            # Braces are required: "$ts_" would be parsed as a variable named 'ts_'.
+            "_${ts}_",
+            '',
+            $Response.TrimEnd()
         )
-        Set-Content -LiteralPath $Path -Value ($header -join [Environment]::NewLine) -Encoding UTF8
+        Add-Content -LiteralPath $Path -Value ($entry -join [Environment]::NewLine) -Encoding UTF8
     }
-    $ts = (Get-Date).ToUniversalTime().ToString('u')
-    if ([string]::IsNullOrWhiteSpace($Response)) { $Response = '_(the reviewer returned no content)_' }
-    $entry = @(
-        '',
-        '---',
-        '',
-        # Level 1: reviewers use '##' and '###' for their own sections, so an entry header at
-        # the same level would be indistinguishable from the content it introduces.
-        "# $Gate - attempt $Attempt - $Verdict",
-        '',
-        # Braces are required: "$ts_" would be parsed as a variable named 'ts_'.
-        "_${ts}_",
-        '',
-        $Response.TrimEnd()
-    )
-    Add-Content -LiteralPath $Path -Value ($entry -join [Environment]::NewLine) -Encoding UTF8
+    catch {
+        # The reviewer response and gate verdict must still reach the orchestrator even when the
+        # workspace log cannot be written.
+    }
 }
 
 function Resolve-Gate {
@@ -408,18 +504,10 @@ try {
         'subagentStart' {
             $gate = Resolve-Gate -AgentName ([string]$payload.agentName)
             if ($null -eq $gate) { Write-JsonResult @{}; exit 0 }
-            if (-not (Confirm-Directory -Path $stateDir)) { Write-JsonResult @{}; exit 0 }
+            Confirm-Directory -Path $stateDir | Out-Null
             Confirm-Directory -Path $viewDir | Out-Null
 
-            $state = Read-State -Path $statePath -SessionId $sessionId
-            if ([int]$state['totalInvocations'] -eq 0) {
-                # First gate of this session. The developer-facing artifacts live at fixed paths
-                # in the workspace, so clear anything an earlier run left behind rather than
-                # appending this session's rows to a stale file. State is per session, so this
-                # fires exactly once per session.
-                Remove-Item -LiteralPath $auditPath -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $feedbackPath -Force -ErrorAction SilentlyContinue
-            }
+            $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             if ([string]$state["${gate}Verdict"] -eq 'PASS') {
                 # This gate already passed, so this is a re-gate after a material change.
                 # Start a fresh per-pass budget rather than charging it the old pass's attempts.
@@ -460,7 +548,7 @@ try {
             $response = [string]$payload.response
             $verdict = Read-VerdictFromResponse -Response $response
 
-            $state = Read-State -Path $statePath -SessionId $sessionId
+            $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             if ([int]$state["${gate}Attempts"] -lt 1) {
                 # subagentStart was missed somehow; still count this attempt.
                 $state["${gate}Attempts"] = 1
@@ -521,10 +609,18 @@ try {
         }
 
         'agentStop' {
-            if (-not (Test-Path -LiteralPath $statePath)) { Write-JsonResult @{}; exit 0 }
-            $state = Read-State -Path $statePath -SessionId $sessionId
+            if (-not (Test-Path -LiteralPath $statePath) -and
+                -not (Test-Path -LiteralPath $mirrorPath)) {
+                Write-JsonResult @{}
+                exit 0
+            }
+            $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             $phase = Get-Phase -State $state
             if ($phase -ne 'gating') { Write-JsonResult @{}; exit 0 }
+            # The authoritative directory may be what was deleted. Recreate it before persisting
+            # the recovered block counter; Write-State still fails open if this is impossible.
+            Confirm-Directory -Path $stateDir | Out-Null
+            Confirm-Directory -Path $viewDir | Out-Null
 
             $blocks = [int]$state['blocks']
             if ($blocks -ge $script:MaxBlocks) {
@@ -565,8 +661,12 @@ try {
             $toolName = [string]$payload.toolName
             if ($toolName -notmatch '^(?:ask_user|AskUserQuestion|task)$') { Write-JsonResult @{}; exit 0 }
 
-            if (-not (Test-Path -LiteralPath $statePath)) { Write-JsonResult @{}; exit 0 }
-            $state = Read-State -Path $statePath -SessionId $sessionId
+            if (-not (Test-Path -LiteralPath $statePath) -and
+                -not (Test-Path -LiteralPath $mirrorPath)) {
+                Write-JsonResult @{}
+                exit 0
+            }
+            $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             $phase = Get-Phase -State $state
 
             if ($toolName -eq 'task') {

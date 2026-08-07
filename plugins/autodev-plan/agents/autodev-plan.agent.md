@@ -371,9 +371,10 @@ manage this and cannot bypass it; you should simply know it exists:
 
   Report the first two paths in WRAPUP so the user can read the reviews for themselves. You may
   read these files if you need to, but you should not need to: the tracker footers already tell
-  you everything they record. **Never edit them.** They exist so the user can see what the
-  reviewers actually said; rewriting them would only mislead the user, and it would not change a
-  gate — the state that enforces the gates is kept outside the workspace.
+  you everything they record. **Never edit them.** The audit and feedback files exist so the user
+  can see what the reviewers actually said. `gate-status.json` is also the tracker's
+  same-session recovery checkpoint if its out-of-workspace state is ever lost; changing it could
+  corrupt that recovery path even though normal enforcement uses the external state.
 
 If the tracker footer never appears, the plugin's hooks are not loaded. Say so plainly in
 WRAPUP — the workflow still ran, but the user has no independent evidence the gates executed, and

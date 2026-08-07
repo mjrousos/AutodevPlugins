@@ -346,6 +346,45 @@ Test-Case 'a state file with no owner is never adopted' {
     Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
 }
 
+Test-Case 'semantically corrupt authoritative state falls back to the valid mirror' {
+    $cases = @(
+        @{ Name = 'non-numeric counter'; Property = 'blocks'; Value = 'bad' }
+        @{ Name = 'negative counter'; Property = 'architectureAttempts'; Value = -1 }
+        @{ Name = 'exponent-sized counter'; Property = 'totalInvocations'; Value = 1e30 }
+        @{ Name = 'signed numeric string'; Property = 'blocks'; Value = '+5' }
+        @{ Name = 'unknown verdict'; Property = 'architectureVerdict'; Value = 'PASSING' }
+    )
+    foreach ($case in $cases) {
+        $sid = New-SessionId
+        Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+        $corrupt = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+        $corrupt.PSObject.Properties[$case.Property].Value = $case.Value
+        Set-Content -LiteralPath (Get-StatePath $sid) -Value ($corrupt | ConvertTo-Json -Depth 5) -Encoding UTF8
+
+        $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+        Assert-Equal 'block' $stop.decision "$($case.Name) prevented mirror recovery"
+        Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+        $restored = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+        Assert-Equal 'PASS' $restored.architectureVerdict
+        Assert-Equal 1 $restored.blocks
+    }
+}
+
+Test-Case 'partial legacy state receives missing defaults' {
+    $sid = New-SessionId
+    $path = Get-StatePath $sid
+    New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $path -Encoding UTF8 -Value (@{
+            sessionId = $sid
+            architectureAttempts = '1'
+            architectureVerdict = 'PASS'
+            totalInvocations = '1'
+        } | ConvertTo-Json)
+    $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $stop.decision
+    Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+}
+
 Test-Case 'garbage stdin returns empty JSON and exits 0' {
     $out = 'this is not json' | powershell -NoProfile -ExecutionPolicy Bypass -File $script:GateScript preToolUse
     Assert-Equal 0 $LASTEXITCODE 'hook must exit 0'
@@ -633,7 +672,7 @@ Test-Case 'state, mirror, audit trail and feedback log are all reachable' {
 
 Test-Case 'enforcement state lives outside the workspace, the mirror inside it' {
     # The orchestrator may edit workspace files while gating, so anything it could rewrite is
-    # not enforcement. Only a read-only view belongs in .autodev.
+    # not the normal enforcement source. Only the view/recovery checkpoint belongs in .autodev.
     $sid = New-SessionId
     $cwd = Get-SessionCwd $sid
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
@@ -651,6 +690,100 @@ Test-Case 'tampering with the mirror does not weaken a gate' {
     Set-Content -LiteralPath (Get-MirrorPath $sid) -Value '{"sessionId":"x","architectureVerdict":"PASS","securityVerdict":"PASS","privacyVerdict":"PASS","architectureAttempts":1,"securityAttempts":1,"privacyAttempts":1,"totalInvocations":3,"blocks":0}'
     $parsed = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
     Assert-Equal 'block' $parsed.decision 'rewriting the mirror must not release the gate'
+}
+
+Test-Case 'losing authoritative state between reviewers recovers from the mirror' {
+    # Regression: deleting COPILOT_HOME/autodev-plan mid-session made the next reviewer look like
+    # the first gate. subagentStart then erased both logs and demanded architecture again.
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    $auditBefore = Get-Content -LiteralPath (Get-AuditPath $sid) -Raw
+    $feedbackBefore = Get-Content -LiteralPath (Get-FeedbackPath $sid) -Raw
+
+    # Delete the whole tracker tree, matching the real incident -- not just the JSON file.
+    Remove-Item -LiteralPath (Join-Path $script:Root 'autodev-plan') -Recurse -Force
+    $ask = Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' } | ConvertFrom-Json
+    Assert-Equal 'deny' $ask.permissionDecision 'gating must remain active during recovery'
+    Start-Gate -SessionId $sid -Gate 'security'
+
+    $recovered = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal 'PASS' $recovered.architectureVerdict 'the prior gate must survive recovery'
+    Assert-Equal 1 $recovered.architectureAttempts
+    Assert-Equal 'running' $recovered.securityVerdict 'the workflow must advance to security'
+    Assert-Equal 1 $recovered.securityAttempts
+    Assert-Equal 2 $recovered.totalInvocations
+
+    $auditAfter = Get-Content -LiteralPath (Get-AuditPath $sid) -Raw
+    $feedbackAfter = Get-Content -LiteralPath (Get-FeedbackPath $sid) -Raw
+    Assert-Match 'architecture \| 1 \| completed \| PASS' $auditAfter
+    Assert-Match 'security \| 1 \| invoked \| -' $auditAfter
+    if (-not $auditAfter.Contains($auditBefore.TrimEnd())) {
+        throw 'the prior audit rows were erased instead of preserved'
+    }
+    Assert-Equal $feedbackBefore $feedbackAfter 'starting security must preserve architecture feedback'
+}
+
+Test-Case 'agentStop recovers a missing authoritative state before enforcing' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    Remove-Item -LiteralPath (Join-Path $script:Root 'autodev-plan') -Recurse -Force
+
+    $decisions = 1..6 | ForEach-Object {
+        $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+        if ($stop.decision -eq 'block') {
+            Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+            '1'
+        }
+        else { '0' }
+    }
+    Assert-Equal '111110' ($decisions -join '') 'recovery must preserve the five-block surrender guard'
+    if (-not (Test-Path -LiteralPath (Get-StatePath $sid))) {
+        throw 'agentStop did not restore authoritative state from the mirror'
+    }
+}
+
+Test-Case 'agentStop does not depend on the workspace audit directory' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    $viewDir = Split-Path (Get-MirrorPath $sid) -Parent
+    Remove-Item -LiteralPath $viewDir -Recurse -Force
+    # Make recreation impossible: .autodev is a file, not a directory.
+    Set-Content -LiteralPath $viewDir -Value 'occupied'
+
+    $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $stop.decision 'an unavailable audit log must not swallow enforcement'
+    Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+}
+
+Test-Case 'agentStop persists its counter to the mirror when external state cannot be recreated' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    $stateRoot = Join-Path $script:Root 'autodev-plan'
+    Remove-Item -LiteralPath $stateRoot -Recurse -Force
+    Set-Content -LiteralPath $stateRoot -Value 'occupied'
+
+    $decisions = 1..6 | ForEach-Object {
+        $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+        if ($stop.decision -eq 'block') { '1' } else { '0' }
+    }
+    Remove-Item -LiteralPath $stateRoot -Force
+    Assert-Equal '111110' ($decisions -join '') 'the mirror must carry the block counter when external writes fail'
+    $mirror = Get-Content -LiteralPath (Get-MirrorPath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal 5 $mirror.blocks
+}
+
+Test-Case 'a mirror from another session is never used for recovery' {
+    $shared = Get-SessionCwd (New-SessionId)
+    $first = New-SessionId
+    Invoke-Hook 'subagentStart' @{ sessionId = $first; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    Invoke-Hook 'subagentStop' @{ sessionId = $first; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
+
+    $second = New-SessionId
+    Invoke-Hook 'subagentStart' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    $state = Get-Content -LiteralPath (Get-StatePath $second) -Raw | ConvertFrom-Json
+    Assert-Equal 'running' $state.architectureVerdict
+    Assert-Equal 1 $state.architectureAttempts 'a new session must start from attempt 1'
+    Assert-Equal 1 $state.totalInvocations 'a new session must not inherit the old invocation count'
 }
 
 Test-Case 'two sessions in one directory keep independent attempt counters' {
@@ -681,13 +814,32 @@ Test-Case 'two sessions in one directory keep independent attempt counters' {
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $b; cwd = $shared; toolName = 'task'; toolArgs = $args2 }) 'the other session must keep its own budget'
 }
 
-Test-Case 'the audit trail is reset once per session, not on every invocation' {
+Test-Case 'the audit and feedback logs accumulate every invocation in a session' {
     $sid = New-SessionId
     1..3 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
     $rows = @((Get-Content -LiteralPath (Get-AuditPath $sid)) | Where-Object { $_ -match '^\|\s+\d{4}-' })
     Assert-Equal 6 $rows.Count 'three rounds must leave six rows, not one'
     $entries = @((Get-Content -LiteralPath (Get-FeedbackPath $sid)) | Where-Object { $_ -match '^# \w+ - attempt ' })
     Assert-Equal 3 $entries.Count 'three rounds must leave three feedback entries'
+}
+
+Test-Case 'zero-byte Markdown logs self-heal without disabling tracking' {
+    $sid = New-SessionId
+    $audit = Get-AuditPath $sid
+    $feedback = Get-FeedbackPath $sid
+    New-Item -ItemType Directory -Path (Split-Path $audit -Parent) -Force | Out-Null
+    [IO.File]::WriteAllBytes($audit, [byte[]]@())
+    [IO.File]::WriteAllBytes($feedback, [byte[]]@())
+
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+
+    $auditText = Get-Content -LiteralPath $audit -Raw
+    $feedbackText = Get-Content -LiteralPath $feedback -Raw
+    Assert-Match ([regex]::Escape("Session: ``$sid``")) $auditText
+    Assert-Match 'architecture \| 1 \| invoked \| -' $auditText
+    Assert-Match 'architecture \| 1 \| completed \| ISSUES' $auditText
+    Assert-Match ([regex]::Escape("Session: ``$sid``")) $feedbackText
+    Assert-Match '(?m)^# architecture - attempt 1 - ISSUES\r?$' $feedbackText
 }
 
 Test-Case 'the feedback log records each reviewer response verbatim' {
@@ -726,15 +878,16 @@ Test-Case 'the footer points the orchestrator at the feedback log when gating fi
     Assert-Match 'gate-audit\.md' $footer
 }
 
-Test-Case 'a new session does not inherit a previous run left in the same directory' {
-    # The files sit at fixed paths now, so a stale run must never hand a fresh session three
-    # passing gates or append its rows to the old session's audit trail.
+Test-Case 'a new session gets fresh state but preserves previous Markdown logs' {
+    # State is per session, but human-readable history is append-only across sessions.
     $shared = Get-SessionCwd (New-SessionId)
     $first = New-SessionId
     foreach ($gate in @('architecture', 'security', 'privacy')) {
         Invoke-Hook 'subagentStart' @{ sessionId = $first; cwd = $shared; agentName = "autodev-plan:autodev-$gate-review" } | Out-Null
         Invoke-Hook 'subagentStop' @{ sessionId = $first; cwd = $shared; agentName = "autodev-plan:autodev-$gate-review"; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
     }
+    $auditBefore = Get-Content -LiteralPath (Join-Path (Join-Path $shared '.autodev') 'gate-audit.md') -Raw
+    $feedbackBefore = Get-Content -LiteralPath (Join-Path (Join-Path $shared '.autodev') 'feedback-log.md') -Raw
 
     $second = New-SessionId
     # Before the new session runs anything, its gates must read as untouched.
@@ -743,10 +896,20 @@ Test-Case 'a new session does not inherit a previous run left in the same direct
     Invoke-Hook 'subagentStart' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
     Invoke-Hook 'subagentStop' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
 
-    # Count before the agentStop below, which legitimately adds its own blocked-stop row.
     $audit = Join-Path (Join-Path $shared '.autodev') 'gate-audit.md'
-    $rows = @((Get-Content -LiteralPath $audit) | Where-Object { $_ -match '^\|\s+\d{4}-' })
-    Assert-Equal 2 $rows.Count 'the audit trail must restart for the new session'
+    $feedback = Join-Path (Join-Path $shared '.autodev') 'feedback-log.md'
+    $auditAfter = Get-Content -LiteralPath $audit -Raw
+    $feedbackAfter = Get-Content -LiteralPath $feedback -Raw
+    $rows = @(($auditAfter -split "`r?`n") | Where-Object { $_ -match '^\|\s+\d{4}-' })
+    Assert-Equal 8 $rows.Count 'six prior lifecycle rows and two new rows must all remain'
+    $entries = @(($feedbackAfter -split "`r?`n") | Where-Object { $_ -match '^# \w+ - attempt ' })
+    Assert-Equal 4 $entries.Count 'all reviewer responses from both sessions must remain'
+    if (-not $auditAfter.Contains($auditBefore.TrimEnd())) { throw 'the prior audit session was erased' }
+    if (-not $feedbackAfter.Contains($feedbackBefore.TrimEnd())) { throw 'the prior feedback session was erased' }
+    Assert-Match ([regex]::Escape("Session: ``$first``")) $auditAfter
+    Assert-Match ([regex]::Escape("Session: ``$second``")) $auditAfter
+    Assert-Match ([regex]::Escape("Session: ``$first``")) $feedbackAfter
+    Assert-Match ([regex]::Escape("Session: ``$second``")) $feedbackAfter
 
     $parsed = Invoke-Hook 'agentStop' @{ sessionId = $second; cwd = $shared; stopReason = 'end_turn' } | ConvertFrom-Json
     Assert-Equal 'block' $parsed.decision 'the old session''s security and privacy passes must not carry over'

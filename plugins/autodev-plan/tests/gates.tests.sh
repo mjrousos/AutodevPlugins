@@ -338,6 +338,66 @@ t_no_owner_state_not_adopted() {
 }
 run_test "a state file with no owner is never adopted" t_no_owner_state_not_adopted
 
+t_semantic_corruption_uses_mirror() {
+  local spec name filter sid state stop restored
+  for spec in \
+    'non-numeric counter|.blocks = "bad"' \
+    'negative counter|.architectureAttempts = -1' \
+    'exponent-sized counter|.totalInvocations = 1e30' \
+    'signed numeric string|.blocks = "+5"' \
+    'unknown verdict|.architectureVerdict = "PASSING"'; do
+    name="${spec%%|*}"
+    filter="${spec#*|}"
+    sid="$(new_session_id)"
+    round "$sid" architecture PASS > /dev/null
+    state="$(state_path "$sid")"
+    jq "$filter" "$state" > "$state.corrupt" && mv -f "$state.corrupt" "$state"
+
+    stop="$(agent_stop "$sid")"
+    assert_equal 'block' "$(printf '%s' "$stop" | jq -r '.decision // ""')" \
+      "$name prevented mirror recovery" || return 1
+    assert_match 'autodev-plan:autodev-security-review' \
+      "$(printf '%s' "$stop" | jq -r '.reason // ""')" || return 1
+    restored="$(cat "$state")"
+    assert_equal 'PASS' "$(printf '%s' "$restored" | jq -r '.architectureVerdict')" || return 1
+    assert_equal 1 "$(printf '%s' "$restored" | jq -r '.blocks')" || return 1
+  done
+}
+run_test "semantically corrupt authoritative state falls back to the valid mirror" t_semantic_corruption_uses_mirror
+
+t_partial_legacy_state() {
+  local sid path stop
+  sid="$(new_session_id)"
+  path="$(state_path "$sid")"
+  mkdir -p "$(dirname "$path")"
+  jq -n --arg sid "$sid" '{
+    sessionId:$sid,
+    architectureAttempts:"1",
+    architectureVerdict:"PASS",
+    totalInvocations:"1"
+  }' > "$path"
+  stop="$(agent_stop "$sid")"
+  assert_equal 'block' "$(printf '%s' "$stop" | jq -r '.decision // ""')" || return 1
+  assert_match 'autodev-plan:autodev-security-review' \
+    "$(printf '%s' "$stop" | jq -r '.reason // ""')"
+}
+run_test "partial legacy state receives missing defaults" t_partial_legacy_state
+
+t_state_file_is_snapshotted_once() {
+  # The workspace mirror is shared by sessions. Validation, owner checking and merging must all
+  # use one captured value, not reopen a path another session can atomically replace.
+  local body reads
+  body="$(sed -n '/^read_state_file()/,/^}/p' "$GATE_SCRIPT")"
+  assert_match 'snapshot="\$\(cat "\$path"' "$body" || return 1
+  reads="$(printf '%s' "$body" | grep -c 'cat "\$path"')"
+  assert_equal 1 "$reads" 'read_state_file must open the checkpoint exactly once' || return 1
+  if printf '%s' "$body" | grep -qE 'jq .*\\"\$path\\"'; then
+    fail 'read_state_file reopens the checkpoint with jq instead of using the snapshot'
+    return 1
+  fi
+}
+run_test "state recovery validates and merges one captured snapshot" t_state_file_is_snapshotted_once
+
 t_garbage_stdin() {
   local out code
   out="$(printf 'this is not json\n' | bash "$GATE_SCRIPT" preToolUse)"
@@ -680,7 +740,7 @@ run_test "state, mirror, audit trail and feedback log are all reachable" t_artif
 
 t_state_outside_workspace() {
   # The orchestrator may edit workspace files while gating, so anything it could rewrite is not
-  # enforcement. Only a read-only view belongs in .autodev.
+  # the normal enforcement source. Only the view/recovery checkpoint belongs in .autodev.
   local sid cwd
   sid="$(new_session_id)"
   cwd="$(session_cwd "$sid")"
@@ -704,6 +764,129 @@ t_mirror_tampering_ignored() {
     'rewriting the mirror must not release the gate'
 }
 run_test "tampering with the mirror does not weaken a gate" t_mirror_tampering_ignored
+
+t_authoritative_loss_recovers() {
+  # Regression: deleting COPILOT_HOME/autodev-plan mid-session made the next reviewer look like
+  # the first gate. subagentStart then erased both logs and demanded architecture again.
+  local sid audit_before feedback_before recovered audit_after feedback_after
+  sid="$(new_session_id)"
+  round "$sid" architecture PASS > /dev/null
+  audit_before="$(cat "$(audit_path "$sid")")"
+  feedback_before="$(cat "$(feedback_path "$sid")")"
+
+  # Delete the whole tracker tree, matching the real incident -- not just the JSON file.
+  rm -rf "$COPILOT_HOME/autodev-plan"
+  assert_equal 'deny' "$(ask_user "$sid" | jq -r '.permissionDecision // ""')" \
+    'gating must remain active during recovery' || return 1
+  start_gate "$sid" security
+
+  recovered="$(cat "$(state_path "$sid")")"
+  assert_equal 'PASS' "$(printf '%s' "$recovered" | jq -r '.architectureVerdict')" \
+    'the prior gate must survive recovery' || return 1
+  assert_equal 1 "$(printf '%s' "$recovered" | jq -r '.architectureAttempts')" || return 1
+  assert_equal 'running' "$(printf '%s' "$recovered" | jq -r '.securityVerdict')" \
+    'the workflow must advance to security' || return 1
+  assert_equal 1 "$(printf '%s' "$recovered" | jq -r '.securityAttempts')" || return 1
+  assert_equal 2 "$(printf '%s' "$recovered" | jq -r '.totalInvocations')" || return 1
+
+  audit_after="$(cat "$(audit_path "$sid")")"
+  feedback_after="$(cat "$(feedback_path "$sid")")"
+  assert_match 'architecture \| 1 \| completed \| PASS' "$audit_after" || return 1
+  assert_match 'security \| 1 \| invoked \| -' "$audit_after" || return 1
+  case "$audit_after" in
+    "$audit_before"*) ;;
+    *) fail 'the prior audit rows were erased instead of preserved'; return 1 ;;
+  esac
+  assert_equal "$feedback_before" "$feedback_after" \
+    'starting security must preserve architecture feedback'
+}
+run_test "losing authoritative state between reviewers recovers from the mirror" t_authoritative_loss_recovers
+
+t_agentstop_recovers() {
+  local sid out i decisions=""
+  sid="$(new_session_id)"
+  round "$sid" architecture PASS > /dev/null
+  rm -rf "$COPILOT_HOME/autodev-plan"
+
+  for i in 1 2 3 4 5 6; do
+    out="$(agent_stop "$sid")"
+    if [ "$(printf '%s' "$out" | jq -r '.decision // ""')" = "block" ]; then
+      assert_match 'autodev-plan:autodev-security-review' \
+        "$(printf '%s' "$out" | jq -r '.reason // ""')" || return 1
+      decisions="${decisions}1"
+    else
+      decisions="${decisions}0"
+    fi
+  done
+  assert_equal '111110' "$decisions" \
+    'recovery must preserve the five-block surrender guard' || return 1
+  [ -f "$(state_path "$sid")" ] ||
+    fail 'agentStop did not restore authoritative state from the mirror'
+}
+run_test "agentStop recovers a missing authoritative state before enforcing" t_agentstop_recovers
+
+t_agentstop_without_view_dir() {
+  local sid view_dir out
+  sid="$(new_session_id)"
+  round "$sid" architecture PASS > /dev/null
+  view_dir="$(dirname "$(mirror_path "$sid")")"
+  rm -rf "$view_dir"
+  # Make recreation impossible: .autodev is a file, not a directory.
+  printf 'occupied' > "$view_dir"
+
+  out="$(agent_stop "$sid")"
+  assert_equal 'block' "$(printf '%s' "$out" | jq -r '.decision // ""')" \
+    'an unavailable audit log must not swallow enforcement' || return 1
+  assert_match 'autodev-plan:autodev-security-review' \
+    "$(printf '%s' "$out" | jq -r '.reason // ""')"
+}
+run_test "agentStop does not depend on the workspace audit directory" t_agentstop_without_view_dir
+
+t_agentstop_when_state_dir_cannot_be_recreated() {
+  local sid i out decisions="" state_root
+  sid="$(new_session_id)"
+  round "$sid" architecture PASS > /dev/null
+  state_root="$COPILOT_HOME/autodev-plan"
+  rm -rf "$state_root"
+  printf 'occupied' > "$state_root"
+
+  for i in 1 2 3 4 5 6; do
+    out="$(agent_stop "$sid")"
+    if [ "$(printf '%s' "$out" | jq -r '.decision // ""')" = "block" ]; then
+      decisions="${decisions}1"
+    else
+      decisions="${decisions}0"
+    fi
+  done
+  # Restore the worker's shared COPILOT_HOME before any later test in this shard runs.
+  rm -f "$state_root"
+  assert_equal '111110' "$decisions" \
+    'the mirror must carry the block counter when external writes fail' || return 1
+  assert_equal 5 "$(jq -r '.blocks' "$(mirror_path "$sid")")"
+}
+run_test "agentStop persists its counter to the mirror when external state cannot be recreated" t_agentstop_when_state_dir_cannot_be_recreated
+
+t_other_session_mirror_not_recovered() {
+  local shared first second state
+  shared="$(session_cwd "$(new_session_id)")"
+  first="$(new_session_id)"
+  hook subagentStart "$(jq -cn --arg s "$first" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
+  hook subagentStop "$(jq -cn --arg s "$first" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+      response:"ok\n\nAUTODEV-VERDICT: PASS"}')" > /dev/null
+
+  second="$(new_session_id)"
+  hook subagentStart "$(jq -cn --arg s "$second" --arg c "$shared" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review"}')" > /dev/null
+  state="$(cat "$(state_path "$second")")"
+  assert_equal 'running' "$(printf '%s' "$state" | jq -r '.architectureVerdict')" || return 1
+  assert_equal 1 "$(printf '%s' "$state" | jq -r '.architectureAttempts')" \
+    'a new session must start from attempt 1' || return 1
+  assert_equal 1 "$(printf '%s' "$state" | jq -r '.totalInvocations')" \
+    'a new session must not inherit the old invocation count'
+}
+run_test "a mirror from another session is never used for recovery" t_other_session_mirror_not_recovered
 
 t_two_sessions_independent() {
   # This is what makes the caps real. If sessions shared one state file they would reset each
@@ -754,7 +937,26 @@ t_reset_once_per_session() {
   entries="$(grep -cE '^# [a-z]+ - attempt ' "$(feedback_path "$sid")")"
   assert_equal 3 "$entries" 'three rounds must leave three feedback entries'
 }
-run_test "the audit trail is reset once per session, not on every invocation" t_reset_once_per_session
+run_test "the audit and feedback logs accumulate every invocation in a session" t_reset_once_per_session
+
+t_empty_logs_self_heal() {
+  local sid audit feedback
+  sid="$(new_session_id)"
+  audit="$(audit_path "$sid")"
+  feedback="$(feedback_path "$sid")"
+  mkdir -p "$(dirname "$audit")"
+  : > "$audit"
+  : > "$feedback"
+
+  round "$sid" architecture ISSUES > /dev/null
+
+  grep -Fqx "Session: \`$sid\`" "$audit" || return 1
+  grep -q 'architecture | 1 | invoked | -' "$audit" || return 1
+  grep -q 'architecture | 1 | completed | ISSUES' "$audit" || return 1
+  grep -Fqx "Session: \`$sid\`" "$feedback" || return 1
+  grep -q '^# architecture - attempt 1 - ISSUES$' "$feedback"
+}
+run_test "zero-byte Markdown logs self-heal without disabling tracking" t_empty_logs_self_heal
 
 t_feedback_verbatim() {
   local sid log
@@ -805,10 +1007,9 @@ t_footer_points_at_logs() {
 }
 run_test "the footer points the orchestrator at the feedback log when gating finishes" t_footer_points_at_logs
 
-t_new_session_does_not_inherit() {
-  # The files sit at fixed paths now, so a stale run must never hand a fresh session three
-  # passing gates or append its rows to the old session's audit trail.
-  local shared first second gate rows
+t_new_session_preserves_logs() {
+  # State is per session, but human-readable history is append-only across sessions.
+  local shared first second gate rows entries audit_before feedback_before audit_after feedback_after
   shared="$(session_cwd "$(new_session_id)")"
   first="$(new_session_id)"
   for gate in architecture security privacy; do
@@ -818,6 +1019,8 @@ t_new_session_does_not_inherit() {
       '{sessionId:$s, cwd:$c, agentName:("autodev-plan:autodev-" + $g + "-review"),
         response:"ok\n\nAUTODEV-VERDICT: PASS"}')" > /dev/null
   done
+  audit_before="$(cat "$shared/.autodev/gate-audit.md")"
+  feedback_before="$(cat "$shared/.autodev/feedback-log.md")"
 
   second="$(new_session_id)"
   # Before the new session runs anything, its gates must read as untouched.
@@ -830,15 +1033,24 @@ t_new_session_does_not_inherit() {
     '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
       response:"ok\n\nAUTODEV-VERDICT: PASS"}')" > /dev/null
 
-  # Count before the agentStop below, which legitimately adds its own blocked-stop row.
-  rows="$(grep -cE '^\| [0-9]{4}-' "$shared/.autodev/gate-audit.md")"
-  assert_equal 2 "$rows" 'the audit trail must restart for the new session' || return 1
+  audit_after="$(cat "$shared/.autodev/gate-audit.md")"
+  feedback_after="$(cat "$shared/.autodev/feedback-log.md")"
+  rows="$(printf '%s' "$audit_after" | grep -cE '^\| [0-9]{4}-')"
+  assert_equal 8 "$rows" 'six prior lifecycle rows and two new rows must all remain' || return 1
+  entries="$(printf '%s' "$feedback_after" | grep -cE '^# [a-z]+ - attempt ')"
+  assert_equal 4 "$entries" 'all reviewer responses from both sessions must remain' || return 1
+  case "$audit_after" in "$audit_before"*) ;; *) fail 'the prior audit session was erased'; return 1 ;; esac
+  case "$feedback_after" in "$feedback_before"*) ;; *) fail 'the prior feedback session was erased'; return 1 ;; esac
+  grep -Fqx "Session: \`$first\`" "$shared/.autodev/gate-audit.md" || return 1
+  grep -Fqx "Session: \`$second\`" "$shared/.autodev/gate-audit.md" || return 1
+  grep -Fqx "Session: \`$first\`" "$shared/.autodev/feedback-log.md" || return 1
+  grep -Fqx "Session: \`$second\`" "$shared/.autodev/feedback-log.md" || return 1
 
   assert_equal 'block' "$(hook agentStop "$(jq -cn --arg s "$second" --arg c "$shared" \
     '{sessionId:$s, cwd:$c, stopReason:"end_turn"}')" | jq -r '.decision // ""')" \
     "the old session's security and privacy passes must not carry over"
 }
-run_test "a new session does not inherit a previous run left in the same directory" t_new_session_does_not_inherit
+run_test "a new session gets fresh state but preserves previous Markdown logs" t_new_session_preserves_logs
 
 t_feedback_timestamp() {
   local sid log
