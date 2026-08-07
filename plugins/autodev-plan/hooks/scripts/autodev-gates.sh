@@ -57,8 +57,9 @@ SESSION_CWD="$(json_get '.cwd')"
 #
 # A mirror of that state, the audit trail and the reviewer feedback log are written into
 # '<session cwd>/.autodev/' so a developer can watch a run in progress and read the reviews
-# afterwards. Those three files are a *view*: nothing reads them back, so tampering with them
-# cannot weaken a gate.
+# afterwards. Audit and feedback are records only. The state mirror is read only as an
+# exact-session recovery checkpoint when authoritative state is missing or corrupt; normal
+# enforcement always prefers the external state.
 #
 # Paths are resolved here but nothing is created; see ensure_dir. The hook runs on every matching
 # event in every session, and creating directories eagerly would litter an empty '.autodev' into
@@ -94,38 +95,51 @@ default_state() {
   }'
 }
 
+read_state_file() {
+  local path="$1" owner
+  [ -f "$path" ] && jq -e . "$path" >/dev/null 2>&1 || return 1
+  owner="$(jq -r '.sessionId // ""' "$path" 2>/dev/null)"
+  [ "$owner" = "$SAFE_SESSION_ID" ] || return 1
+  # Merge over defaults so a partial or older state file still yields every field.
+  jq -s '.[0] * .[1]' <(default_state) "$path" 2>/dev/null
+}
+
 read_state() {
-  if [ -f "$STATE_PATH" ] && jq -e . "$STATE_PATH" >/dev/null 2>&1; then
-    # State is keyed by session id in its filename, so a mismatch should be impossible. Require
-    # an exact match anyway: adopting a file whose owner is unknown or missing would let a
-    # hand-edited or truncated file drive enforcement in a session it has nothing to do with.
-    local owner
-    owner="$(jq -r '.sessionId // ""' "$STATE_PATH" 2>/dev/null)"
-    if [ "$owner" != "$SAFE_SESSION_ID" ]; then
-      default_state
-      return
-    fi
-    # Merge over defaults so a partial or older state file still yields every field.
-    jq -s '.[0] * .[1]' <(default_state) "$STATE_PATH" 2>/dev/null || default_state
-  else
-    # Missing or corrupt state is treated as absent. Never fatal.
-    default_state
+  local recovered
+  if recovered="$(read_state_file "$STATE_PATH")"; then
+    printf '%s' "$recovered"
+    return
   fi
+  # The workspace copy is also a recovery checkpoint. If the authoritative directory is
+  # deleted mid-run, restore an exact session-id match rather than treating the next reviewer
+  # as the first gate and erasing the prior audit and feedback.
+  if [ "$MIRROR_PATH" != "$STATE_PATH" ] && recovered="$(read_state_file "$MIRROR_PATH")"; then
+    printf '%s' "$recovered"
+    return
+  fi
+  default_state
 }
 
 write_state() {
   # Write then rename, so a concurrent reader never observes a half-written file. A torn read
   # would be treated as absent state, which would silently switch enforcement off. The temp
   # name includes the PID so two concurrent writers cannot clobber each other's temp file.
-  local tmp="$STATE_PATH.$$.tmp"
-  printf '%s' "$1" \
-    | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.updatedAt = $now' \
-    > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE_PATH" 2>/dev/null
+  local tmp="$STATE_PATH.$$.tmp" serialized
+  serialized="$(printf '%s' "$1" \
+    | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.updatedAt = $now' 2>/dev/null)" ||
+    serialized="$1"
+  printf '%s' "$serialized" > "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$STATE_PATH" 2>/dev/null
   rm -f "$tmp" 2>/dev/null
-  # Best-effort human-facing copy. Nothing ever reads this back, so a failure here must not
-  # affect enforcement.
-  [ -f "$STATE_PATH" ] && [ "$MIRROR_PATH" != "$STATE_PATH" ] &&
-    cp -f "$STATE_PATH" "$MIRROR_PATH" 2>/dev/null
+  # Human-facing copy and recovery checkpoint. Normal enforcement always reads the authoritative
+  # path first; this is consulted only when that file is missing or corrupt. It must be atomic
+  # too -- a torn checkpoint is indistinguishable from no recovery state.
+  if [ "$MIRROR_PATH" != "$STATE_PATH" ]; then
+    local mirror_tmp="$MIRROR_PATH.$$.tmp"
+    printf '%s' "$serialized" > "$mirror_tmp" 2>/dev/null &&
+      mv -f "$mirror_tmp" "$MIRROR_PATH" 2>/dev/null
+    rm -f "$mirror_tmp" 2>/dev/null
+  fi
   return 0
 }
 
@@ -149,6 +163,9 @@ add_audit_row() {
   printf '| %s | %s | %s | %s | %s |\n' \
     "$(date -u '+%Y-%m-%d %H:%M:%S')" "$gate" "$attempt" "$action" "$verdict" \
     >> "$AUDIT_PATH" 2>/dev/null
+  # Auditability must never control enforcement. A missing/read-only workspace still gets the
+  # block or deny response derived from authoritative state.
+  return 0
 }
 
 add_feedback_entry() {
@@ -174,6 +191,9 @@ add_feedback_entry() {
     printf '_%s_\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     printf '%s\n' "$response"
   } >> "$FEEDBACK_PATH" 2>/dev/null
+  # The reviewer response and gate verdict must still reach the orchestrator even when the
+  # workspace log cannot be written.
+  return 0
 }
 
 # toolArgs arrives as a JSON *string* rather than an object, so it needs a second parse.
@@ -278,8 +298,8 @@ case "$EVENT_NAME" in
   subagentStart)
     GATE="$(resolve_gate "$(json_get '.agentName')")"
     [ -n "$GATE" ] || emit_empty
-    ensure_dir "$STATE_DIR" || emit_empty
-    ensure_dir "$VIEW_DIR"
+    ensure_dir "$STATE_DIR" || true
+    ensure_dir "$VIEW_DIR" || true
     if [ "$(state_num "$STATE" 'totalInvocations')" -eq 0 ] 2>/dev/null; then
       # First gate of this session. The developer-facing artifacts live at fixed paths in the
       # workspace, so clear anything an earlier run left behind rather than appending this
@@ -316,8 +336,8 @@ case "$EVENT_NAME" in
     # subagentStop does not support a matcher, so filter here.
     GATE="$(resolve_gate "$(json_get '.agentName')")"
     [ -n "$GATE" ] || emit_empty
-    ensure_dir "$STATE_DIR"
-    ensure_dir "$VIEW_DIR"
+    ensure_dir "$STATE_DIR" || true
+    ensure_dir "$VIEW_DIR" || true
 
     RESPONSE="$(json_get '.response')"
     VERDICT="$(read_verdict "$RESPONSE")"
@@ -371,8 +391,12 @@ $FOOTER" '{modifiedResponse: $r}'
     ;;
 
   agentStop)
-    [ -f "$STATE_PATH" ] || emit_empty
+    [ -f "$STATE_PATH" ] || [ -f "$MIRROR_PATH" ] || emit_empty
     [ "$(get_phase "$STATE")" = "gating" ] || emit_empty
+    # The authoritative directory may be what was deleted. Recreate it before persisting the
+    # recovered block counter; write_state still updates the mirror if this is impossible.
+    ensure_dir "$STATE_DIR" || true
+    ensure_dir "$VIEW_DIR" || true
 
     BLOCKS="$(state_num "$STATE" 'blocks')"
     # Give up rather than fight the CLI's own runaway guard.
@@ -408,7 +432,7 @@ $FOOTER" '{modifiedResponse: $r}'
       *) emit_empty ;;
     esac
 
-    [ -f "$STATE_PATH" ] || emit_empty
+    [ -f "$STATE_PATH" ] || [ -f "$MIRROR_PATH" ] || emit_empty
     PHASE="$(get_phase "$STATE")"
 
     if [ "$(printf '%s' "$TOOL_NAME" | tr 'A-Z' 'a-z')" = "task" ]; then

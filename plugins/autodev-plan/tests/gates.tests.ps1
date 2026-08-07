@@ -633,7 +633,7 @@ Test-Case 'state, mirror, audit trail and feedback log are all reachable' {
 
 Test-Case 'enforcement state lives outside the workspace, the mirror inside it' {
     # The orchestrator may edit workspace files while gating, so anything it could rewrite is
-    # not enforcement. Only a read-only view belongs in .autodev.
+    # not the normal enforcement source. Only the view/recovery checkpoint belongs in .autodev.
     $sid = New-SessionId
     $cwd = Get-SessionCwd $sid
     Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
@@ -651,6 +651,100 @@ Test-Case 'tampering with the mirror does not weaken a gate' {
     Set-Content -LiteralPath (Get-MirrorPath $sid) -Value '{"sessionId":"x","architectureVerdict":"PASS","securityVerdict":"PASS","privacyVerdict":"PASS","architectureAttempts":1,"securityAttempts":1,"privacyAttempts":1,"totalInvocations":3,"blocks":0}'
     $parsed = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
     Assert-Equal 'block' $parsed.decision 'rewriting the mirror must not release the gate'
+}
+
+Test-Case 'losing authoritative state between reviewers recovers from the mirror' {
+    # Regression: deleting COPILOT_HOME/autodev-plan mid-session made the next reviewer look like
+    # the first gate. subagentStart then erased both logs and demanded architecture again.
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    $auditBefore = Get-Content -LiteralPath (Get-AuditPath $sid) -Raw
+    $feedbackBefore = Get-Content -LiteralPath (Get-FeedbackPath $sid) -Raw
+
+    # Delete the whole tracker tree, matching the real incident -- not just the JSON file.
+    Remove-Item -LiteralPath (Join-Path $script:Root 'autodev-plan') -Recurse -Force
+    $ask = Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' } | ConvertFrom-Json
+    Assert-Equal 'deny' $ask.permissionDecision 'gating must remain active during recovery'
+    Start-Gate -SessionId $sid -Gate 'security'
+
+    $recovered = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal 'PASS' $recovered.architectureVerdict 'the prior gate must survive recovery'
+    Assert-Equal 1 $recovered.architectureAttempts
+    Assert-Equal 'running' $recovered.securityVerdict 'the workflow must advance to security'
+    Assert-Equal 1 $recovered.securityAttempts
+    Assert-Equal 2 $recovered.totalInvocations
+
+    $auditAfter = Get-Content -LiteralPath (Get-AuditPath $sid) -Raw
+    $feedbackAfter = Get-Content -LiteralPath (Get-FeedbackPath $sid) -Raw
+    Assert-Match 'architecture \| 1 \| completed \| PASS' $auditAfter
+    Assert-Match 'security \| 1 \| invoked \| -' $auditAfter
+    if (-not $auditAfter.Contains($auditBefore.TrimEnd())) {
+        throw 'the prior audit rows were erased instead of preserved'
+    }
+    Assert-Equal $feedbackBefore $feedbackAfter 'starting security must preserve architecture feedback'
+}
+
+Test-Case 'agentStop recovers a missing authoritative state before enforcing' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    Remove-Item -LiteralPath (Join-Path $script:Root 'autodev-plan') -Recurse -Force
+
+    $decisions = 1..6 | ForEach-Object {
+        $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+        if ($stop.decision -eq 'block') {
+            Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+            '1'
+        }
+        else { '0' }
+    }
+    Assert-Equal '111110' ($decisions -join '') 'recovery must preserve the five-block surrender guard'
+    if (-not (Test-Path -LiteralPath (Get-StatePath $sid))) {
+        throw 'agentStop did not restore authoritative state from the mirror'
+    }
+}
+
+Test-Case 'agentStop does not depend on the workspace audit directory' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    $viewDir = Split-Path (Get-MirrorPath $sid) -Parent
+    Remove-Item -LiteralPath $viewDir -Recurse -Force
+    # Make recreation impossible: .autodev is a file, not a directory.
+    Set-Content -LiteralPath $viewDir -Value 'occupied'
+
+    $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $stop.decision 'an unavailable audit log must not swallow enforcement'
+    Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+}
+
+Test-Case 'agentStop persists its counter to the mirror when external state cannot be recreated' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    $stateRoot = Join-Path $script:Root 'autodev-plan'
+    Remove-Item -LiteralPath $stateRoot -Recurse -Force
+    Set-Content -LiteralPath $stateRoot -Value 'occupied'
+
+    $decisions = 1..6 | ForEach-Object {
+        $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+        if ($stop.decision -eq 'block') { '1' } else { '0' }
+    }
+    Remove-Item -LiteralPath $stateRoot -Force
+    Assert-Equal '111110' ($decisions -join '') 'the mirror must carry the block counter when external writes fail'
+    $mirror = Get-Content -LiteralPath (Get-MirrorPath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal 5 $mirror.blocks
+}
+
+Test-Case 'a mirror from another session is never used for recovery' {
+    $shared = Get-SessionCwd (New-SessionId)
+    $first = New-SessionId
+    Invoke-Hook 'subagentStart' @{ sessionId = $first; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    Invoke-Hook 'subagentStop' @{ sessionId = $first; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
+
+    $second = New-SessionId
+    Invoke-Hook 'subagentStart' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    $state = Get-Content -LiteralPath (Get-StatePath $second) -Raw | ConvertFrom-Json
+    Assert-Equal 'running' $state.architectureVerdict
+    Assert-Equal 1 $state.architectureAttempts 'a new session must start from attempt 1'
+    Assert-Equal 1 $state.totalInvocations 'a new session must not inherit the old invocation count'
 }
 
 Test-Case 'two sessions in one directory keep independent attempt counters' {

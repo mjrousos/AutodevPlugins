@@ -152,19 +152,28 @@ so you can follow a run while it happens and read the reviews afterwards:
 `.autodev/` is gitignored (the orchestrator offers to add it on first use), so none of this ends
 up in version control.
 
-These four files are a **read-only view**. The state that actually enforces the gates lives at
+The state that normally enforces the gates lives at
 `<COPILOT_HOME>/autodev-plan/gates/<sessionId>.json`, outside the workspace and keyed by session.
 That split is deliberate:
 
 - The orchestrator is allowed to edit files in the workspace while gating, so state it could
-  rewrite would not be enforcement at all. Editing `.autodev/gate-status.json` changes nothing.
+  rewrite must not be the normal source of enforcement.
 - Two sessions running in the same repository keep independent attempt budgets, so they cannot
   reset each other's counters and quietly disable every cap.
 
+`.autodev/gate-status.json` is both the live developer-facing view and a **disaster-recovery
+checkpoint**. The tracker reads it only when the authoritative file is missing or corrupt, and
+only when its `sessionId` exactly matches the current session. This prevents a lost
+`<COPILOT_HOME>` state directory from making the next reviewer look like a new session, resetting
+the audit/feedback logs, and re-running gates that already passed.
+
 The three tracker files are written **only** by hooks — the orchestrator does not write them and
-is instructed not to edit them. If you run two autodev-plan sessions in one directory they will
-share these files (as they would share `plan.md`), so the logs interleave; the enforcement state
-behind them stays separate. One plan per directory at a time is the intended usage.
+is instructed not to edit them. In particular, never edit `gate-status.json`: normal enforcement
+ignores it while the authoritative state exists, but it may be needed to recover the same
+session. If you run two autodev-plan sessions in one directory they will share these files (as
+they would share `plan.md`), so the logs interleave and the single recovery checkpoint belongs to
+whichever session wrote it last; the enforcement state behind them stays separate. Recovery,
+like the plan itself, assumes one active autodev-plan session per directory.
 
 #### `gate-status.json`
 
@@ -395,8 +404,9 @@ force it, edit the session's enforcement state at
 `<COPILOT_HOME>/autodev-plan/gates/<sessionId>.json` mid-run and set `architectureAttempts` to
 `10` with `architectureVerdict` as `ISSUES`. The next reviewer invocation must be **denied** with
 an "out of budget" message, and the orchestrator must escalate to you rather than retrying.
-Editing `.autodev/gate-status.json` instead must have no effect at all — that file is only a
-mirror.
+Editing `.autodev/gate-status.json` instead must have no effect on this check while the
+authoritative state exists. Do not delete the authoritative file afterwards: the workspace copy
+is also its same-session recovery checkpoint.
 
 **7. Clean up.**
 
