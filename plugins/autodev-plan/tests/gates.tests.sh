@@ -338,6 +338,21 @@ t_no_owner_state_not_adopted() {
 }
 run_test "a state file with no owner is never adopted" t_no_owner_state_not_adopted
 
+t_state_file_is_snapshotted_once() {
+  # The workspace mirror is shared by sessions. Validation, owner checking and merging must all
+  # use one captured value, not reopen a path another session can atomically replace.
+  local body reads
+  body="$(sed -n '/^read_state_file()/,/^}/p' "$GATE_SCRIPT")"
+  assert_match 'snapshot="\$\(cat "\$path"' "$body" || return 1
+  reads="$(printf '%s' "$body" | grep -c 'cat "\$path"')"
+  assert_equal 1 "$reads" 'read_state_file must open the checkpoint exactly once' || return 1
+  if printf '%s' "$body" | grep -qE 'jq .*\\"\$path\\"'; then
+    fail 'read_state_file reopens the checkpoint with jq instead of using the snapshot'
+    return 1
+  fi
+}
+run_test "state recovery validates and merges one captured snapshot" t_state_file_is_snapshotted_once
+
 t_garbage_stdin() {
   local out code
   out="$(printf 'this is not json\n' | bash "$GATE_SCRIPT" preToolUse)"

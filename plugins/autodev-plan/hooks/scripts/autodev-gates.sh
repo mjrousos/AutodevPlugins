@@ -96,12 +96,17 @@ default_state() {
 }
 
 read_state_file() {
-  local path="$1" owner
-  [ -f "$path" ] && jq -e . "$path" >/dev/null 2>&1 || return 1
-  owner="$(jq -r '.sessionId // ""' "$path" 2>/dev/null)"
+  local path="$1" snapshot owner
+  [ -f "$path" ] || return 1
+  # Capture one immutable snapshot. Reopening the shared workspace mirror for validation,
+  # ownership and merge would let another session atomically replace it between those reads.
+  snapshot="$(cat "$path" 2>/dev/null)" || return 1
+  [ -n "$snapshot" ] || return 1
+  printf '%s' "$snapshot" | jq -e . >/dev/null 2>&1 || return 1
+  owner="$(printf '%s' "$snapshot" | jq -r '.sessionId // ""' 2>/dev/null)"
   [ "$owner" = "$SAFE_SESSION_ID" ] || return 1
   # Merge over defaults so a partial or older state file still yields every field.
-  jq -s '.[0] * .[1]' <(default_state) "$path" 2>/dev/null
+  jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
 }
 
 read_state() {
