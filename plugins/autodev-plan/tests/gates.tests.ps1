@@ -71,9 +71,13 @@ if (-not $script:IsWorker -and -not $Sequential) {
 
     $totalPassed = 0
     $totalFailed = 0
-    foreach ($r in $running) {
+    $missing = @()
+    for ($i = 0; $i -lt $running.Count; $i++) {
+        $r = $running[$i]
+        $sawResult = $false
         foreach ($line in @(Get-Content -LiteralPath $r.Log -ErrorAction SilentlyContinue)) {
             if ($line -match '^\s*RESULT\s+(\d+)\s+(\d+)\s*$') {
+                $sawResult = $true
                 $totalPassed += [int]$Matches[1]
                 $totalFailed += [int]$Matches[2]
             }
@@ -81,11 +85,27 @@ if (-not $script:IsWorker -and -not $Sequential) {
             elseif ($line -match '^\s*PASS\s') { Write-Host $line -ForegroundColor Green }
             else { Write-Host $line }
         }
+        # A worker that dies before printing its tally takes its whole share of the cases with
+        # it. Without this the run would report only the surviving shards' results and pass.
+        if (-not $sawResult) {
+            # Start-Process -PassThru does not always surface ExitCode once the process object's
+            # handle is gone, so do not let a missing code hide the real message.
+            $code = 'unknown'
+            try { if ($null -ne $r.Proc.ExitCode) { $code = $r.Proc.ExitCode } } catch { }
+            $missing += [pscustomobject]@{ Shard = $i; ExitCode = $code }
+        }
     }
     Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
 
     $elapsed = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
     Write-Host ''
+    if ($missing.Count -gt 0) {
+        foreach ($m in $missing) {
+            Write-Host "  worker shard $($m.Shard) produced no result summary (exit code $($m.ExitCode)); its cases did not run" -ForegroundColor Red
+        }
+        Write-Host "$totalPassed passed, $totalFailed failed, $($missing.Count) worker(s) did not report  (${elapsed}s)" -ForegroundColor Red
+        exit 1
+    }
     if ($totalFailed -gt 0) {
         Write-Host "$totalPassed passed, $totalFailed failed  (${elapsed}s)" -ForegroundColor Red
         exit 1

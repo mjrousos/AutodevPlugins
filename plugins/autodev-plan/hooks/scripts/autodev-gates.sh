@@ -140,7 +140,8 @@ add_audit_row() {
       printf 'Session: `%s`\n' "$SAFE_SESSION_ID"
       printf 'Started: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
       printf 'Every row below was written by a hook observing a real sub-agent lifecycle event.\n'
-      printf 'The orchestrator cannot write to this file.\n\n'
+      printf 'The orchestrator does not write this file and is instructed not to edit it, but it\n'
+      printf 'lives in your workspace, so treat it as a record rather than as proof.\n\n'
       printf '| Time (UTC) | Gate | Attempt | Event | Verdict |\n'
       printf '| --- | --- | --- | --- | --- |\n'
     } > "$AUDIT_PATH" 2>/dev/null
@@ -158,8 +159,10 @@ add_feedback_entry() {
       printf 'Session: `%s`\n' "$SAFE_SESSION_ID"
       printf 'Started: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
       printf "Each entry is the reviewer sub-agent's verbatim response, captured by a hook as the\n"
-      printf 'sub-agent finished. The orchestrator cannot edit this file, so it records what the\n'
-      printf 'reviewers actually said rather than what the orchestrator chose to relay.\n'
+      printf 'sub-agent finished. The orchestrator does not write this file and is instructed not\n'
+      printf 'to edit it, so it records what the reviewers actually said rather than what the\n'
+      printf 'orchestrator chose to relay. It lives in your workspace and is not read back by the\n'
+      printf 'gate tracker, so editing it changes nothing except this record.\n'
     } > "$FEEDBACK_PATH" 2>/dev/null
   fi
   [ -n "$response" ] || response='_(the reviewer returned no content)_'

@@ -199,14 +199,18 @@ genuinely run, the trail will show it.
 #### `feedback-log.md`
 
 The audit trail tells you *that* a gate objected; this tells you *what* it objected to. Each
-entry is the reviewer's full response, exactly as written:
+entry is the reviewer's full response, exactly as written. Entry headers are level 1, because
+reviewers use `##` and `###` for their own sections:
 
 ```markdown
 ---
 
-## architecture - attempt 1 - ISSUES
+# architecture - attempt 1 - ISSUES
 
 _2026-08-04 20:26:13 UTC_
+
+## Summary
+...
 
 ### blocker Undo bypasses the server's move pipeline
 ...

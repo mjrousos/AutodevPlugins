@@ -69,21 +69,39 @@ if [ "$SHARD" -lt 0 ] && [ "$SEQUENTIAL" -eq 0 ]; then
   wait
   TOTAL_PASSED=0
   TOTAL_FAILED=0
-  for log in "$OUT_DIR"/shard-*.log; do
-    while IFS= read -r line; do
-      case "$line" in
-        RESULT\ *)
-          set -- $line
-          TOTAL_PASSED=$((TOTAL_PASSED + $2))
-          TOTAL_FAILED=$((TOTAL_FAILED + $3))
-          ;;
-        *) printf '%s\n' "$line" ;;
-      esac
-    done < "$log"
+  MISSING=""
+  i=0
+  while [ "$i" -lt "$WORKERS" ]; do
+    log="$OUT_DIR/shard-$i.log"
+    SAW_RESULT=0
+    if [ -f "$log" ]; then
+      while IFS= read -r line; do
+        case "$line" in
+          RESULT\ *)
+            SAW_RESULT=1
+            set -- $line
+            TOTAL_PASSED=$((TOTAL_PASSED + $2))
+            TOTAL_FAILED=$((TOTAL_FAILED + $3))
+            ;;
+          *) printf '%s\n' "$line" ;;
+        esac
+      done < "$log"
+    fi
+    # A worker that dies before printing its tally takes its whole share of the cases with it.
+    # Without this the run would report only the surviving shards' results and pass.
+    [ "$SAW_RESULT" -eq 1 ] || MISSING="$MISSING $i"
+    i=$((i + 1))
   done
   rm -rf "$OUT_DIR"
   ELAPSED=$(( $(date +%s) - START_TS ))
   echo
+  if [ -n "$MISSING" ]; then
+    for s in $MISSING; do
+      echo "  worker shard $s produced no result summary (crashed or was killed); its cases did not run"
+    done
+    echo "$TOTAL_PASSED passed, $TOTAL_FAILED failed, worker(s)$MISSING did not report  (${ELAPSED}s)"
+    exit 1
+  fi
   if [ "$TOTAL_FAILED" -gt 0 ]; then
     echo "$TOTAL_PASSED passed, $TOTAL_FAILED failed  (${ELAPSED}s)"
     exit 1

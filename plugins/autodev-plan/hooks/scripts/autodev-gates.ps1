@@ -196,7 +196,8 @@ function Add-AuditRow {
             "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
             '',
             'Every row below was written by a hook observing a real sub-agent lifecycle event.',
-            'The orchestrator cannot write to this file.',
+            'The orchestrator does not write this file and is instructed not to edit it, but it',
+            'lives in your workspace, so treat it as a record rather than as proof.',
             '',
             '| Time (UTC) | Gate | Attempt | Event | Verdict |',
             '| --- | --- | --- | --- | --- |'
@@ -224,8 +225,10 @@ function Add-FeedbackEntry {
             "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
             '',
             'Each entry is the reviewer sub-agent''s verbatim response, captured by a hook as the',
-            'sub-agent finished. The orchestrator cannot edit this file, so it records what the',
-            'reviewers actually said rather than what the orchestrator chose to relay.'
+            'sub-agent finished. The orchestrator does not write this file and is instructed not',
+            'to edit it, so it records what the reviewers actually said rather than what the',
+            'orchestrator chose to relay. It lives in your workspace and is not read back by the',
+            'gate tracker, so editing it changes nothing except this record.'
         )
         Set-Content -LiteralPath $Path -Value ($header -join [Environment]::NewLine) -Encoding UTF8
     }
