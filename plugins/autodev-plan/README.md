@@ -228,8 +228,13 @@ _2026-08-04 20:26:13 UTC_
 This exists because the orchestrator summarises reviewer findings as it goes, and a summary is
 lossy. When you want to audit a decision — or disagree with one — read this file.
 
-All three files are reset when a new session starts a gate in the same directory, so they always
-describe the current run rather than accumulating across sessions.
+`gate-audit.md` and `feedback-log.md` are **append-only across reviewers and planning sessions**.
+A new session adds a `Session: <id>` section and keeps every older row and reviewer response; the
+tracker never deletes or clears either Markdown file, including after wrap-up. This is deliberate
+human-review history, so archive or delete it manually only when you no longer need it.
+
+`gate-status.json` is different: it remains the live/recovery state for the most recent session
+in that workspace and is overwritten as that session advances.
 
 ### Escalation is enforced by refusing the tool call
 

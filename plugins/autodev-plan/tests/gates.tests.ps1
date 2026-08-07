@@ -775,13 +775,32 @@ Test-Case 'two sessions in one directory keep independent attempt counters' {
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $b; cwd = $shared; toolName = 'task'; toolArgs = $args2 }) 'the other session must keep its own budget'
 }
 
-Test-Case 'the audit trail is reset once per session, not on every invocation' {
+Test-Case 'the audit and feedback logs accumulate every invocation in a session' {
     $sid = New-SessionId
     1..3 | ForEach-Object { Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null }
     $rows = @((Get-Content -LiteralPath (Get-AuditPath $sid)) | Where-Object { $_ -match '^\|\s+\d{4}-' })
     Assert-Equal 6 $rows.Count 'three rounds must leave six rows, not one'
     $entries = @((Get-Content -LiteralPath (Get-FeedbackPath $sid)) | Where-Object { $_ -match '^# \w+ - attempt ' })
     Assert-Equal 3 $entries.Count 'three rounds must leave three feedback entries'
+}
+
+Test-Case 'zero-byte Markdown logs self-heal without disabling tracking' {
+    $sid = New-SessionId
+    $audit = Get-AuditPath $sid
+    $feedback = Get-FeedbackPath $sid
+    New-Item -ItemType Directory -Path (Split-Path $audit -Parent) -Force | Out-Null
+    [IO.File]::WriteAllBytes($audit, [byte[]]@())
+    [IO.File]::WriteAllBytes($feedback, [byte[]]@())
+
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'ISSUES' | Out-Null
+
+    $auditText = Get-Content -LiteralPath $audit -Raw
+    $feedbackText = Get-Content -LiteralPath $feedback -Raw
+    Assert-Match ([regex]::Escape("Session: ``$sid``")) $auditText
+    Assert-Match 'architecture \| 1 \| invoked \| -' $auditText
+    Assert-Match 'architecture \| 1 \| completed \| ISSUES' $auditText
+    Assert-Match ([regex]::Escape("Session: ``$sid``")) $feedbackText
+    Assert-Match '(?m)^# architecture - attempt 1 - ISSUES\r?$' $feedbackText
 }
 
 Test-Case 'the feedback log records each reviewer response verbatim' {
@@ -820,15 +839,16 @@ Test-Case 'the footer points the orchestrator at the feedback log when gating fi
     Assert-Match 'gate-audit\.md' $footer
 }
 
-Test-Case 'a new session does not inherit a previous run left in the same directory' {
-    # The files sit at fixed paths now, so a stale run must never hand a fresh session three
-    # passing gates or append its rows to the old session's audit trail.
+Test-Case 'a new session gets fresh state but preserves previous Markdown logs' {
+    # State is per session, but human-readable history is append-only across sessions.
     $shared = Get-SessionCwd (New-SessionId)
     $first = New-SessionId
     foreach ($gate in @('architecture', 'security', 'privacy')) {
         Invoke-Hook 'subagentStart' @{ sessionId = $first; cwd = $shared; agentName = "autodev-plan:autodev-$gate-review" } | Out-Null
         Invoke-Hook 'subagentStop' @{ sessionId = $first; cwd = $shared; agentName = "autodev-plan:autodev-$gate-review"; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
     }
+    $auditBefore = Get-Content -LiteralPath (Join-Path (Join-Path $shared '.autodev') 'gate-audit.md') -Raw
+    $feedbackBefore = Get-Content -LiteralPath (Join-Path (Join-Path $shared '.autodev') 'feedback-log.md') -Raw
 
     $second = New-SessionId
     # Before the new session runs anything, its gates must read as untouched.
@@ -837,10 +857,20 @@ Test-Case 'a new session does not inherit a previous run left in the same direct
     Invoke-Hook 'subagentStart' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
     Invoke-Hook 'subagentStop' @{ sessionId = $second; cwd = $shared; agentName = 'autodev-plan:autodev-architecture-review'; response = "ok`n`nAUTODEV-VERDICT: PASS" } | Out-Null
 
-    # Count before the agentStop below, which legitimately adds its own blocked-stop row.
     $audit = Join-Path (Join-Path $shared '.autodev') 'gate-audit.md'
-    $rows = @((Get-Content -LiteralPath $audit) | Where-Object { $_ -match '^\|\s+\d{4}-' })
-    Assert-Equal 2 $rows.Count 'the audit trail must restart for the new session'
+    $feedback = Join-Path (Join-Path $shared '.autodev') 'feedback-log.md'
+    $auditAfter = Get-Content -LiteralPath $audit -Raw
+    $feedbackAfter = Get-Content -LiteralPath $feedback -Raw
+    $rows = @(($auditAfter -split "`r?`n") | Where-Object { $_ -match '^\|\s+\d{4}-' })
+    Assert-Equal 8 $rows.Count 'six prior lifecycle rows and two new rows must all remain'
+    $entries = @(($feedbackAfter -split "`r?`n") | Where-Object { $_ -match '^# \w+ - attempt ' })
+    Assert-Equal 4 $entries.Count 'all reviewer responses from both sessions must remain'
+    if (-not $auditAfter.Contains($auditBefore.TrimEnd())) { throw 'the prior audit session was erased' }
+    if (-not $feedbackAfter.Contains($feedbackBefore.TrimEnd())) { throw 'the prior feedback session was erased' }
+    Assert-Match ([regex]::Escape("Session: ``$first``")) $auditAfter
+    Assert-Match ([regex]::Escape("Session: ``$second``")) $auditAfter
+    Assert-Match ([regex]::Escape("Session: ``$first``")) $feedbackAfter
+    Assert-Match ([regex]::Escape("Session: ``$second``")) $feedbackAfter
 
     $parsed = Invoke-Hook 'agentStop' @{ sessionId = $second; cwd = $shared; stopReason = 'end_turn' } | ConvertFrom-Json
     Assert-Equal 'block' $parsed.decision 'the old session''s security and privacy passes must not carry over'

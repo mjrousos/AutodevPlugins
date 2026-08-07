@@ -213,11 +213,12 @@ function Add-AuditRow {
         [string]$Verdict
     )
     try {
+        $sessionMarker = "Session: ``$SessionId``"
         if (-not (Test-Path -LiteralPath $Path)) {
             $header = @(
                 '# autodev-plan review gate audit',
                 '',
-                "Session: ``$SessionId``",
+                $sessionMarker,
                 "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
                 '',
                 'Every row below was written by a hook observing a real sub-agent lifecycle event.',
@@ -228,6 +229,25 @@ function Add-AuditRow {
                 '| --- | --- | --- | --- | --- |'
             )
             Set-Content -LiteralPath $Path -Value ($header -join [Environment]::NewLine) -Encoding UTF8
+        }
+        else {
+            # Windows PowerShell returns $null for a zero-byte file. Coerce it to an empty
+            # string so a manually cleared or interrupted file self-heals with a new section.
+            $existing = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+            if ($null -eq $existing) { $existing = '' }
+            if (-not $existing.Contains($sessionMarker)) {
+                $sessionHeader = @(
+                    '',
+                    '---',
+                    '',
+                    $sessionMarker,
+                    "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
+                    '',
+                    '| Time (UTC) | Gate | Attempt | Event | Verdict |',
+                    '| --- | --- | --- | --- | --- |'
+                )
+                Add-Content -LiteralPath $Path -Value ($sessionHeader -join [Environment]::NewLine) -Encoding UTF8
+            }
         }
         $ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
         Add-Content -LiteralPath $Path -Value "| $ts | $Gate | $Attempt | $Action | $Verdict |" -Encoding UTF8
@@ -248,11 +268,12 @@ function Add-FeedbackEntry {
         [string]$Response
     )
     try {
+        $sessionMarker = "Session: ``$SessionId``"
         if (-not (Test-Path -LiteralPath $Path)) {
             $header = @(
                 '# autodev-plan reviewer feedback log',
                 '',
-                "Session: ``$SessionId``",
+                $sessionMarker,
                 "Started: $((Get-Date).ToUniversalTime().ToString('u'))",
                 '',
                 'Each entry is the reviewer sub-agent''s verbatim response, captured by a hook as the',
@@ -262,6 +283,20 @@ function Add-FeedbackEntry {
                 'gate tracker, so editing it changes nothing except this record.'
             )
             Set-Content -LiteralPath $Path -Value ($header -join [Environment]::NewLine) -Encoding UTF8
+        }
+        else {
+            $existing = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+            if ($null -eq $existing) { $existing = '' }
+            if (-not $existing.Contains($sessionMarker)) {
+                $sessionHeader = @(
+                    '',
+                    '---',
+                    '',
+                    $sessionMarker,
+                    "Started: $((Get-Date).ToUniversalTime().ToString('u'))"
+                )
+                Add-Content -LiteralPath $Path -Value ($sessionHeader -join [Environment]::NewLine) -Encoding UTF8
+            }
         }
         $ts = (Get-Date).ToUniversalTime().ToString('u')
         if ([string]::IsNullOrWhiteSpace($Response)) { $Response = '_(the reviewer returned no content)_' }
@@ -448,14 +483,6 @@ try {
             Confirm-Directory -Path $viewDir | Out-Null
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
-            if ([int]$state['totalInvocations'] -eq 0) {
-                # First gate of this session. The developer-facing artifacts live at fixed paths
-                # in the workspace, so clear anything an earlier run left behind rather than
-                # appending this session's rows to a stale file. State is per session, so this
-                # fires exactly once per session.
-                Remove-Item -LiteralPath $auditPath -Force -ErrorAction SilentlyContinue
-                Remove-Item -LiteralPath $feedbackPath -Force -ErrorAction SilentlyContinue
-            }
             if ([string]$state["${gate}Verdict"] -eq 'PASS') {
                 # This gate already passed, so this is a re-gate after a material change.
                 # Start a fresh per-pass budget rather than charging it the old pass's attempts.

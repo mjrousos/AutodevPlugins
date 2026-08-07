@@ -147,11 +147,12 @@ state_num() { printf '%s' "$1" | jq -r ".$2 // 0" 2>/dev/null; }
 state_str() { printf '%s' "$1" | jq -r ".$2 // \"pending\"" 2>/dev/null; }
 
 add_audit_row() {
-  local gate="$1" attempt="$2" action="$3" verdict="$4"
+  local gate="$1" attempt="$2" action="$3" verdict="$4" session_marker
+  session_marker="Session: \`$SAFE_SESSION_ID\`"
   if [ ! -f "$AUDIT_PATH" ]; then
     {
       printf '# autodev-plan review gate audit\n\n'
-      printf 'Session: `%s`\n' "$SAFE_SESSION_ID"
+      printf '%s\n' "$session_marker"
       printf 'Started: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
       printf 'Every row below was written by a hook observing a real sub-agent lifecycle event.\n'
       printf 'The orchestrator does not write this file and is instructed not to edit it, but it\n'
@@ -159,6 +160,14 @@ add_audit_row() {
       printf '| Time (UTC) | Gate | Attempt | Event | Verdict |\n'
       printf '| --- | --- | --- | --- | --- |\n'
     } > "$AUDIT_PATH" 2>/dev/null
+  elif ! grep -Fqx "$session_marker" "$AUDIT_PATH" 2>/dev/null; then
+    {
+      printf '\n---\n\n'
+      printf '%s\n' "$session_marker"
+      printf 'Started: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+      printf '| Time (UTC) | Gate | Attempt | Event | Verdict |\n'
+      printf '| --- | --- | --- | --- | --- |\n'
+    } >> "$AUDIT_PATH" 2>/dev/null
   fi
   printf '| %s | %s | %s | %s | %s |\n' \
     "$(date -u '+%Y-%m-%d %H:%M:%S')" "$gate" "$attempt" "$action" "$verdict" \
@@ -169,11 +178,12 @@ add_audit_row() {
 }
 
 add_feedback_entry() {
-  local gate="$1" attempt="$2" verdict="$3" response="$4"
+  local gate="$1" attempt="$2" verdict="$3" response="$4" session_marker
+  session_marker="Session: \`$SAFE_SESSION_ID\`"
   if [ ! -f "$FEEDBACK_PATH" ]; then
     {
       printf '# autodev-plan reviewer feedback log\n\n'
-      printf 'Session: `%s`\n' "$SAFE_SESSION_ID"
+      printf '%s\n' "$session_marker"
       printf 'Started: %s\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
       printf "Each entry is the reviewer sub-agent's verbatim response, captured by a hook as the\n"
       printf 'sub-agent finished. The orchestrator does not write this file and is instructed not\n'
@@ -181,6 +191,12 @@ add_feedback_entry() {
       printf 'orchestrator chose to relay. It lives in your workspace and is not read back by the\n'
       printf 'gate tracker, so editing it changes nothing except this record.\n'
     } > "$FEEDBACK_PATH" 2>/dev/null
+  elif ! grep -Fqx "$session_marker" "$FEEDBACK_PATH" 2>/dev/null; then
+    {
+      printf '\n---\n\n'
+      printf '%s\n' "$session_marker"
+      printf 'Started: %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    } >> "$FEEDBACK_PATH" 2>/dev/null
   fi
   [ -n "$response" ] || response='_(the reviewer returned no content)_'
   {
@@ -300,12 +316,6 @@ case "$EVENT_NAME" in
     [ -n "$GATE" ] || emit_empty
     ensure_dir "$STATE_DIR" || true
     ensure_dir "$VIEW_DIR" || true
-    if [ "$(state_num "$STATE" 'totalInvocations')" -eq 0 ] 2>/dev/null; then
-      # First gate of this session. The developer-facing artifacts live at fixed paths in the
-      # workspace, so clear anything an earlier run left behind rather than appending this
-      # session's rows to a stale file. State is per session, so this fires exactly once.
-      rm -f "$AUDIT_PATH" "$FEEDBACK_PATH" 2>/dev/null
-    fi
     if [ "$(state_str "$STATE" "${GATE}Verdict")" = "PASS" ]; then
       # This gate already passed, so this is a re-gate after a material change.
       # Start a fresh per-pass budget rather than charging it the old pass's attempts.

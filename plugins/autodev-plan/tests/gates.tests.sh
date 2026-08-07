@@ -877,7 +877,26 @@ t_reset_once_per_session() {
   entries="$(grep -cE '^# [a-z]+ - attempt ' "$(feedback_path "$sid")")"
   assert_equal 3 "$entries" 'three rounds must leave three feedback entries'
 }
-run_test "the audit trail is reset once per session, not on every invocation" t_reset_once_per_session
+run_test "the audit and feedback logs accumulate every invocation in a session" t_reset_once_per_session
+
+t_empty_logs_self_heal() {
+  local sid audit feedback
+  sid="$(new_session_id)"
+  audit="$(audit_path "$sid")"
+  feedback="$(feedback_path "$sid")"
+  mkdir -p "$(dirname "$audit")"
+  : > "$audit"
+  : > "$feedback"
+
+  round "$sid" architecture ISSUES > /dev/null
+
+  grep -Fqx "Session: \`$sid\`" "$audit" || return 1
+  grep -q 'architecture | 1 | invoked | -' "$audit" || return 1
+  grep -q 'architecture | 1 | completed | ISSUES' "$audit" || return 1
+  grep -Fqx "Session: \`$sid\`" "$feedback" || return 1
+  grep -q '^# architecture - attempt 1 - ISSUES$' "$feedback"
+}
+run_test "zero-byte Markdown logs self-heal without disabling tracking" t_empty_logs_self_heal
 
 t_feedback_verbatim() {
   local sid log
@@ -928,10 +947,9 @@ t_footer_points_at_logs() {
 }
 run_test "the footer points the orchestrator at the feedback log when gating finishes" t_footer_points_at_logs
 
-t_new_session_does_not_inherit() {
-  # The files sit at fixed paths now, so a stale run must never hand a fresh session three
-  # passing gates or append its rows to the old session's audit trail.
-  local shared first second gate rows
+t_new_session_preserves_logs() {
+  # State is per session, but human-readable history is append-only across sessions.
+  local shared first second gate rows entries audit_before feedback_before audit_after feedback_after
   shared="$(session_cwd "$(new_session_id)")"
   first="$(new_session_id)"
   for gate in architecture security privacy; do
@@ -941,6 +959,8 @@ t_new_session_does_not_inherit() {
       '{sessionId:$s, cwd:$c, agentName:("autodev-plan:autodev-" + $g + "-review"),
         response:"ok\n\nAUTODEV-VERDICT: PASS"}')" > /dev/null
   done
+  audit_before="$(cat "$shared/.autodev/gate-audit.md")"
+  feedback_before="$(cat "$shared/.autodev/feedback-log.md")"
 
   second="$(new_session_id)"
   # Before the new session runs anything, its gates must read as untouched.
@@ -953,15 +973,24 @@ t_new_session_does_not_inherit() {
     '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
       response:"ok\n\nAUTODEV-VERDICT: PASS"}')" > /dev/null
 
-  # Count before the agentStop below, which legitimately adds its own blocked-stop row.
-  rows="$(grep -cE '^\| [0-9]{4}-' "$shared/.autodev/gate-audit.md")"
-  assert_equal 2 "$rows" 'the audit trail must restart for the new session' || return 1
+  audit_after="$(cat "$shared/.autodev/gate-audit.md")"
+  feedback_after="$(cat "$shared/.autodev/feedback-log.md")"
+  rows="$(printf '%s' "$audit_after" | grep -cE '^\| [0-9]{4}-')"
+  assert_equal 8 "$rows" 'six prior lifecycle rows and two new rows must all remain' || return 1
+  entries="$(printf '%s' "$feedback_after" | grep -cE '^# [a-z]+ - attempt ')"
+  assert_equal 4 "$entries" 'all reviewer responses from both sessions must remain' || return 1
+  case "$audit_after" in "$audit_before"*) ;; *) fail 'the prior audit session was erased'; return 1 ;; esac
+  case "$feedback_after" in "$feedback_before"*) ;; *) fail 'the prior feedback session was erased'; return 1 ;; esac
+  grep -Fqx "Session: \`$first\`" "$shared/.autodev/gate-audit.md" || return 1
+  grep -Fqx "Session: \`$second\`" "$shared/.autodev/gate-audit.md" || return 1
+  grep -Fqx "Session: \`$first\`" "$shared/.autodev/feedback-log.md" || return 1
+  grep -Fqx "Session: \`$second\`" "$shared/.autodev/feedback-log.md" || return 1
 
   assert_equal 'block' "$(hook agentStop "$(jq -cn --arg s "$second" --arg c "$shared" \
     '{sessionId:$s, cwd:$c, stopReason:"end_turn"}')" | jq -r '.decision // ""')" \
     "the old session's security and privacy passes must not carry over"
 }
-run_test "a new session does not inherit a previous run left in the same directory" t_new_session_does_not_inherit
+run_test "a new session gets fresh state but preserves previous Markdown logs" t_new_session_preserves_logs
 
 t_feedback_timestamp() {
   local sid log
