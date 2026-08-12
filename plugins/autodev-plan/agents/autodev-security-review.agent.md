@@ -101,7 +101,7 @@ in response. If there is no such section, treat this as a first review.
 On a re-review:
 
 - **Your primary task is convergence:** validate the disposition of every previous finding and
-  inspect the revisions made to address them. Do not repeat the first review's full threat-model
+  inspect the revisions made to address them. Do not repeat the first review's full threat model
   sweep over untouched parts of the plan.
 - Verify each previous finding was genuinely addressed rather than papered over. A control that
   was moved rather than added is not a fix, and neither is a requirement restated in weaker or

@@ -108,7 +108,7 @@ in response. If there is no such section, treat this as a first review.
 On a re-review:
 
 - **Your primary task is convergence:** validate the disposition of every previous finding and
-  inspect the revisions made to address them. Do not repeat the first review's full data-inventory
+  inspect the revisions made to address them. Do not repeat the first review's full data inventory
   sweep over untouched parts of the plan.
 - Verify each previous finding was genuinely addressed rather than papered over. Data that was
   renamed, relabelled as "anonymized", or moved to a different store is not automatically fixed.

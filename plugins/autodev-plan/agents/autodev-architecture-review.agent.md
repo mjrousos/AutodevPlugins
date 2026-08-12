@@ -114,9 +114,10 @@ everything you actually found, at the severity it actually warrants.
 - `minor` — Worth improving; does not by itself force `ISSUES`.
 - `nit` — Optional polish. Never forces `ISSUES`.
 
-Report `minor` and `nit` findings even when you are already returning `ISSUES` for something
-else. They cost the orchestrator nothing extra to fix in a revision it is making anyway, and
-holding them back only guarantees another round later.
+On a first review, report `minor` and `nit` findings even when you are already returning `ISSUES`
+for something else. They cost the orchestrator nothing extra to fix in a revision it is making
+anyway, and holding them back only guarantees another round later. The narrower re-review rules
+below override this first-review instruction.
 
 You are being invoked in a loop, so you may be reviewing the same plan more than once.
 
