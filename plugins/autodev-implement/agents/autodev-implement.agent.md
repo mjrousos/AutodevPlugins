@@ -115,6 +115,10 @@ When it returns:
   against the plan. Every implementation step in the plan must appear somewhere. If something is
   clearly missing or a milestone is obviously oversized, re-invoke `autodev-tasking` with specific
   corrections rather than editing the file yourself.
+- If the tracker reports the attempt as `BLOCKED` even though the agent said `DONE`, the todo list
+  it wrote does not carry `## Milestone <n>` headings numbered consecutively from 1. The tracker
+  cannot walk that file, so re-invoke `autodev-tasking` and require the documented format
+  explicitly.
 - If the verdict is `BLOCKED`, read what it could not do. Usually the plan is missing something
   material. Re-invoke it with the missing context if you can supply it from the plan or the
   repository. If you genuinely cannot, keep looping until the tracker escalates and unlocks

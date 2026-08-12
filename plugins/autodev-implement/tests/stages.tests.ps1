@@ -607,14 +607,35 @@ Test-Case 'tasking DONE moves to the first milestone and reports the parsed coun
     Assert-Match 'autodev-implementation for milestone 1' $footer
 }
 
-Test-Case 'a todo list with no milestone headings warns and degrades' {
+Test-Case 'a todo list with no milestone headings is recorded as BLOCKED, not DONE' {
+    # A DONE the tracker cannot act on would send the run into the milestone phase against an
+    # unusable artifact, and would contradict its own warning by naming implementation next.
     $sid = New-SessionId
     $dir = Join-Path (Get-SessionCwd $sid) '.autodev'
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $dir 'todos.md') -Value "# Todos`n`nJust some prose." -Encoding UTF8
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE')
+    Assert-Match 'Recorded verdict: BLOCKED' $footer
     Assert-Match "does not contain '## Milestone <n>' headings" $footer
-    Assert-Match 'milestones=0/unknown done' $footer
+    Assert-Match "tasking=BLOCKED\(1/$script:MaxWorkerAttempts\)" $footer
+    Assert-Match 'Re-invoke autodev-implement:autodev-tasking' $footer
+    Assert-NoMatch 'autodev-implementation for milestone' $footer 'implementation must not be the next action'
+}
+
+Test-Case 'an unusable todo list still escalates at the tasking retry cap' {
+    # The downgrade must charge the tasking budget, or a malformed todo list could be retried
+    # forever without ever reaching escalation.
+    $sid = New-SessionId
+    $dir = Join-Path (Get-SessionCwd $sid) '.autodev'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir 'todos.md') -Value "# Todos`n`nNo milestones here." -Encoding UTF8
+    Set-ImplState -SessionId $sid -Values @{
+        taskingAttempts  = ($script:MaxWorkerAttempts - 1); taskingVerdict = 'BLOCKED'
+        totalInvocations = 4
+    }
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE')
+    Assert-Match 'escalate to the user' $footer
+    Assert-Match "tasking stage used all $script:MaxWorkerAttempts permitted attempts" $footer
 }
 
 Test-Case 'a gap in the milestone numbering is rejected rather than miscounted' {
@@ -627,7 +648,7 @@ Test-Case 'a gap in the milestone numbering is rejected rather than miscounted' 
         -Value "## Milestone 1 - a`n**Status:** not-started`n`n## Milestone 3 - c`n**Status:** not-started`n" -Encoding UTF8
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE')
     Assert-Match 'numbered consecutively from 1' $footer
-    Assert-Match 'milestones=0/unknown done' $footer
+    Assert-Match 'Recorded verdict: BLOCKED' $footer
 }
 
 Test-Case 'a duplicated milestone number is rejected' {
@@ -637,7 +658,18 @@ Test-Case 'a duplicated milestone number is rejected' {
     Set-Content -LiteralPath (Join-Path $dir 'todos.md') `
         -Value "## Milestone 1 - a`n**Status:** not-started`n`n## Milestone 1 - b`n**Status:** not-started`n" -Encoding UTF8
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE')
-    Assert-Match 'milestones=0/unknown done' $footer
+    Assert-Match 'Recorded verdict: BLOCKED' $footer
+}
+
+Test-Case 'a tasking DONE is trusted when there is no workspace to check it against' {
+    # The tracker cannot read a todo list it has no directory for, so it must not fail the
+    # agent for that -- it would lock an otherwise healthy run out of the milestone phase.
+    $sid = New-SessionId
+    Invoke-Hook 'subagentStart' @{ sessionId = $sid; cwd = ''; agentName = 'autodev-implement:autodev-tasking' } | Out-Null
+    $out = Invoke-Hook 'subagentStop' @{ sessionId = $sid; cwd = ''; agentName = 'autodev-implement:autodev-tasking'; response = "body`n`nAUTODEV-VERDICT: DONE" }
+    $footer = Get-Footer $out
+    Assert-Match 'Recorded verdict: DONE' $footer
+    Assert-Match 'no workspace directory to read the todo list from' $footer
 }
 
 Test-Case 'a shrinking todo list cannot retire milestones that were never built' {

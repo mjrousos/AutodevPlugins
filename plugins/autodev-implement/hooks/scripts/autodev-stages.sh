@@ -67,8 +67,12 @@ STATE_DIR="$COPILOT_HOME_DIR/autodev-implement/stages"
 
 if [ -n "$SESSION_CWD" ] && [ -d "$SESSION_CWD" ]; then
   VIEW_DIR="$SESSION_CWD/.autodev"
+  # Whether the todo list is somewhere the tracker can actually read it. Without a workspace it
+  # cannot judge the tasking agent's output, and must not fail it for that.
+  HAS_WORKSPACE=1
 else
   VIEW_DIR="$STATE_DIR"
+  HAS_WORKSPACE=0
 fi
 
 # Called only once a real autodev-implement sub-agent has been identified, so directories appear
@@ -790,19 +794,32 @@ $1"; fi; }
       tasking)
         ATTEMPT="$(state_num "$STATE" 'taskingAttempts')"
         [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.taskingAttempts = $a | .taskingVerdict = $v')"
         if [ "$VERDICT" = "DONE" ]; then
-          [ "$(state_num "$STATE" 'currentMilestone')" -ge 1 ] 2>/dev/null ||
-            STATE="$(printf '%s' "$STATE" | jq '.currentMilestone = 1')"
           PARSED_COUNT="$(get_milestone_count)"
           if [ "$PARSED_COUNT" -gt 0 ] 2>/dev/null; then
             STATE="$(printf '%s' "$STATE" | jq --argjson c "$PARSED_COUNT" '.milestoneCount = $c')"
+            [ "$(state_num "$STATE" 'currentMilestone')" -ge 1 ] 2>/dev/null ||
+              STATE="$(printf '%s' "$STATE" | jq '.currentMilestone = 1')"
             add_note "Todo list parsed: $PARSED_COUNT milestone(s)."
+          elif [ "$HAS_WORKSPACE" -eq 1 ]; then
+            # A DONE the tracker cannot act on is not a DONE. Recording it as such would send
+            # the run into the milestone phase against an artifact nobody can walk, and would
+            # contradict the warning below by naming implementation as the next action.
+            # Downgrading keeps the next action on tasking and charges the attempt against the
+            # tasking retry budget, so a persistently malformed todo list escalates instead of
+            # quietly starting implementation.
+            VERDICT='BLOCKED'
+            add_note "WARNING: $TODO_PATH does not contain '## Milestone <n>' headings numbered consecutively from 1, so the tracker cannot walk the milestones. This attempt is recorded as BLOCKED rather than DONE. Re-invoke the tasking agent and require the documented todo list format."
           else
-            add_note "WARNING: $TODO_PATH does not contain '## Milestone <n>' headings numbered consecutively from 1. The tracker cannot count milestones, so milestone enforcement is degraded. Re-invoke the tasking agent and require the documented todo list format."
+            # No workspace to look in, so the todo list cannot be judged either way. Take the
+            # agent at its word rather than locking the run out.
+            [ "$(state_num "$STATE" 'currentMilestone')" -ge 1 ] 2>/dev/null ||
+              STATE="$(printf '%s' "$STATE" | jq '.currentMilestone = 1')"
+            add_note "WARNING: there is no workspace directory to read the todo list from, so milestone enforcement is degraded for this run."
           fi
         fi
+        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
+          '.taskingAttempts = $a | .taskingVerdict = $v')"
         ;;
       implementation)
         ATTEMPT="$(state_num "$STATE" 'implementAttempts')"

@@ -798,7 +798,10 @@ try {
     $statePath = Join-Path $stateDir "$sessionId.json"
     # Developer-facing artifacts go next to the plan when there is a workspace to put them in.
     $viewDir = Get-ViewDirectory -Cwd ([string]$payload.cwd)
-    if ([string]::IsNullOrWhiteSpace($viewDir)) { $viewDir = $stateDir }
+    # Whether the todo list is somewhere the tracker can actually read it. Without a workspace
+    # it cannot judge the tasking agent's output, and must not fail it for that.
+    $hasWorkspace = -not [string]::IsNullOrWhiteSpace($viewDir)
+    if (-not $hasWorkspace) { $viewDir = $stateDir }
     $mirrorPath = Join-Path $viewDir 'implement-status.json'
     $auditPath = Join-Path $viewDir 'implement-gate-audit.md'
     $feedbackPath = Join-Path $viewDir 'implement-feedback-log.md'
@@ -933,19 +936,33 @@ try {
             switch ($agent) {
                 'tasking' {
                     if ([int]$state['taskingAttempts'] -lt 1) { $state['taskingAttempts'] = 1 }
-                    $state['taskingVerdict'] = $verdict
                     $attempt = [int]$state['taskingAttempts']
                     if ($verdict -eq 'DONE') {
-                        if ([int]$state['currentMilestone'] -lt 1) { $state['currentMilestone'] = 1 }
                         $parsedCount = Get-MilestoneCount -TodoPath $todoPath
                         if ($parsedCount -gt 0) {
                             $state['milestoneCount'] = $parsedCount
+                            if ([int]$state['currentMilestone'] -lt 1) { $state['currentMilestone'] = 1 }
                             $extraNotes += "Todo list parsed: $parsedCount milestone(s)."
                         }
+                        elseif ($hasWorkspace) {
+                            # A DONE the tracker cannot act on is not a DONE. Recording it as
+                            # such would send the run into the milestone phase against an
+                            # artifact nobody can walk, and would contradict the warning below
+                            # by naming implementation as the next action. Downgrading keeps the
+                            # next action on tasking and charges the attempt against the tasking
+                            # retry budget, so a persistently malformed todo list escalates
+                            # instead of quietly starting implementation.
+                            $verdict = 'BLOCKED'
+                            $extraNotes += "WARNING: $todoPath does not contain '## Milestone <n>' headings numbered consecutively from 1, so the tracker cannot walk the milestones. This attempt is recorded as BLOCKED rather than DONE. Re-invoke the tasking agent and require the documented todo list format."
+                        }
                         else {
-                            $extraNotes += "WARNING: $todoPath does not contain '## Milestone <n>' headings numbered consecutively from 1. The tracker cannot count milestones, so milestone enforcement is degraded. Re-invoke the tasking agent and require the documented todo list format."
+                            # No workspace to look in, so the todo list cannot be judged either
+                            # way. Take the agent at its word rather than locking the run out.
+                            if ([int]$state['currentMilestone'] -lt 1) { $state['currentMilestone'] = 1 }
+                            $extraNotes += "WARNING: there is no workspace directory to read the todo list from, so milestone enforcement is degraded for this run."
                         }
                     }
+                    $state['taskingVerdict'] = $verdict
                 }
                 'implementation' {
                     if ([int]$state['implementAttempts'] -lt 1) { $state['implementAttempts'] = 1 }

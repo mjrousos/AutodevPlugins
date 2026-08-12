@@ -83,8 +83,10 @@ Sub-agents are matched by their exact `autodev-implement:` namespace, so another
 exposing an identically named agent cannot be captured by this tracker or mutate its counters.
 
 Milestone *structure* is read from `.autodev/todos.md` — it is the only place that information
-exists, and the headings must be numbered consecutively from 1 or the tracker refuses to count
-them. Milestone *progress* comes entirely from the tracker's own counters, and a count that is
+exists, and the headings must be numbered consecutively from 1. A tasking agent that reports
+success but leaves a todo list the tracker cannot walk is recorded as `BLOCKED` rather than
+`DONE`, so the run retries tasking instead of starting implementation against an unusable
+artifact. Milestone *progress* comes entirely from the tracker's own counters, and a count that is
 already known can only be changed by the tasking agent, so editing the todo list cannot skip a
 review or retire a milestone that was never built.
 

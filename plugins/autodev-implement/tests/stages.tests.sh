@@ -622,16 +622,36 @@ t_tasking_done() {
 run_test 'tasking DONE moves to the first milestone and reports the parsed count' t_tasking_done
 
 t_todo_no_headings() {
+  # A DONE the tracker cannot act on would send the run into the milestone phase against an
+  # unusable artifact, and would contradict its own warning by naming implementation next.
   local sid footer dir
   sid="$(new_session_id)"
   dir="$(session_cwd "$sid")/.autodev"
   mkdir -p "$dir"
   printf '# Todos\n\nJust some prose.\n' > "$dir/todos.md"
   footer="$(round "$sid" 'tasking' 'DONE')"
+  assert_match 'Recorded verdict: BLOCKED' "$footer" || return 1
   assert_match "does not contain '## Milestone <n>' headings" "$footer" || return 1
-  assert_match 'milestones=0/unknown done' "$footer"
+  assert_match "tasking=BLOCKED\(1/$MAX_WORKER_ATTEMPTS\)" "$footer" || return 1
+  assert_match 'Re-invoke autodev-implement:autodev-tasking' "$footer" || return 1
+  assert_no_match 'autodev-implementation for milestone' "$footer" 'implementation must not be the next action'
 }
-run_test 'a todo list with no milestone headings warns and degrades' t_todo_no_headings
+run_test 'a todo list with no milestone headings is recorded as BLOCKED, not DONE' t_todo_no_headings
+
+t_unusable_todo_escalates() {
+  # The downgrade must charge the tasking budget, or a malformed todo list could be retried
+  # forever without ever reaching escalation.
+  local sid footer dir
+  sid="$(new_session_id)"
+  dir="$(session_cwd "$sid")/.autodev"
+  mkdir -p "$dir"
+  printf '# Todos\n\nNo milestones here.\n' > "$dir/todos.md"
+  seed_state "$sid" ".taskingAttempts=$((MAX_WORKER_ATTEMPTS - 1)) | .taskingVerdict=\"BLOCKED\" | .totalInvocations=4"
+  footer="$(round "$sid" 'tasking' 'DONE')"
+  assert_match 'escalate to the user' "$footer" || return 1
+  assert_match "tasking stage used all $MAX_WORKER_ATTEMPTS permitted attempts" "$footer"
+}
+run_test 'an unusable todo list still escalates at the tasking retry cap' t_unusable_todo_escalates
 
 t_todo_numbering_gap() {
   # Milestones 1 and 3 counted naively would look like two milestones, and the run would go
@@ -643,7 +663,7 @@ t_todo_numbering_gap() {
   printf '## Milestone 1 - a\n**Status:** not-started\n\n## Milestone 3 - c\n**Status:** not-started\n' > "$dir/todos.md"
   footer="$(round "$sid" 'tasking' 'DONE')"
   assert_match 'numbered consecutively from 1' "$footer" || return 1
-  assert_match 'milestones=0/unknown done' "$footer"
+  assert_match 'Recorded verdict: BLOCKED' "$footer"
 }
 run_test 'a gap in the milestone numbering is rejected rather than miscounted' t_todo_numbering_gap
 
@@ -654,9 +674,24 @@ t_todo_duplicate_number() {
   mkdir -p "$dir"
   printf '## Milestone 1 - a\n**Status:** not-started\n\n## Milestone 1 - b\n**Status:** not-started\n' > "$dir/todos.md"
   footer="$(round "$sid" 'tasking' 'DONE')"
-  assert_match 'milestones=0/unknown done' "$footer"
+  assert_match 'Recorded verdict: BLOCKED' "$footer"
 }
 run_test 'a duplicated milestone number is rejected' t_todo_duplicate_number
+
+t_no_workspace_tasking_trusted() {
+  # The tracker cannot read a todo list it has no directory for, so it must not fail the agent
+  # for that -- it would lock an otherwise healthy run out of the milestone phase.
+  local sid footer
+  sid="$(new_session_id)"
+  hook subagentStart "$(jq -cn --arg s "$sid" \
+    '{sessionId:$s, cwd:"", agentName:"autodev-implement:autodev-tasking"}')" > /dev/null
+  footer="$(hook subagentStop "$(jq -cn --arg s "$sid" --arg r "body
+
+AUTODEV-VERDICT: DONE" '{sessionId:$s, cwd:"", agentName:"autodev-implement:autodev-tasking", response:$r}')" | jq -r '.modifiedResponse // ""')"
+  assert_match 'Recorded verdict: DONE' "$footer" || return 1
+  assert_match 'no workspace directory to read the todo list from' "$footer"
+}
+run_test 'a tasking DONE is trusted when there is no workspace to check it against' t_no_workspace_tasking_trusted
 
 t_todo_cannot_shrink() {
   # The todo list is in a directory the orchestrator may write to, so it must not be able to end
