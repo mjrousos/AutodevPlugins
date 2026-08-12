@@ -273,12 +273,16 @@ function Set-StageState {
         'security' {
             $values['completedMilestones'] = 1
             $values['currentMilestone'] = 2
+            # The user checkpoint has been satisfied; without this the stage would resolve back
+            # to 'user-review' and every assertion below it would be testing the wrong stage.
+            $values['userReviewReached'] = 1
             $values['securityAttempts'] = 1
             $values['securityVerdict'] = 'ISSUES'
         }
         'privacy' {
             $values['completedMilestones'] = 1
             $values['currentMilestone'] = 2
+            $values['userReviewReached'] = 1
             $values['securityAttempts'] = 1
             $values['securityVerdict'] = 'PASS'
             $values['privacyAttempts'] = 1
@@ -287,6 +291,7 @@ function Set-StageState {
         'complete' {
             $values['completedMilestones'] = 1
             $values['currentMilestone'] = 2
+            $values['userReviewReached'] = 1
             $values['securityAttempts'] = 1
             $values['securityVerdict'] = 'PASS'
             $values['privacyAttempts'] = 1
@@ -295,6 +300,7 @@ function Set-StageState {
         'escalated' {
             $values['completedMilestones'] = 1
             $values['currentMilestone'] = 2
+            $values['userReviewReached'] = 1
             $values['securityAttempts'] = $script:MaxReviewAttempts
             $values['securityVerdict'] = 'ISSUES'
         }
@@ -463,6 +469,32 @@ Test-Case 'code-review does not swallow code-security-review' {
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-security-review' -Verdict 'PASS')
     Assert-Match 'Stage: code-security-review' $footer
     Assert-Match 'security=PASS' $footer
+}
+
+# Plugin agents are namespaced, so a suffix match would also capture another installed plugin's
+# identically named agent and let it mutate this run's counters.
+foreach ($agent in @('other-plugin:autodev-code-review', 'other:autodev-tasking', 'somewhere:autodev-code-security-review')) {
+    $a = $agent
+    Test-Case "an agent from another namespace ('$a') is not captured" {
+        $sid = New-SessionId
+        Assert-Equal '{}' (Invoke-Hook 'subagentStart' @{ sessionId = $sid; agentName = $a })
+        Assert-Equal $false (Test-Path -LiteralPath (Get-StatePath $sid))
+    }.GetNewClosure()
+}
+
+Test-Case 'a task call to a same-named agent in another namespace is never refused' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'milestones'
+    $taskArgs = @{ agent_type = 'other-plugin:autodev-code-security-review' } | ConvertTo-Json -Compress
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $taskArgs })
+}
+
+Test-Case 'an unnamespaced sub-agent name is still tracked' {
+    # Only a *different* namespace is rejected; a bare name keeps working.
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    Invoke-Hook 'subagentStart' @{ sessionId = $sid; agentName = 'autodev-tasking' } | Out-Null
+    Assert-Equal $true (Test-Path -LiteralPath (Get-StatePath $sid))
 }
 
 Test-Case 'garbage stdin returns empty JSON and exits 0' {
@@ -638,17 +670,91 @@ Test-Case 'the last milestone closing moves to the user review checkpoint' {
     Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE' | Out-Null
     Invoke-Round -SessionId $sid -Agent 'implementation' -Verdict 'DONE' | Out-Null
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-review' -Verdict 'PASS')
-    Assert-Match 'wait for them to review the code' $footer
+    Assert-Match 'hand the code back for review' $footer
     Assert-Match 'Audit trail:' $footer
 }
 
 Test-Case 'security passing moves to privacy, privacy passing completes the run' {
     $sid = New-SessionId
-    Set-StageState -SessionId $sid -Stage 'user-review'
+    Set-StageState -SessionId $sid -Stage 'user-review' -Extra @{ userReviewReached = 1 }
     $sec = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-security-review' -Verdict 'PASS')
     Assert-Match 'autodev-code-privacy-review' $sec
     $priv = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-privacy-review' -Verdict 'PASS')
     Assert-Match 'Proceed to WRAPUP' $priv
+}
+
+# ------------------------------------------------------------------------------------------
+Write-Section 'The USER-REVIEW checkpoint is actually enforced'
+# ------------------------------------------------------------------------------------------
+
+Test-Case 'the security review is refused until the code has been handed to the user' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'user-review'
+    $out = Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review'
+    Assert-Match '"permissionDecision":"deny"' $out
+    Assert-Match 'has not been given the code to review yet' $out
+}
+
+Test-Case 'ending the turn at the checkpoint records the handoff and unlocks security' {
+    # Closing the last milestone and starting the security review in the same turn would skip
+    # the user entirely, so the stop itself is what satisfies the checkpoint.
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'user-review'
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid })
+    Assert-Equal '{}' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
+}
+
+Test-Case 'asking the user at the checkpoint also records the handoff' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'user-review'
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+    Assert-Equal '{}' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
+}
+
+Test-Case 'the handoff is recorded in the audit trail' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'user-review'
+    Invoke-Hook 'agentStop' @{ sessionId = $sid } | Out-Null
+    $audit = Get-Content -LiteralPath (Get-ViewPath $sid 'implement-gate-audit.md') -Raw
+    Assert-Match 'handed to user' $audit
+}
+
+Test-Case 'fixing user-reported issues sends the run back to the checkpoint' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'user-review'
+    Invoke-Hook 'agentStop' @{ sessionId = $sid } | Out-Null
+    Invoke-Round -SessionId $sid -Agent 'code-fix' -Verdict 'DONE' | Out-Null
+    $out = Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review'
+    Assert-Match '"permissionDecision":"deny"' $out 'the user must approve the fixed code too'
+}
+
+Test-Case 'a fix after the final reviews passed resequences back to security' {
+    # The fix changed code that both reviews already judged, so their verdicts are stale.
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'complete'
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-fix' -Verdict 'DONE')
+    Assert-Match 'security=pending' $footer
+    Assert-Match 'privacy=pending' $footer
+    Assert-Match 'autodev-code-security-review' $footer
+    Assert-NoMatch 'hand the code back for review' $footer 'the user already approved this code'
+}
+
+Test-Case 'a fix during the privacy loop restarts security without refunding privacy rounds' {
+    # Security must re-run because the code changed, but the privacy loop keeps its spent
+    # budget: refunding it would make the loop unbounded.
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'privacy' -Extra @{ privacyAttempts = 4 }
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-fix' -Verdict 'DONE')
+    Assert-Match 'security=pending\(0/' $footer
+    Assert-Match "privacy=ISSUES\(4/$script:MaxReviewAttempts\)" $footer
+    Assert-Match 'autodev-code-security-review' $footer
+}
+
+Test-Case 'a fix during the security loop does not refund its rounds' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'security' -Extra @{ securityAttempts = 6 }
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-fix' -Verdict 'DONE')
+    Assert-Match "security=ISSUES\(6/$script:MaxReviewAttempts\)" $footer
 }
 
 Test-Case 'a security re-review invalidates a privacy verdict for the older code' {
@@ -724,7 +830,7 @@ Test-Case 'a security pass recorded before tasking cannot skip the user review c
     Invoke-Round -SessionId $sid -Agent 'implementation' -Verdict 'DONE' | Out-Null
     $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-review' -Verdict 'PASS')
     Assert-Match 'security=pending' $footer
-    Assert-Match 'wait for them to review the code' $footer
+    Assert-Match 'hand the code back for review' $footer
 }
 
 # ------------------------------------------------------------------------------------------
@@ -817,7 +923,7 @@ $orderCases = @(
     @{ Stage = 'milestones'; Agent = 'code-review'; Expect = 'allow' }
     @{ Stage = 'milestones'; Agent = 'code-fix'; Expect = 'allow' }
     @{ Stage = 'milestones'; Agent = 'implementation'; Expect = 'allow' }
-    @{ Stage = 'user-review'; Agent = 'code-security-review'; Expect = 'allow' }
+    @{ Stage = 'user-review'; Agent = 'code-security-review'; Expect = 'deny' }
     @{ Stage = 'user-review'; Agent = 'code-fix'; Expect = 'allow' }
     @{ Stage = 'user-review'; Agent = 'code-privacy-review'; Expect = 'deny' }
     @{ Stage = 'user-review'; Agent = 'code-review'; Expect = 'deny' }
@@ -861,6 +967,24 @@ Test-Case 'a task call to a built-in agent is never refused' {
     Set-StageState -SessionId $sid -Stage 'milestones'
     $taskArgs = @{ agent_type = 'explore' } | ConvertTo-Json -Compress
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $taskArgs })
+}
+
+Test-Case 're-tasking is refused once milestone work has started' {
+    # Re-tasking rewrites the milestone list; a shorter one would retire milestones that were
+    # never built.
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'milestones'
+    $out = Invoke-TaskCheck -SessionId $sid -Agent 'tasking'
+    Assert-Match '"permissionDecision":"deny"' $out
+    Assert-Match 'milestone work has already started' $out
+}
+
+Test-Case 're-tasking is still allowed before any milestone work has started' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'milestones' -Extra @{
+        implementVerdict = 'pending'; implementAttempts = 0; reviewAttempts = 0; completedMilestones = 0
+    }
+    Assert-Equal '{}' (Invoke-TaskCheck -SessionId $sid -Agent 'tasking')
 }
 
 # ------------------------------------------------------------------------------------------

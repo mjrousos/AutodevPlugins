@@ -392,10 +392,16 @@ function Add-FeedbackEntry {
 function Resolve-Agent {
     param([string]$AgentName)
     if ([string]::IsNullOrWhiteSpace($AgentName)) { return $null }
-    # agentName arrives namespaced, e.g. "autodev-implement:autodev-code-review". The trailing
-    # anchor is what keeps 'code-review' from swallowing 'code-security-review', and what keeps
-    # this plugin from capturing autodev-plan's 'autodev-security-review'.
-    if ($AgentName -match 'autodev-(tasking|implementation|code-review|code-fix|code-security-review|code-privacy-review)\s*$') {
+    # agentName arrives namespaced, e.g. "autodev-implement:autodev-code-review". The match is
+    # anchored at both ends and pinned to this plugin's namespace, because a suffix match would
+    # also capture another installed plugin's "other:autodev-code-review" and let it mutate this
+    # run's counters. An unnamespaced name is still accepted so the tracker keeps working if the
+    # agents are ever loaded without a namespace; only a *different* namespace is rejected.
+    #
+    # The trailing anchor is also what keeps 'code-review' from swallowing
+    # 'code-security-review', and what keeps this plugin from capturing autodev-plan's
+    # 'autodev-security-review'.
+    if ($AgentName -match '^\s*(?:autodev-implement:)?autodev-(tasking|implementation|code-review|code-fix|code-security-review|code-privacy-review)\s*$') {
         return $Matches[1]
     }
     return $null
@@ -516,6 +522,22 @@ function Reset-DownstreamVerdicts {
     $State['privacyAttempts'] = 0
 }
 
+function Reset-FinalVerdictsAfterFix {
+    # A fix applied once the milestones are closed changes code that the whole-implementation
+    # reviews have already judged, so any PASS they hold is stale and the sequence has to
+    # restart at the security review. Only a PASS is cleared: a loop that is still in progress
+    # keeps its attempt budget, or a fix mid-loop would hand it an unlimited number of rounds.
+    param([hashtable]$State)
+    if ([string]$State['securityVerdict'] -eq 'PASS') {
+        $State['securityVerdict'] = 'pending'
+        $State['securityAttempts'] = 0
+    }
+    if ([string]$State['privacyVerdict'] -eq 'PASS') {
+        $State['privacyVerdict'] = 'pending'
+        $State['privacyAttempts'] = 0
+    }
+}
+
 function Invoke-MilestoneAdvance {
     # Closes the current milestone when its review loop has ended, either because the reviewer
     # passed it or because the loop spent its budget. Code review is the one loop that proceeds
@@ -581,8 +603,10 @@ function Get-Stage {
     }
 
     if ([string]$State['securityVerdict'] -ne 'PASS') {
-        # Every milestone is closed but the security review has not started: this is the one
-        # interactive checkpoint, where the user reviews the code before the final reviews run.
+        # Every milestone is closed and no final review has started: this is the interactive
+        # checkpoint. The stage covers the whole window in which the user holds the code, so
+        # the orchestrator may keep stopping while it waits for them. What actually gates the
+        # security review is userReviewReached, checked in preToolUse.
         if ([int]$State['securityAttempts'] -eq 0) { return 'user-review' }
         if ([int]$State['securityAttempts'] -ge $script:MaxReviewAttempts) { return 'escalated' }
         return 'security'
@@ -663,7 +687,10 @@ function Get-NextAction {
             return "Invoke autodev-implement:autodev-code-review for milestone $m."
         }
         'user-review' {
-            return 'Every milestone is closed. Report to the user and wait for them to review the code. You may stop your turn here and ask_user is permitted. When they tell you to proceed, invoke autodev-implement:autodev-code-security-review.'
+            if ([int]$State['userReviewReached'] -eq 0) {
+                return 'Every milestone is closed. Report to the user, state what you built, and hand the code back for review - end your turn or ask them directly. The security review stays locked until you do.'
+            }
+            return 'The user has the code. When they tell you to proceed, invoke autodev-implement:autodev-code-security-review. If they report issues, invoke autodev-implement:autodev-code-fix and hand the result back to them again.'
         }
         'security' {
             if ([string]$State['securityVerdict'] -eq 'ISSUES') {
@@ -838,6 +865,16 @@ try {
                         [int]$state['completedMilestones'] -lt (Get-EffectiveMilestoneCount -State $state)) {
                         $milestoneLabel = [string][int]$state['currentMilestone']
                     }
+                    else {
+                        # Past the milestone phase, so this fix changes code the security and
+                        # privacy reviews have already judged.
+                        if ((Get-Stage -State $state) -eq 'user-review') {
+                            # The user asked for this change, so they get to look again before
+                            # the final reviews run.
+                            $state['userReviewReached'] = 0
+                        }
+                        Reset-FinalVerdictsAfterFix -State $state
+                    }
                 }
                 'code-security-review' {
                     if ([string]$state['securityVerdict'] -eq 'PASS') { $state['securityAttempts'] = 1 }
@@ -1000,8 +1037,23 @@ try {
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             Invoke-MilestoneAdvance -State $state | Out-Null
             $stage = Get-Stage -State $state
-            # 'user-review' is deliberately not blocked: stopping to let the human review the
-            # code is the whole point of that checkpoint.
+            if ($stage -eq 'user-review') {
+                # 'user-review' is deliberately not blocked: stopping to let the human review
+                # the code is the whole point of that checkpoint. Record that the pause actually
+                # happened -- that record is what unlocks the security review, so the run cannot
+                # close its last milestone and start the final reviews in the same turn without
+                # ever handing the code back to the user.
+                Confirm-Directory -Path $stateDir | Out-Null
+                Confirm-Directory -Path $viewDir | Out-Null
+                if ([int]$state['userReviewReached'] -eq 0) {
+                    $state['userReviewReached'] = 1
+                    Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
+                    Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage 'user-review' `
+                        -Milestone '-' -Attempt 0 -Action 'handed to user' -Verdict '-'
+                }
+                Write-JsonResult @{}
+                exit 0
+            }
             if ($stage -notin $script:AutonomousStages) { Write-JsonResult @{}; exit 0 }
             # The authoritative directory may be what was deleted. Recreate it before persisting
             # the recovered block counter; Write-State still fails open if this is impossible.
@@ -1088,6 +1140,15 @@ try {
                                 $remaining = $total - [int]$state['completedMilestones']
                                 $denyReason = "$remaining milestone(s) are still unimplemented, and the security and privacy reviews run only once the whole implementation is finished"
                             }
+                            elseif ($target -eq 'tasking' -and
+                                ([int]$state['completedMilestones'] -gt 0 -or
+                                [int]$state['implementAttempts'] -gt 0 -or
+                                [int]$state['reviewAttempts'] -gt 0)) {
+                                # Re-tasking rewrites the milestone list, and a shorter list
+                                # would retire milestones that were never built. It is only safe
+                                # before any milestone work has started.
+                                $denyReason = "milestone work has already started, and re-tasking now would rewrite the milestone list underneath it"
+                            }
                             elseif ($target -eq 'code-review' -and
                                 [string]$state['implementVerdict'] -ne 'DONE') {
                                 # Reviewing before the milestone is built would record a verdict
@@ -1102,11 +1163,21 @@ try {
                             }
                         }
                         'user-review' {
-                            if ($target -eq 'implementation' -or $target -eq 'code-review' -or $target -eq 'tasking') {
-                                $denyReason = "every milestone is closed and the run is waiting for the user to review the code"
+                            if ($target -eq 'code-security-review') {
+                                # The checkpoint is satisfied only once the orchestrator has
+                                # actually handed the code back -- by ending its turn or by
+                                # asking the user. Without this the final milestone could close
+                                # and the security review start in the same turn, and the user
+                                # would never get to look at anything.
+                                if ([int]$state['userReviewReached'] -eq 0) {
+                                    $denyReason = "the user has not been given the code to review yet. End your turn, or ask the user to review, and run the security review once they tell you to proceed"
+                                }
                             }
                             elseif ($target -eq 'code-privacy-review') {
                                 $denyReason = "the security review runs before the privacy review"
+                            }
+                            else {
+                                $denyReason = "every milestone is closed and the run is waiting for the user to review the code"
                             }
                         }
                         'security' {
@@ -1135,6 +1206,20 @@ try {
 
             # ask_user. Permitted at the USER-REVIEW checkpoint, once a stage has escalated,
             # before the run starts, and after it completes. Denied in between.
+            if ($stage -eq 'user-review') {
+                # Asking the user to review the code is the handoff, so it satisfies the
+                # checkpoint just as ending the turn does.
+                Confirm-Directory -Path $stateDir | Out-Null
+                Confirm-Directory -Path $viewDir | Out-Null
+                if ([int]$state['userReviewReached'] -eq 0) {
+                    $state['userReviewReached'] = 1
+                    Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
+                    Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage 'user-review' `
+                        -Milestone '-' -Attempt 0 -Action 'handed to user' -Verdict '-'
+                }
+                Write-JsonResult @{}
+                exit 0
+            }
             if ($stage -notin $script:AutonomousStages) { Write-JsonResult @{}; exit 0 }
 
             $reason = "The autodev-implement run is in an autonomous phase ($stage), which proceeds " +

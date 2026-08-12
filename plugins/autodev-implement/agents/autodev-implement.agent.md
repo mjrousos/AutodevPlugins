@@ -186,11 +186,15 @@ user.
 4. Ask them to review the code and tell you either that it looks good or what needs to change.
 5. **Wait.** Do not start the security review on your own initiative. The transition out of
    USER-REVIEW is the user's decision, and the tracker permits you to stop here precisely so you
-   can wait for them.
+   can wait for them. Until you have actually handed the code back — by ending your turn or by
+   asking the user — the security review is refused outright, so there is no way to skip this
+   checkpoint even by accident.
 
 If they report issues, route every one of them through `autodev-code-fix` — you do not fix them
 yourself. Give the fix agent the user's words verbatim; the user's framing often carries context
-that a paraphrase loses. When the fixes are in, report back and wait again.
+that a paraphrase loses. When the fixes are in, report back and wait again: a fix made at this
+checkpoint re-locks the security review, because the user should see the corrected code before the
+final reviews run.
 
 When they tell you to proceed, tell them the security and privacy reviews are starting, that this
 runs without further input, and that you will report back when it is clean.
@@ -380,7 +384,7 @@ reviewer, and leave it out entirely on a first round.
 | Security review | 10 rounds | **Escalate to the user** |
 | Privacy review | 10 rounds | **Escalate to the user** |
 | Tasking / implementation retries | 5 attempts | **Escalate to the user** |
-| Whole session | 300 sub-agent invocations | **Escalate to the user** |
+| Whole session | 120 + 30 per milestone sub-agent invocations | **Escalate to the user** |
 
 To escalate:
 

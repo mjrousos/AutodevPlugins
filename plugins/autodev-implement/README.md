@@ -66,15 +66,21 @@ every sub-agent lifecycle event and:
   and the exact next action;
 - **blocks the orchestrator from ending its turn mid-run** — except at USER-REVIEW, where stopping
   to wait for you is the correct behaviour;
+- **records the USER-REVIEW handoff** — the security review stays locked until the orchestrator has
+  actually given the code back to you, by ending its turn or asking you directly, so the last
+  milestone cannot close and the final reviews start in the same turn;
 - **denies `ask_user` during autonomous phases**, and unlocks it at USER-REVIEW and on escalation;
 - **refuses out-of-order sub-agent calls** — no security review while milestones remain, no review
   of a milestone that has not been implemented, no new milestone while the current one's review is
-  unresolved;
+  unresolved, and no re-tasking once milestone work has started;
 - **invalidates stale verdicts** — implementing new code clears the review verdict for that
-  milestone and any security or privacy verdict, so a pass can never describe code that has since
-  changed;
+  milestone, and a fix applied after the milestones close clears the security and privacy passes,
+  so the final reviews re-run against the code that actually shipped;
 - **refuses any further sub-agent call once a budget is spent**, which is what actually ends a loop
   that will not converge.
+
+Sub-agents are matched by their exact `autodev-implement:` namespace, so another installed plugin
+exposing an identically named agent cannot be captured by this tracker or mutate its counters.
 
 Milestone *structure* is read from `.autodev/todos.md` — it is the only place that information
 exists, and the headings must be numbered consecutively from 1 or the tracker refuses to count
@@ -129,8 +135,11 @@ the same session — without clobbering each other.
 Run [Autodev-Plan](../autodev-plan/README.md) first, or bring your own plan document, then:
 
 ```
-/agent autodev-implement
+copilot --agent autodev-implement:autodev-implement
 ```
+
+> Agents contributed by a plugin are namespaced `<plugin>:<agent>`, so the entry point is
+> `autodev-implement:autodev-implement`. The bare name is not accepted.
 
 Tell it what to implement, or just point it at the plan. It defaults to `./.autodev/plan.md`.
 

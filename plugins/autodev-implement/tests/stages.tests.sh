@@ -231,7 +231,12 @@ assert_match() { # pattern actual because
 }
 
 assert_no_match() { # pattern actual because
-  printf '%s' "$2" | grep -qE "$1" && fail "expected NO match for '$1' but got '$2'. ${3:-}"
+  # Must not end with an unconditional `return 0`: `grep && fail` would set CURRENT_ERROR but
+  # the function would still report success, and every assertion using it would be vacuous.
+  if printf '%s' "$2" | grep -qE "$1"; then
+    CURRENT_ERROR="expected NO match for '$1' but got '$2'. ${3:-}"
+    return 1
+  fi
   return 0
 }
 
@@ -273,16 +278,18 @@ stage_expr() { # stage
       printf '%s | %s' "$base" "$closed"
       ;;
     security)
-      printf '%s | %s | .securityAttempts=1 | .securityVerdict="ISSUES"' "$base" "$closed"
+      # The user checkpoint has been satisfied; without userReviewReached the security review
+      # would still be refused and every assertion below it would test the wrong thing.
+      printf '%s | %s | .userReviewReached=1 | .securityAttempts=1 | .securityVerdict="ISSUES"' "$base" "$closed"
       ;;
     privacy)
-      printf '%s | %s | .securityAttempts=1 | .securityVerdict="PASS" | .privacyAttempts=1 | .privacyVerdict="ISSUES"' "$base" "$closed"
+      printf '%s | %s | .userReviewReached=1 | .securityAttempts=1 | .securityVerdict="PASS" | .privacyAttempts=1 | .privacyVerdict="ISSUES"' "$base" "$closed"
       ;;
     complete)
-      printf '%s | %s | .securityAttempts=1 | .securityVerdict="PASS" | .privacyAttempts=1 | .privacyVerdict="PASS"' "$base" "$closed"
+      printf '%s | %s | .userReviewReached=1 | .securityAttempts=1 | .securityVerdict="PASS" | .privacyAttempts=1 | .privacyVerdict="PASS"' "$base" "$closed"
       ;;
     escalated)
-      printf '%s | %s | .securityAttempts=%s | .securityVerdict="ISSUES"' "$base" "$closed" "$MAX_REVIEW_ATTEMPTS"
+      printf '%s | %s | .userReviewReached=1 | .securityAttempts=%s | .securityVerdict="ISSUES"' "$base" "$closed" "$MAX_REVIEW_ATTEMPTS"
       ;;
   esac
 }
@@ -442,33 +449,77 @@ t_code_review_prefix() {
 }
 run_test 'code-review does not swallow code-security-review' t_code_review_prefix
 
+# Plugin agents are namespaced, so a suffix match would also capture another installed plugin's
+# identically named agent and let it mutate this run's counters.
+FOREIGN_AGENT=""
+t_foreign_namespace_ignored() {
+  local sid
+  sid="$(new_session_id)"
+  assert_equal '{}' "$(hook subagentStart "$(jq -cn --arg s "$sid" --arg a "$FOREIGN_AGENT" \
+    --arg c "$(session_cwd "$sid")" '{sessionId:$s, cwd:$c, agentName:$a}')")" || return 1
+  [ ! -f "$(state_path "$sid")" ] || fail 'the foreign agent created implementation state'
+}
+for agent in other-plugin:autodev-code-review other:autodev-tasking somewhere:autodev-code-security-review; do
+  FOREIGN_AGENT="$agent"
+  run_test "an agent from another namespace ('$agent') is not captured" t_foreign_namespace_ignored
+done
+
+t_foreign_namespace_task_allowed() {
+  local sid
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'milestones'
+  assert_equal '{}' "$(task_check "$sid" 'other-plugin:autodev-code-security-review')"
+}
+run_test 'a task call to a same-named agent in another namespace is never refused' t_foreign_namespace_task_allowed
+
+t_unnamespaced_agent_tracked() {
+  # Only a *different* namespace is rejected; a bare name keeps working.
+  local sid
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  hook subagentStart "$(jq -cn --arg s "$sid" --arg c "$(session_cwd "$sid")" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-tasking"}')" > /dev/null
+  [ -f "$(state_path "$sid")" ] || fail 'an unnamespaced sub-agent was not tracked'
+}
+run_test 'an unnamespaced sub-agent name is still tracked' t_unnamespaced_agent_tracked
+
 t_garbage_stdin() {
-  local out
+  # Capture the hook's exit status immediately: checking $? after an assertion would report the
+  # assertion helper's status, and a hook that printed '{}' but exited non-zero would slip
+  # through -- which is the exact fail-closed regression this case exists to catch.
+  local out status
   out="$(printf 'not json at all' | bash "$STAGE_SCRIPT" preToolUse)"
+  status=$?
   assert_equal '{}' "$out" || return 1
-  assert_equal 0 "$?"
+  assert_equal 0 "$status" 'the hook must exit 0'
 }
 run_test 'garbage stdin returns empty JSON and exits 0' t_garbage_stdin
 
 t_empty_stdin() {
-  local out
+  local out status
   out="$(printf '' | bash "$STAGE_SCRIPT" preToolUse)"
-  assert_equal '{}' "$out"
+  status=$?
+  assert_equal '{}' "$out" || return 1
+  assert_equal 0 "$status" 'the hook must exit 0'
 }
 run_test 'empty stdin returns empty JSON and exits 0' t_empty_stdin
 
 t_unknown_event() {
   # preToolUse is fail-closed on a non-zero exit, so an unknown event must still emit '{}'.
-  local out
+  local out status
   out="$(printf '{"sessionId":"x"}' | bash "$STAGE_SCRIPT" bogusEvent)"
-  assert_equal '{}' "$out"
+  status=$?
+  assert_equal '{}' "$out" || return 1
+  assert_equal 0 "$status" 'the hook must exit 0'
 }
 run_test 'an unknown event name fails open instead of denying the tool call' t_unknown_event
 
 t_missing_event() {
-  local out
+  local out status
   out="$(printf '{"sessionId":"x"}' | bash "$STAGE_SCRIPT")"
-  assert_equal '{}' "$out"
+  status=$?
+  assert_equal '{}' "$out" || return 1
+  assert_equal 0 "$status" 'the hook must exit 0'
 }
 run_test 'a missing event name fails open' t_missing_event
 
@@ -642,7 +693,7 @@ t_last_milestone_to_user_review() {
   round "$sid" 'tasking' 'DONE' > /dev/null
   round "$sid" 'implementation' 'DONE' > /dev/null
   footer="$(round "$sid" 'code-review' 'PASS')"
-  assert_match 'wait for them to review the code' "$footer" || return 1
+  assert_match 'hand the code back for review' "$footer" || return 1
   assert_match 'Audit trail:' "$footer"
 }
 run_test 'the last milestone closing moves to the user review checkpoint' t_last_milestone_to_user_review
@@ -650,13 +701,103 @@ run_test 'the last milestone closing moves to the user review checkpoint' t_last
 t_security_then_privacy() {
   local sid sec priv
   sid="$(new_session_id)"
-  seed_stage "$sid" 'user-review'
+  seed_stage "$sid" 'user-review' '| .userReviewReached=1'
   sec="$(round "$sid" 'code-security-review' 'PASS')"
   assert_match 'autodev-code-privacy-review' "$sec" || return 1
   priv="$(round "$sid" 'code-privacy-review' 'PASS')"
   assert_match 'Proceed to WRAPUP' "$priv"
 }
 run_test 'security passing moves to privacy, privacy passing completes the run' t_security_then_privacy
+
+# ---------------------------------------------------------------------------------------------
+section 'The USER-REVIEW checkpoint is actually enforced'
+# ---------------------------------------------------------------------------------------------
+
+t_security_locked_until_handoff() {
+  local sid out
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'user-review'
+  out="$(agent_task_check "$sid" 'code-security-review')"
+  assert_match '"permissionDecision":"deny"' "$out" || return 1
+  assert_match 'has not been given the code to review yet' "$out"
+}
+run_test 'the security review is refused until the code has been handed to the user' t_security_locked_until_handoff
+
+t_stop_records_handoff() {
+  # Closing the last milestone and starting the security review in the same turn would skip the
+  # user entirely, so the stop itself is what satisfies the checkpoint.
+  local sid
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'user-review'
+  assert_equal '{}' "$(agent_stop "$sid")" || return 1
+  assert_equal '{}' "$(agent_task_check "$sid" 'code-security-review')"
+}
+run_test 'ending the turn at the checkpoint records the handoff and unlocks security' t_stop_records_handoff
+
+t_askuser_records_handoff() {
+  local sid
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'user-review'
+  assert_equal '{}' "$(tool_check "$sid" 'ask_user')" || return 1
+  assert_equal '{}' "$(agent_task_check "$sid" 'code-security-review')"
+}
+run_test 'asking the user at the checkpoint also records the handoff' t_askuser_records_handoff
+
+t_handoff_audited() {
+  local sid audit
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'user-review'
+  agent_stop "$sid" > /dev/null
+  audit="$(cat "$(view_path "$sid" 'implement-gate-audit.md')")"
+  assert_match 'handed to user' "$audit"
+}
+run_test 'the handoff is recorded in the audit trail' t_handoff_audited
+
+t_user_fix_returns_to_checkpoint() {
+  local sid
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'user-review'
+  agent_stop "$sid" > /dev/null
+  round "$sid" 'code-fix' 'DONE' > /dev/null
+  assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" 'code-security-review')" \
+    'the user must approve the fixed code too'
+}
+run_test 'fixing user-reported issues sends the run back to the checkpoint' t_user_fix_returns_to_checkpoint
+
+t_fix_after_complete_resequences() {
+  # The fix changed code that both reviews already judged, so their verdicts are stale.
+  local sid footer
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'complete'
+  footer="$(round "$sid" 'code-fix' 'DONE')"
+  assert_match 'security=pending' "$footer" || return 1
+  assert_match 'privacy=pending' "$footer" || return 1
+  assert_match 'autodev-code-security-review' "$footer" || return 1
+  assert_no_match 'hand the code back for review' "$footer" 'the user already approved this code'
+}
+run_test 'a fix after the final reviews passed resequences back to security' t_fix_after_complete_resequences
+
+t_fix_during_privacy_restarts_security() {
+  # Security must re-run because the code changed, but the privacy loop keeps its spent budget:
+  # refunding it would make the loop unbounded.
+  local sid footer
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'privacy' '| .privacyAttempts=4'
+  footer="$(round "$sid" 'code-fix' 'DONE')"
+  assert_match 'security=pending\(0/' "$footer" || return 1
+  assert_match "privacy=ISSUES\(4/$MAX_REVIEW_ATTEMPTS\)" "$footer" || return 1
+  assert_match 'autodev-code-security-review' "$footer"
+}
+run_test 'a fix during the privacy loop restarts security without refunding privacy rounds' t_fix_during_privacy_restarts_security
+
+t_fix_during_security_keeps_budget() {
+  local sid footer
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'security' '| .securityAttempts=6'
+  footer="$(round "$sid" 'code-fix' 'DONE')"
+  assert_match "security=ISSUES\(6/$MAX_REVIEW_ATTEMPTS\)" "$footer"
+}
+run_test 'a fix during the security loop does not refund its rounds' t_fix_during_security_keeps_budget
 
 t_security_rerun_invalidates_privacy() {
   local sid footer
@@ -738,7 +879,7 @@ t_early_security_pass_cannot_skip_user_review() {
   round "$sid" 'implementation' 'DONE' > /dev/null
   footer="$(round "$sid" 'code-review' 'PASS')"
   assert_match 'security=pending' "$footer" || return 1
-  assert_match 'wait for them to review the code' "$footer"
+  assert_match 'hand the code back for review' "$footer"
 }
 run_test 'a security pass recorded before tasking cannot skip the user review checkpoint' t_early_security_pass_cannot_skip_user_review
 
@@ -873,7 +1014,7 @@ ordering_case milestones   code-privacy-review   deny
 ordering_case milestones   code-review           allow
 ordering_case milestones   code-fix              allow
 ordering_case milestones   implementation        allow
-ordering_case user-review  code-security-review  allow
+ordering_case user-review  code-security-review  deny
 ordering_case user-review  code-fix              allow
 ordering_case user-review  code-privacy-review   deny
 ordering_case user-review  code-review           deny
@@ -910,6 +1051,26 @@ t_builtin_task_allowed() {
   assert_equal '{}' "$(task_check "$sid" 'explore')"
 }
 run_test 'a task call to a built-in agent is never refused' t_builtin_task_allowed
+
+t_retasking_denied_after_progress() {
+  # Re-tasking rewrites the milestone list; a shorter one would retire milestones that were
+  # never built.
+  local sid out
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'milestones'
+  out="$(agent_task_check "$sid" 'tasking')"
+  assert_match '"permissionDecision":"deny"' "$out" || return 1
+  assert_match 'milestone work has already started' "$out"
+}
+run_test 're-tasking is refused once milestone work has started' t_retasking_denied_after_progress
+
+t_retasking_allowed_before_progress() {
+  local sid
+  sid="$(new_session_id)"
+  seed_stage "$sid" 'milestones' '| .implementVerdict="pending" | .implementAttempts=0 | .reviewAttempts=0 | .completedMilestones=0'
+  assert_equal '{}' "$(agent_task_check "$sid" 'tasking')"
+}
+run_test 're-tasking is still allowed before any milestone work has started' t_retasking_allowed_before_progress
 
 # ---------------------------------------------------------------------------------------------
 section 'Attempt caps'

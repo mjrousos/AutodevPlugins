@@ -4,7 +4,7 @@
     "subagentStart": [
       {
         "type": "command",
-        "matcher": ".*autodev-(?:tasking|implementation|code-review|code-fix|code-security-review|code-privacy-review)",
+        "matcher": "^(?:autodev-implement:)?autodev-(?:tasking|implementation|code-review|code-fix|code-security-review|code-privacy-review)$",
         "bash": "bash \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.sh\" subagentStart",
         "powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.ps1\" subagentStart",
         "timeoutSec": 20

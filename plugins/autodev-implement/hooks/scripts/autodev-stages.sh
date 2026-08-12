@@ -280,20 +280,33 @@ get_task_agent_type() {
              | .agent_type // ""' 2>/dev/null
 }
 
-# agentName arrives namespaced, e.g. "autodev-implement:autodev-code-review". Matching on the
-# full trailing name is what keeps 'code-review' from swallowing 'code-security-review', and
-# what keeps this plugin from capturing autodev-plan's 'autodev-security-review'.
+# agentName arrives namespaced, e.g. "autodev-implement:autodev-code-review". The match is
+# anchored and pinned to this plugin's namespace, because a suffix match would also capture
+# another installed plugin's "other:autodev-code-review" and let it mutate this run's counters.
+# An unnamespaced name is still accepted so the tracker keeps working if the agents are ever
+# loaded without a namespace; only a *different* namespace is rejected.
+#
+# Matching on the full trailing name is also what keeps 'code-review' from swallowing
+# 'code-security-review', and what keeps this plugin from capturing autodev-plan's
+# 'autodev-security-review'.
 resolve_agent() {
   local name
-  name="$(printf '%s' "$1" | sed 's/[[:space:]]*$//')"
+  name="$(printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
   case "$name" in
-    *autodev-tasking)              printf 'tasking' ;;
-    *autodev-implementation)       printf 'implementation' ;;
-    *autodev-code-review)          printf 'code-review' ;;
-    *autodev-code-fix)             printf 'code-fix' ;;
-    *autodev-code-security-review) printf 'code-security-review' ;;
-    *autodev-code-privacy-review)  printf 'code-privacy-review' ;;
-    *)                             printf '' ;;
+    autodev-tasking|autodev-implement:autodev-tasking)
+      printf 'tasking' ;;
+    autodev-implementation|autodev-implement:autodev-implementation)
+      printf 'implementation' ;;
+    autodev-code-review|autodev-implement:autodev-code-review)
+      printf 'code-review' ;;
+    autodev-code-fix|autodev-implement:autodev-code-fix)
+      printf 'code-fix' ;;
+    autodev-code-security-review|autodev-implement:autodev-code-security-review)
+      printf 'code-security-review' ;;
+    autodev-code-privacy-review|autodev-implement:autodev-code-privacy-review)
+      printf 'code-privacy-review' ;;
+    *)
+      printf '' ;;
   esac
 }
 
@@ -383,6 +396,21 @@ reset_downstream_verdicts() {
      | .privacyVerdict = "pending" | .privacyAttempts = 0')"
 }
 
+# A fix applied once the milestones are closed changes code that the whole-implementation
+# reviews have already judged, so any PASS they hold is stale and the sequence has to restart at
+# the security review. Only a PASS is cleared: a loop that is still in progress keeps its
+# attempt budget, or a fix mid-loop would hand it an unlimited number of rounds.
+#
+# Rewrites the global STATE.
+reset_final_verdicts_after_fix() {
+  if [ "$(state_str "$STATE" 'securityVerdict')" = "PASS" ]; then
+    STATE="$(printf '%s' "$STATE" | jq '.securityVerdict = "pending" | .securityAttempts = 0')"
+  fi
+  if [ "$(state_str "$STATE" 'privacyVerdict')" = "PASS" ]; then
+    STATE="$(printf '%s' "$STATE" | jq '.privacyVerdict = "pending" | .privacyAttempts = 0')"
+  fi
+}
+
 # Closes the current milestone when its review loop has ended, either because the reviewer
 # passed it or because the loop spent its budget. Code review is the one loop that proceeds on
 # exhaustion instead of escalating - the outstanding findings are recorded and the run moves on -
@@ -455,8 +483,10 @@ get_stage() {
   fi
 
   if [ "$(state_str "$state" 'securityVerdict')" != "PASS" ]; then
-    # Every milestone is closed but the security review has not started: this is the one
-    # interactive checkpoint, where the user reviews the code before the final reviews run.
+    # Every milestone is closed and no final review has started: this is the interactive
+    # checkpoint. The stage covers the whole window in which the user holds the code, so the
+    # orchestrator may keep stopping while it waits for them. What actually gates the security
+    # review is userReviewReached, checked in preToolUse.
     [ "$(state_num "$state" 'securityAttempts')" -eq 0 ] 2>/dev/null && { printf 'user-review'; return; }
     [ "$(state_num "$state" 'securityAttempts')" -ge "$MAX_REVIEW_ATTEMPTS" ] 2>/dev/null &&
       { printf 'escalated'; return; }
@@ -559,7 +589,11 @@ get_next_action() {
       fi
       ;;
     user-review)
-      printf 'Every milestone is closed. Report to the user and wait for them to review the code. You may stop your turn here and ask_user is permitted. When they tell you to proceed, invoke autodev-implement:autodev-code-security-review.'
+      if [ "$(state_num "$state" 'userReviewReached')" -eq 0 ] 2>/dev/null; then
+        printf 'Every milestone is closed. Report to the user, state what you built, and hand the code back for review - end your turn or ask them directly. The security review stays locked until you do.'
+      else
+        printf 'The user has the code. When they tell you to proceed, invoke autodev-implement:autodev-code-security-review. If they report issues, invoke autodev-implement:autodev-code-fix and hand the result back to them again.'
+      fi
       ;;
     security)
       if [ "$(state_str "$state" 'securityVerdict')" = "ISSUES" ]; then
@@ -693,6 +727,15 @@ case "$EVENT_NAME" in
         if [ "$(state_num "$STATE" 'currentMilestone')" -ge 1 ] 2>/dev/null &&
           [ "$(state_num "$STATE" 'completedMilestones')" -lt "$(get_effective_milestone_count "$STATE")" ] 2>/dev/null; then
           MILESTONE_LABEL="$(state_num "$STATE" 'currentMilestone')"
+        else
+          # Past the milestone phase, so this fix changes code the security and privacy reviews
+          # have already judged.
+          if [ "$(get_stage "$STATE")" = "user-review" ]; then
+            # The user asked for this change, so they get to look again before the final
+            # reviews run.
+            STATE="$(printf '%s' "$STATE" | jq '.userReviewReached = 0')"
+          fi
+          reset_final_verdicts_after_fix
         fi
         ;;
       code-security-review)
@@ -853,8 +896,20 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
     if [ ! -f "$STATE_PATH" ] && [ ! -f "$MIRROR_PATH" ]; then emit_empty; fi
     advance_milestone
     STAGE="$(get_stage "$STATE")"
-    # 'user-review' is deliberately not blocked: stopping to let the human review the code is
-    # the whole point of that checkpoint.
+    if [ "$STAGE" = "user-review" ]; then
+      # 'user-review' is deliberately not blocked: stopping to let the human review the code is
+      # the whole point of that checkpoint. Record that the pause actually happened -- that
+      # record is what unlocks the security review, so the run cannot close its last milestone
+      # and start the final reviews in the same turn without ever handing the code to the user.
+      ensure_dir "$STATE_DIR" || true
+      ensure_dir "$VIEW_DIR" || true
+      if [ "$(state_num "$STATE" 'userReviewReached')" -eq 0 ] 2>/dev/null; then
+        STATE="$(printf '%s' "$STATE" | jq '.userReviewReached = 1')"
+        write_state "$STATE"
+        add_audit_row "user-review" "-" "0" "handed to user" "-"
+      fi
+      emit_empty
+    fi
     is_autonomous_stage "$STAGE" || emit_empty
     # The authoritative directory may be what was deleted. Recreate it before persisting the
     # recovered block counter; write_state still fails open if this is impossible.
@@ -925,6 +980,14 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
             if [ "$TARGET" = "code-security-review" ] || [ "$TARGET" = "code-privacy-review" ]; then
               REMAINING=$(( $(get_effective_milestone_count "$STATE") - $(state_num "$STATE" 'completedMilestones') ))
               DENY_REASON="$REMAINING milestone(s) are still unimplemented, and the security and privacy reviews run only once the whole implementation is finished"
+            elif [ "$TARGET" = "tasking" ] &&
+              { [ "$(state_num "$STATE" 'completedMilestones')" -gt 0 ] 2>/dev/null ||
+                [ "$(state_num "$STATE" 'implementAttempts')" -gt 0 ] 2>/dev/null ||
+                [ "$(state_num "$STATE" 'reviewAttempts')" -gt 0 ] 2>/dev/null; }; then
+              # Re-tasking rewrites the milestone list, and a shorter list would retire
+              # milestones that were never built. It is only safe before any milestone work has
+              # started.
+              DENY_REASON="milestone work has already started, and re-tasking now would rewrite the milestone list underneath it"
             elif [ "$TARGET" = "code-review" ] &&
               [ "$(state_str "$STATE" 'implementVerdict')" != "DONE" ]; then
               # Reviewing before the milestone is built would record a verdict about code that
@@ -938,10 +1001,18 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
             fi
             ;;
           user-review)
-            if [ "$TARGET" = "implementation" ] || [ "$TARGET" = "code-review" ] || [ "$TARGET" = "tasking" ]; then
-              DENY_REASON="every milestone is closed and the run is waiting for the user to review the code"
+            if [ "$TARGET" = "code-security-review" ]; then
+              # The checkpoint is satisfied only once the orchestrator has actually handed the
+              # code back -- by ending its turn or by asking the user. Without this the final
+              # milestone could close and the security review start in the same turn, and the
+              # user would never get to look at anything.
+              if [ "$(state_num "$STATE" 'userReviewReached')" -eq 0 ] 2>/dev/null; then
+                DENY_REASON="the user has not been given the code to review yet. End your turn, or ask the user to review, and run the security review once they tell you to proceed"
+              fi
             elif [ "$TARGET" = "code-privacy-review" ]; then
               DENY_REASON="the security review runs before the privacy review"
+            else
+              DENY_REASON="every milestone is closed and the run is waiting for the user to review the code"
             fi
             ;;
           security)
@@ -969,6 +1040,18 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
 
     # ask_user. Permitted at the USER-REVIEW checkpoint, once a stage has escalated, before the
     # run starts, and after it completes. Denied in between.
+    if [ "$STAGE" = "user-review" ]; then
+      # Asking the user to review the code is the handoff, so it satisfies the checkpoint just
+      # as ending the turn does.
+      ensure_dir "$STATE_DIR" || true
+      ensure_dir "$VIEW_DIR" || true
+      if [ "$(state_num "$STATE" 'userReviewReached')" -eq 0 ] 2>/dev/null; then
+        STATE="$(printf '%s' "$STATE" | jq '.userReviewReached = 1')"
+        write_state "$STATE"
+        add_audit_row "user-review" "-" "0" "handed to user" "-"
+      fi
+      emit_empty
+    fi
     is_autonomous_stage "$STAGE" || emit_empty
 
     REASON="The autodev-implement run is in an autonomous phase ($STAGE), which proceeds without human interaction, so ask_user is unavailable. Resolve the question yourself using the plan and your best engineering judgement, and record the decision in the todo list. The user is consulted at the USER-REVIEW checkpoint once every milestone is closed. If you truly cannot proceed, keep working until the current stage reaches its attempt limit, at which point escalation to the user is unlocked automatically. Next required action: $(get_next_action "$STATE" "$STAGE")"
