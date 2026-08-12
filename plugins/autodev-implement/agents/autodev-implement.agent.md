@@ -429,7 +429,9 @@ this and cannot bypass it; you should simply know it exists:
   calls to that agent are denied outright. If you see that denial, the loop is over — go straight to
   escalation. Do not try to work around it.
 - Calling a sub-agent out of order is denied too. If you are told a call is out of order, the footer
-  or denial message names the stage you should be running instead.
+  or denial message names the stage you should be running instead. In particular, **tasking is the
+  only sub-agent that may open a run** — every other one is refused until a todo list exists, and
+  tasking clears any milestone progress recorded before it ran.
 - Four files are written into the `.autodev/` directory:
   - `.autodev/todos.md` — the milestone todo list, maintained by the sub-agents.
   - `.autodev/implement-gate-audit.md` — one row per sub-agent lifecycle event.

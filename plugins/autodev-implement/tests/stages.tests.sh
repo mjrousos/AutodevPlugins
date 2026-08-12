@@ -407,10 +407,54 @@ run_test 'agentStop with no state returns empty' t_agentstop_no_state
 t_askuser_no_state() { assert_equal '{}' "$(tool_check "$(new_session_id)" 'ask_user')"; }
 run_test 'ask_user with no state is permitted' t_askuser_no_state
 
-t_task_no_state() {
-  assert_equal '{}' "$(agent_task_check "$(new_session_id)" 'code-security-review')"
+t_task_no_state_tasking() {
+  assert_equal '{}' "$(agent_task_check "$(new_session_id)" 'tasking')"
 }
-run_test 'task with no state is permitted' t_task_no_state
+run_test 'opening a run with tasking is permitted when no state exists' t_task_no_state_tasking
+
+NO_STATE_AGENT=""
+t_task_no_state_denied() {
+  # Otherwise the first call could be implementation, which records milestone progress for code
+  # that predates any milestone -- and tasking would then hand it straight to review.
+  local out
+  out="$(agent_task_check "$(new_session_id)" "$NO_STATE_AGENT")"
+  assert_match '"permissionDecision":"deny"' "$out" || return 1
+  assert_match 'run has not started' "$out"
+}
+for agent in implementation code-review code-fix code-security-review code-privacy-review; do
+  NO_STATE_AGENT="$agent"
+  run_test "opening a run with '$agent' instead of tasking is refused" t_task_no_state_denied
+done
+
+t_foreign_agent_no_state() {
+  assert_equal '{}' "$(task_check "$(new_session_id)" 'explore')"
+}
+run_test 'a foreign agent is still permitted when no state exists' t_foreign_agent_no_state
+
+t_idle_only_tasking() {
+  # State exists (something was invoked) but tasking has never run.
+  local sid
+  sid="$(new_session_id)"
+  seed_state "$sid" '.implementAttempts=1 | .implementVerdict="DONE" | .totalInvocations=1'
+  assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" 'code-review')" || return 1
+  assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" 'code-fix')" || return 1
+  assert_equal '{}' "$(agent_task_check "$sid" 'tasking')"
+}
+run_test 'only tasking may run while the run is still idle' t_idle_only_tasking
+
+t_tasking_clears_early_progress() {
+  # An implementation that ran before any milestone existed must not let the first milestone
+  # skip straight to code review.
+  local sid footer
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  round "$sid" 'implementation' 'DONE' > /dev/null
+  footer="$(round "$sid" 'tasking' 'DONE')"
+  assert_match 'implement=pending\(0/' "$footer" || return 1
+  assert_match 'autodev-implementation for milestone 1' "$footer" || return 1
+  assert_no_match 'autodev-code-review for milestone' "$footer" 'nothing has been implemented against this todo list yet'
+}
+run_test 'tasking clears milestone progress recorded before the run opened' t_tasking_clears_early_progress
 
 UNTRACKED_AGENT=""
 t_untracked_agent() {

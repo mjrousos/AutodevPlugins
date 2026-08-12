@@ -840,6 +840,15 @@ try {
                         $state['taskingAttempts'] = [int]$state['taskingAttempts'] + 1
                     }
                     $state['taskingVerdict'] = 'running'
+                    # Any milestone progress on the books describes code written before this
+                    # todo list existed -- for example an implementation sub-agent invoked
+                    # before the run was opened. Carrying it forward would let the first
+                    # milestone go straight to code review without ever being implemented
+                    # against the todo list.
+                    $state['implementAttempts'] = 0
+                    $state['implementVerdict'] = 'pending'
+                    $state['reviewAttempts'] = 0
+                    $state['reviewVerdict'] = 'pending'
                     # Nothing has been implemented yet against this todo list, so any security
                     # or privacy verdict on the books belongs to a different body of code.
                     Reset-DownstreamVerdicts -State $state
@@ -1111,6 +1120,22 @@ try {
 
             if (-not (Test-Path -LiteralPath $statePath) -and
                 -not (Test-Path -LiteralPath $mirrorPath)) {
+                # No run has started. ask_user is nobody's business here, but the target still
+                # has to be resolved before letting a sub-agent through: the only stage that may
+                # open a run is tasking. Starting with implementation would record milestone
+                # progress for code that predates any milestone, and once tasking finished the
+                # tracker would hand that code straight to code review.
+                if ($toolName -eq 'task') {
+                    $target = Resolve-Agent -AgentName (Get-TaskAgentType -ToolArgs $payload.toolArgs)
+                    if ($null -ne $target -and $target -ne 'tasking') {
+                        $reason = "Out of order: invoking $target is not the next step because the " +
+                        "autodev-implement run has not started and no milestones exist yet. " +
+                        "Next required action: Invoke autodev-implement:autodev-tasking to break " +
+                        "the plan into milestones."
+                        Write-JsonResult @{ permissionDecision = 'deny'; permissionDecisionReason = $reason }
+                        exit 0
+                    }
+                }
                 Write-JsonResult @{}
                 exit 0
             }
@@ -1139,12 +1164,19 @@ try {
                     exit 0
                 }
 
-                # Ordering. The fix agent is legal in every stage, and re-tasking is legal
-                # whenever the milestone work has not started, so only genuine out-of-order
-                # jumps are refused. Over-denying here would deadlock the orchestrator against
-                # the agentStop block, so every denial below leaves at least one way forward.
+                # Ordering. The fix agent is legal in every stage that has code to fix, so only
+                # genuine out-of-order jumps are refused. Over-denying here would deadlock the
+                # orchestrator against the agentStop block, so every denial below leaves at
+                # least one way forward.
                 $denyReason = ''
-                if ($target -ne 'code-fix') {
+                if ($stage -eq 'idle') {
+                    # State exists but tasking has never run, so there are no milestones and
+                    # nothing has been built. Only tasking may open the run.
+                    if ($target -ne 'tasking') {
+                        $denyReason = "the autodev-implement run has not started and no milestones exist yet, so tasking has to define them before any other stage runs"
+                    }
+                }
+                elseif ($target -ne 'code-fix') {
                     switch ($stage) {
                         'tasking' {
                             if ($target -ne 'tasking') {

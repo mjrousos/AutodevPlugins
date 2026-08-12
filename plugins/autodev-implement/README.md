@@ -70,12 +70,14 @@ every sub-agent lifecycle event and:
   actually given the code back to you, by ending its turn or asking you directly, so the last
   milestone cannot close and the final reviews start in the same turn;
 - **denies `ask_user` during autonomous phases**, and unlocks it at USER-REVIEW and on escalation;
-- **refuses out-of-order sub-agent calls** — no security review while milestones remain, no review
-  of a milestone that has not been implemented, no new milestone while the current one's review is
-  unresolved, and no re-tasking once milestone work has started;
-- **invalidates stale verdicts** — implementing new code clears the review verdict for that
-  milestone, and a fix applied after the milestones close clears the security and privacy passes,
-  so the final reviews re-run against the code that actually shipped;
+- **refuses out-of-order sub-agent calls** — nothing but tasking may open a run, no security
+  review while milestones remain, no review of a milestone that has not been implemented, no new
+  milestone while the current one's review is unresolved, and no re-tasking once milestone work
+  has started;
+- **invalidates stale verdicts** — tasking clears any milestone progress recorded before the todo
+  list existed, implementing new code clears the review verdict for that milestone, and a fix
+  applied after the milestones close clears the security and privacy passes, so the final reviews
+  re-run against the code that actually shipped;
 - **refuses any further sub-agent call once a budget is spent**, which is what actually ends a loop
   that will not converge.
 

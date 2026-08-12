@@ -699,9 +699,15 @@ case "$EVENT_NAME" in
           ATTEMPT=$(( $(state_num "$STATE" 'taskingAttempts') + 1 ))
         fi
         STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" \
-          '.taskingAttempts = $a | .taskingVerdict = "running"')"
-        # Nothing has been implemented yet against this todo list, so any security or privacy
-        # verdict on the books belongs to a different body of code.
+          '.taskingAttempts = $a | .taskingVerdict = "running"
+           | .implementAttempts = 0 | .implementVerdict = "pending"
+           | .reviewAttempts = 0 | .reviewVerdict = "pending"')"
+        # Any milestone progress on the books describes code written before this todo list
+        # existed -- for example an implementation sub-agent invoked before the run was opened.
+        # Carrying it forward would let the first milestone go straight to code review without
+        # ever being implemented against the todo list. Nothing has been implemented against
+        # this todo list yet either, so any security or privacy verdict belongs to a different
+        # body of code.
         reset_downstream_verdicts
         ;;
       implementation)
@@ -961,7 +967,23 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
       *) emit_empty ;;
     esac
 
-    if [ ! -f "$STATE_PATH" ] && [ ! -f "$MIRROR_PATH" ]; then emit_empty; fi
+    if [ ! -f "$STATE_PATH" ] && [ ! -f "$MIRROR_PATH" ]; then
+      # No run has started. ask_user is nobody's business here, but the target still has to be
+      # resolved before letting a sub-agent through: the only stage that may open a run is
+      # tasking. Starting with implementation would record milestone progress for code that
+      # predates any milestone, and once tasking finished the tracker would hand that code
+      # straight to code review.
+      if [ "$TOOL_NAME" = "task" ]; then
+        TARGET="$(resolve_agent "$(get_task_agent_type)")"
+        if [ -n "$TARGET" ] && [ "$TARGET" != "tasking" ]; then
+          REASON="Out of order: invoking $TARGET is not the next step because the autodev-implement run has not started and no milestones exist yet. Next required action: Invoke autodev-implement:autodev-tasking to break the plan into milestones."
+          jq -cn --arg r "$REASON" \
+            '{permissionDecision: "deny", permissionDecisionReason: $r}' 2>/dev/null || emit_empty
+          exit 0
+        fi
+      fi
+      emit_empty
+    fi
     advance_milestone
     STAGE="$(get_stage "$STATE")"
 
@@ -982,11 +1004,17 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
         exit 0
       fi
 
-      # Ordering. The fix agent is legal in every stage, so only genuine out-of-order jumps are
-      # refused. Over-denying here would deadlock the orchestrator against the agentStop block,
-      # so every denial below leaves at least one way forward.
+      # Ordering. The fix agent is legal in every stage that has code to fix, so only genuine
+      # out-of-order jumps are refused. Over-denying here would deadlock the orchestrator
+      # against the agentStop block, so every denial below leaves at least one way forward.
       DENY_REASON=''
-      if [ "$TARGET" != "code-fix" ]; then
+      if [ "$STAGE" = "idle" ]; then
+        # State exists but tasking has never run, so there are no milestones and nothing has
+        # been built. Only tasking may open the run.
+        if [ "$TARGET" != "tasking" ]; then
+          DENY_REASON="the autodev-implement run has not started and no milestones exist yet, so tasking has to define them before any other stage runs"
+        fi
+      elif [ "$TARGET" != "code-fix" ]; then
         case "$STAGE" in
           tasking)
             if [ "$TARGET" != "tasking" ]; then

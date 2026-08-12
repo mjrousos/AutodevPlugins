@@ -441,8 +441,45 @@ Test-Case 'ask_user with no state is permitted' {
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = New-SessionId; toolName = 'ask_user' })
 }
 
-Test-Case 'task with no state is permitted' {
-    Assert-Equal '{}' (Invoke-TaskCheck -SessionId (New-SessionId) -Agent 'code-security-review')
+Test-Case 'opening a run with tasking is permitted when no state exists' {
+    Assert-Equal '{}' (Invoke-TaskCheck -SessionId (New-SessionId) -Agent 'tasking')
+}
+
+foreach ($agent in @('implementation', 'code-review', 'code-fix', 'code-security-review', 'code-privacy-review')) {
+    $a = $agent
+    Test-Case "opening a run with '$a' instead of tasking is refused" {
+        # Otherwise the first call could be implementation, which records milestone progress for
+        # code that predates any milestone -- and tasking would then hand it straight to review.
+        $out = Invoke-TaskCheck -SessionId (New-SessionId) -Agent $a
+        Assert-Match '"permissionDecision":"deny"' $out
+        Assert-Match 'run has not started' $out
+    }.GetNewClosure()
+}
+
+Test-Case 'a foreign agent is still permitted when no state exists' {
+    $taskArgs = @{ agent_type = 'explore' } | ConvertTo-Json -Compress
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = New-SessionId; toolName = 'task'; toolArgs = $taskArgs })
+}
+
+Test-Case 'only tasking may run while the run is still idle' {
+    # State exists (something was invoked) but tasking has never run.
+    $sid = New-SessionId
+    Set-ImplState -SessionId $sid -Values @{ implementAttempts = 1; implementVerdict = 'DONE'; totalInvocations = 1 }
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-review')
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-fix')
+    Assert-Equal '{}' (Invoke-TaskCheck -SessionId $sid -Agent 'tasking')
+}
+
+Test-Case 'tasking clears milestone progress recorded before the run opened' {
+    # An implementation that ran before any milestone existed must not let the first milestone
+    # skip straight to code review.
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    Invoke-Round -SessionId $sid -Agent 'implementation' -Verdict 'DONE' | Out-Null
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE')
+    Assert-Match 'implement=pending\(0/' $footer
+    Assert-Match 'autodev-implementation for milestone 1' $footer
+    Assert-NoMatch 'autodev-code-review for milestone' $footer 'nothing has been implemented against this todo list yet'
 }
 
 foreach ($agent in @('explore', 'general-purpose', 'security-review', 'code-review', 'task', 'autodev-implement:autodev-implement')) {
