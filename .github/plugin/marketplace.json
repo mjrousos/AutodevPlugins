@@ -17,8 +17,8 @@
     },
     {
       "name": "autodev-implement",
-      "description": "Generates code implementations based on a plan from Autodev-Plan.",
-      "version": "0.1.0",
+      "description": "Implements a plan from Autodev-Plan milestone by milestone, hardened by isolated code, security, and privacy review loops.",
+      "version": "0.2.0",
       "source": "./plugins/autodev-implement"
     },
     {

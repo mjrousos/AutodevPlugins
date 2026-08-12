@@ -1,4 +1,39 @@
 {
   "version": 1,
-  "hooks": {}
+  "hooks": {
+    "subagentStart": [
+      {
+        "type": "command",
+        "matcher": ".*autodev-(?:tasking|implementation|code-review|code-fix|code-security-review|code-privacy-review)",
+        "bash": "bash \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.sh\" subagentStart",
+        "powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.ps1\" subagentStart",
+        "timeoutSec": 20
+      }
+    ],
+    "subagentStop": [
+      {
+        "type": "command",
+        "bash": "bash \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.sh\" subagentStop",
+        "powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.ps1\" subagentStop",
+        "timeoutSec": 20
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "bash \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.sh\" agentStop",
+        "powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.ps1\" agentStop",
+        "timeoutSec": 20
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "matcher": "^(?:ask_user|AskUserQuestion|task)$",
+        "bash": "bash \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.sh\" preToolUse",
+        "powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${PLUGIN_ROOT}/hooks/scripts/autodev-stages.ps1\" preToolUse",
+        "timeoutSec": 20
+      }
+    ]
+  }
 }

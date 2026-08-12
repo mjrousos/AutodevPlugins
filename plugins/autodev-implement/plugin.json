@@ -1,7 +1,7 @@
 {
   "name": "autodev-implement",
-  "version": "0.1.0",
-  "description": "Generates code implementations based on a plan from Autodev-Plan.",
+  "version": "0.2.0",
+  "description": "Implements a plan from Autodev-Plan milestone by milestone, hardened by isolated code, security, and privacy review loops.",
   "author": {
     "name": "Mike Rousos",
     "email": "mjrousos@github.com",

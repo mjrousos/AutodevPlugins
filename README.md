@@ -5,11 +5,11 @@ This repository contains plugins for automating different parts of the software 
 Plugins:
 
 - [Autodev-Plan](./plugins/autodev-plan/README.md): Generates a development plan based on a project or feature description, hardened by isolated architecture, security, and privacy review gates.
-- [Autodev-Implement](./plugins/autodev-implement/README.md): Generates code implementations based on a plan from Autodev-Plan.
+- [Autodev-Implement](./plugins/autodev-implement/README.md): Implements a plan from Autodev-Plan milestone by milestone, hardened by isolated code, security, and privacy review loops.
 - [Autodev-Docs](./plugins/autodev-docs/README.md): Generates documentation for your codebase or project.
 
-> **Status:** `autodev-plan` is implemented. `autodev-implement` and `autodev-docs` are still
-> scaffolded placeholders.
+> **Status:** `autodev-plan` and `autodev-implement` are implemented. `autodev-docs` is still a
+> scaffolded placeholder.
 
 ## Installation
 
@@ -37,7 +37,7 @@ plugins/<plugin-name>/
 ```
 
 Each plugin's `plugin.json` references its `hooks.json` and `.mcp.json`. In the unimplemented
-plugins both files are present but empty, so they load cleanly until they are built out.
+plugin both files are present but empty, so they load cleanly until they are built out.
 
 Agents contributed by a plugin are namespaced `<plugin>:<agent>` — for example
 `autodev-plan:autodev-plan`.
