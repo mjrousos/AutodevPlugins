@@ -211,7 +211,7 @@ Repository root: <ABSOLUTE PATH>
 Project context: <one or two sentences — language, framework, what this codebase is>
 Feature being planned: <one or two sentences>
 
-This is attempt <N> of at most 5 for this gate.
+This is attempt <N> of at most 10 for this gate.
 
 <Include the section below only when N > 1. Omit the heading entirely on a first review —
 the reviewers treat its presence as the signal that this is a re-review.>
@@ -219,7 +219,9 @@ the reviewers treat its presence as the signal that this is a re-review.>
 ## Previous findings
 
 Your previous review raised the findings below. I have revised the plan in response.
-Verify each was genuinely addressed, and review the revised plan as a whole.
+Focus on verifying that each was genuinely addressed. Raise a new finding only if it is blocker
+or major and the plan introduced it, worsened it, or it directly affects behavior added or
+changed by the plan.
 
 <verbatim list of the previous findings, with the resolution noted for each — including
 any you disagreed with and why>
