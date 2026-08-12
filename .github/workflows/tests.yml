@@ -16,6 +16,15 @@ jobs:
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-plan/tests/gates.tests.ps1
 
+  stages-powershell:
+    name: Stage tracker (Windows PowerShell)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run stage tracker tests
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-implement/tests/stages.tests.ps1
+
   gates-bash:
     name: Gate tracker (bash)
     strategy:
@@ -32,6 +41,23 @@ jobs:
           fi
       - name: Run gate tracker tests
         run: bash plugins/autodev-plan/tests/gates.tests.sh
+
+  stages-bash:
+    name: Stage tracker (bash)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install jq; else sudo apt-get update && sudo apt-get install -y jq; fi
+          fi
+      - name: Run stage tracker tests
+        run: bash plugins/autodev-implement/tests/stages.tests.sh
 
   manifests:
     name: Manifests and line endings
