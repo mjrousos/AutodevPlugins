@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# OTLP/HTTP span emitter for the autodev plugins (Linux / macOS).
+#
+# Emits exactly one OpenTelemetry span describing a completed autodev sub-agent, so that
+# 'ISSUES' verdicts reported by the review gates can be counted in a tracing backend.
+#
+# This script is ALWAYS run as an isolated child process by the hook scripts, never sourced
+# into them. That is a safety requirement, not a style preference. The hook scripts install
+# `trap '... printf "{}"; exit 0' ERR`, so a non-zero return from curl inside the hook process
+# would print '{}' and exit, destroying the tracker footer the gate depends on. Running here,
+# invoked with `>/dev/null 2>&1 </dev/null || :`, means neither this script's output nor its
+# exit code can reach the hook.
+#
+# Correlation: the hook payload carries no W3C trace context, so this span cannot be a child of
+# Copilot's own spans. Instead it carries the raw session id as 'gen_ai.conversation.id' and
+# 'github.copilot.session.id', which are the attributes Copilot CLI puts its session id on,
+# making a backend-side join exact.
+#
+# Configuration comes from the same environment variables Copilot CLI itself uses, so hook
+# telemetry switches on and off with Copilot's own telemetry.
+#
+# Requires jq (already required by the hook scripts) and, for the network path, curl. Either
+# being absent degrades to "no telemetry", never to a failure.
+#
+# Usage: autodev-otel.sh <payload-json-file>
+
+PAYLOAD_PATH="${1:-}"
+
+# Ceiling on the request timeout. The parent applies its own bound; this keeps a user-set value
+# from ever approaching the hook's own timeout budget.
+MAX_TIMEOUT_SEC=5
+DEFAULT_TIMEOUT_SEC=2
+
+# Every exit path is a success: telemetry is never worth a failed hook.
+die_ok() { exit 0; }
+
+is_truthy() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1 | true | yes | on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+trim() {
+  # Pure parameter expansion: this runs on every configuration read, and spawning sed for each
+  # one is needless process churn in a hook that shares a 20 second budget.
+  local s="${1:-}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  printf '%s' "${s%"${s##*[![:space:]]}"}"
+}
+
+resolve_timeout() {
+  local raw
+  raw="$(trim "${AUTODEV_OTEL_TIMEOUT_SEC:-}")"
+  case "$raw" in
+    '' | *[!0-9]*) printf '%s' "$DEFAULT_TIMEOUT_SEC"; return ;;
+  esac
+  if [ "$raw" -lt 1 ] 2>/dev/null; then printf '1'; return; fi
+  if [ "$raw" -gt "$MAX_TIMEOUT_SEC" ] 2>/dev/null; then printf '%s' "$MAX_TIMEOUT_SEC"; return; fi
+  printf '%s' "$raw"
+}
+
+resolve_protocol() {
+  local protocol="${OTEL_EXPORTER_OTLP_TRACES_PROTOCOL:-}"
+  [ -n "$protocol" ] || protocol="${OTEL_EXPORTER_OTLP_PROTOCOL:-}"
+  printf '%s' "$protocol" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
+}
+
+resolve_endpoint() {
+  # Per the OTLP exporter specification the signal-specific variable is used verbatim, while the
+  # generic one is a base that '/v1/traces' is appended to. Copilot's implicit
+  # 'http://127.0.0.1:4318' default is deliberately not reproduced: silently posting to localhost
+  # from a hook would be surprising.
+  local specific generic
+  specific="$(trim "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}")"
+  if [ -n "$specific" ]; then printf '%s' "$specific"; return; fi
+  generic="$(trim "${OTEL_EXPORTER_OTLP_ENDPOINT:-}")"
+  [ -n "$generic" ] || return 0
+  printf '%s/v1/traces' "${generic%/}"
+}
+
+# http/https only, so a malformed variable cannot turn into some other scheme.
+endpoint_ok() {
+  case "${1:-}" in
+    http://?* | https://?*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+percent_decode() {
+  # Escape backslashes first so a literal one in a header value is not reinterpreted by %b.
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  printf '%b' "${s//%/\\x}"
+}
+
+# Emits one '-H name: value' pair per line, NUL-free, for the caller to read into an array.
+# OTEL_EXPORTER_OTLP_TRACES_HEADERS wins over the generic variable rather than merging with it,
+# per the specification. Values are split on the FIRST '=' only, so a base64 token containing '='
+# survives intact. Never logged.
+collect_headers() {
+  local raw pair name value
+  raw="${OTEL_EXPORTER_OTLP_TRACES_HEADERS:-}"
+  [ -n "$raw" ] || raw="${OTEL_EXPORTER_OTLP_HEADERS:-}"
+  [ -n "$raw" ] || return 0
+  local IFS=','
+  for pair in $raw; do
+    pair="$(trim "$pair")"
+    [ -n "$pair" ] || continue
+    case "$pair" in
+      =*) continue ;;
+      *=*) ;;
+      *) continue ;;
+    esac
+    name="$(trim "${pair%%=*}")"
+    value="$(trim "${pair#*=}")"
+    [ -n "$name" ] || continue
+    printf '%s: %s\n' "$(percent_decode "$name")" "$(percent_decode "$value")"
+  done
+}
+
+random_hex() {
+  # Real randomness, not a reformatted UUID: a UUID has fixed version and variant bits, which for
+  # an 8-byte span id is a meaningful loss of uniformity. All-zero ids are invalid per the spec,
+  # so reject and retry rather than emit an unusable span.
+  local bytes="$1" hex attempt=0
+  while [ "$attempt" -lt 8 ]; do
+    attempt=$((attempt + 1))
+    hex=''
+    if [ -r /dev/urandom ]; then
+      hex="$(head -c "$bytes" /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n')"
+    fi
+    if [ -z "$hex" ] && command -v openssl >/dev/null 2>&1; then
+      hex="$(openssl rand -hex "$bytes" 2>/dev/null | tr -d ' \n')"
+    fi
+    [ "${#hex}" -eq $((bytes * 2)) ] || continue
+    case "$hex" in
+      *[!0]*) printf '%s' "$hex"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+digits_or_zero() {
+  case "${1:-}" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+main() {
+  is_truthy "${COPILOT_OTEL_ENABLED:-}" || die_ok
+  command -v jq >/dev/null 2>&1 || die_ok
+  [ -n "$PAYLOAD_PATH" ] && [ -f "$PAYLOAD_PATH" ] || die_ok
+
+  # An explicitly gRPC-configured exporter must not be sent HTTP/JSON: the endpoint is a gRPC
+  # port and the POST would be meaningless traffic rather than a dropped span.
+  [ "$(resolve_protocol)" = "grpc" ] && die_ok
+
+  local debug_file endpoint
+  debug_file="$(trim "${AUTODEV_OTEL_DEBUG_FILE:-}")"
+  endpoint="$(resolve_endpoint)"
+  # The debug sink is for tests and for a developer inspecting what would be exported, so it
+  # deliberately does not require a reachable endpoint.
+  if [ -z "$debug_file" ]; then
+    endpoint_ok "$endpoint" || die_ok
+    command -v curl >/dev/null 2>&1 || die_ok
+  fi
+
+  local request
+  request="$(cat "$PAYLOAD_PATH" 2>/dev/null)" || die_ok
+  [ -n "$request" ] || die_ok
+  printf '%s' "$request" | jq -e . >/dev/null 2>&1 || die_ok
+
+  # One jq invocation for every field, newline separated in a fixed order. Reading them one at a
+  # time would spawn a dozen jq processes inside a hook that shares a 20 second budget. None of
+  # these values can legitimately contain a newline, and jq renders any that did as an escape.
+  # Carriage returns are stripped so a payload file written with CRLF cannot corrupt every value.
+  local span_name session_id agent_name agent_id plugin unit_key unit_value verdict
+  local attempt total start_ms end_ms
+  IFS=$'\n' read -r -d '' \
+    span_name session_id agent_name agent_id plugin unit_key unit_value verdict \
+    attempt total start_ms end_ms < <(printf '%s' "$request" | jq -r '
+      [ .spanName, .sessionId, .agentName, .agentId, .plugin, .unitKey, .unitValue, .verdict,
+        .attempt, .totalInvocations, .startTimeMs, .endTimeMs ]
+      | map(if . == null then "" else (. | tostring) end)
+      | .[]' 2>/dev/null | tr -d '\r')
+
+  [ -n "$unit_key" ] || unit_key='autodev.gate'
+  [ -n "$span_name" ] || span_name='autodev.subagent'
+
+  attempt="$(digits_or_zero "$attempt")"
+  total="$(digits_or_zero "$total")"
+  end_ms="$(digits_or_zero "$end_ms")"
+  start_ms="$(digits_or_zero "$start_ms")"
+  if [ "$end_ms" = "0" ]; then
+    end_ms="$(date -u +%s 2>/dev/null)000"
+    end_ms="$(digits_or_zero "$end_ms")"
+  fi
+  # A missing or stale start time yields an honest zero-duration span rather than a fabricated
+  # or negative one. Compared as strings of equal length only when lengths match, so a longer
+  # (larger) start value is also caught.
+  if [ "$start_ms" = "0" ] ||
+    [ "${#start_ms}" -gt "${#end_ms}" ] ||
+    { [ "${#start_ms}" -eq "${#end_ms}" ] && [ "$start_ms" \> "$end_ms" ]; }; then
+    start_ms="$end_ms"
+  fi
+  # Concatenating '000000' converts milliseconds to nanoseconds without 64-bit shell arithmetic,
+  # and keeps the value a decimal string, which is how OTLP/JSON encodes every int64.
+  local start_ns="${start_ms}000000" end_ns="${end_ms}000000"
+
+  local issues=0 blocked=0
+  [ "$verdict" = "ISSUES" ] && issues=1
+  [ "$verdict" = "BLOCKED" ] && blocked=1
+
+  local service_name trace_id span_id
+  service_name="$(trim "${OTEL_SERVICE_NAME:-}")"
+  [ -n "$service_name" ] || service_name='github-copilot'
+  trace_id="$(random_hex 16)" || die_ok
+  span_id="$(random_hex 8)" || die_ok
+
+  local document
+  document="$(jq -cn \
+    --arg service "$service_name" \
+    --arg traceId "$trace_id" \
+    --arg spanId "$span_id" \
+    --arg name "$span_name" \
+    --arg startNs "$start_ns" \
+    --arg endNs "$end_ns" \
+    --arg sessionId "$session_id" \
+    --arg agentName "$agent_name" \
+    --arg agentId "$agent_id" \
+    --arg plugin "$plugin" \
+    --arg unitKey "$unit_key" \
+    --arg unitValue "$unit_value" \
+    --arg verdict "$verdict" \
+    --arg issues "$issues" \
+    --arg blocked "$blocked" \
+    --arg attempt "$attempt" \
+    --arg total "$total" \
+    '{
+      resourceSpans: [{
+        resource: {
+          attributes: [{ key: "service.name", value: { stringValue: $service } }]
+        },
+        scopeSpans: [{
+          scope: { name: "autodev-plugins" },
+          spans: [{
+            traceId: $traceId,
+            spanId: $spanId,
+            name: $name,
+            kind: 1,
+            startTimeUnixNano: $startNs,
+            endTimeUnixNano: $endNs,
+            attributes: [
+              { key: "gen_ai.conversation.id",    value: { stringValue: $sessionId } },
+              { key: "github.copilot.session.id", value: { stringValue: $sessionId } },
+              { key: "github.copilot.agent.name", value: { stringValue: $agentName } },
+              { key: "github.copilot.agent.id",   value: { stringValue: $agentId } },
+              { key: "autodev.plugin",            value: { stringValue: $plugin } },
+              { key: $unitKey,                    value: { stringValue: $unitValue } },
+              { key: "autodev.verdict",           value: { stringValue: $verdict } },
+              { key: "autodev.issues",            value: { intValue: $issues } },
+              { key: "autodev.blocked",           value: { intValue: $blocked } },
+              { key: "autodev.attempt",           value: { intValue: $attempt } },
+              { key: "autodev.total_invocations", value: { intValue: $total } }
+            ],
+            status: { code: 0 }
+          }]
+        }]
+      }]
+    }' 2>/dev/null)" || die_ok
+  [ -n "$document" ] || die_ok
+
+  if [ -n "$debug_file" ]; then
+    # One document per line so a test can count emissions as well as inspect them. Headers are
+    # never written here; they can carry credentials.
+    printf '%s\n' "$document" >> "$debug_file" 2>/dev/null
+    die_ok
+  fi
+
+  local timeout_sec header_args=() header_line
+  timeout_sec="$(resolve_timeout)"
+  while IFS= read -r header_line; do
+    [ -n "$header_line" ] || continue
+    header_args+=(-H "$header_line")
+  done <<EOF
+$(collect_headers)
+EOF
+
+  # -o /dev/null discards the response body; --max-time is a hard bound on the whole exchange.
+  printf '%s' "$document" | curl -sS -o /dev/null \
+    --max-time "$timeout_sec" --connect-timeout "$timeout_sec" \
+    -X POST -H 'Content-Type: application/json' \
+    "${header_args[@]}" --data-binary @- "$endpoint" >/dev/null 2>&1
+
+  die_ok
+}
+
+main
+exit 0

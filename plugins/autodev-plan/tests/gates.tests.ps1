@@ -1064,6 +1064,304 @@ Test-Case 'every hook entry sets a timeout' {
 }
 
 # ------------------------------------------------------------------------------------------
+Write-Section 'OpenTelemetry span emission'
+# ------------------------------------------------------------------------------------------
+
+function Get-TelemetryDir {
+    param([string]$SessionId)
+    $dir = Join-Path $script:Root "otel-$SessionId"
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Invoke-HookWithEnv {
+    # Runs the hook with extra environment variables set only for that invocation, so telemetry
+    # configuration cannot leak between cases running in the same worker.
+    param([string]$EventName, [hashtable]$Payload, [hashtable]$EnvVars)
+    $saved = @{}
+    foreach ($key in $EnvVars.Keys) {
+        $saved[$key] = [Environment]::GetEnvironmentVariable($key)
+        [Environment]::SetEnvironmentVariable($key, $EnvVars[$key])
+    }
+    try {
+        return Invoke-Hook $EventName $Payload
+    }
+    finally {
+        foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
+    }
+}
+
+function Invoke-TelemetryRound {
+    <#
+        Drives one full subagentStart/subagentStop round with the debug sink enabled and returns
+        the hook output plus every span document that was written.
+    #>
+    param(
+        [string]$SessionId,
+        [string]$Gate = 'architecture',
+        [string]$Verdict = 'ISSUES',
+        [hashtable]$ExtraEnv = @{},
+        [string]$AgentId = 'agent-1',
+        [switch]$SkipStart
+    )
+    $dir = Get-TelemetryDir $SessionId
+    $sink = Join-Path $dir 'spans.jsonl'
+    # Note: PowerShell variable names are case insensitive, so this must not be called '$env'
+    # or it would alias the $ExtraEnv parameter.
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    foreach ($key in $ExtraEnv.Keys) { $vars[$key] = $ExtraEnv[$key] }
+
+    $agentName = "autodev-plan:autodev-$Gate-review"
+    if (-not $SkipStart) {
+        Invoke-HookWithEnv 'subagentStart' @{ sessionId = $SessionId; agentName = $agentName } $vars | Out-Null
+    }
+    $output = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $SessionId
+        agentName = $agentName
+        agentId   = $AgentId
+        response  = "Body text.`n`nAUTODEV-VERDICT: $Verdict"
+    } $vars
+
+    $spans = @()
+    if (Test-Path -LiteralPath $sink) {
+        foreach ($line in @(Get-Content -LiteralPath $sink)) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) { $spans += ($line | ConvertFrom-Json) }
+        }
+    }
+    return [pscustomobject]@{ Output = $output; Spans = $spans; SinkPath = $sink }
+}
+
+function Get-SpanAttribute {
+    param($Document, [string]$Key)
+    $span = $Document.resourceSpans[0].scopeSpans[0].spans[0]
+    foreach ($attr in $span.attributes) {
+        if ($attr.key -eq $Key) {
+            if ($null -ne $attr.value.stringValue) { return [string]$attr.value.stringValue }
+            return [string]$attr.value.intValue
+        }
+    }
+    return $null
+}
+
+Test-Case 'telemetry is off by default and writes nothing' {
+    $session = New-SessionId
+    $dir = Get-TelemetryDir $session
+    $sink = Join-Path $dir 'spans.jsonl'
+    # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = 'autodev-plan:autodev-architecture-review' } @{ AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+    $out = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session
+        agentName = 'autodev-plan:autodev-architecture-review'
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } @{ AUTODEV_OTEL_DEBUG_FILE = $sink }
+    if (Test-Path -LiteralPath $sink) { throw 'a span was emitted while telemetry was disabled' }
+    Assert-Match 'gate tracker' (Get-Footer $out) 'the footer must be unaffected'
+}
+
+Test-Case 'an enabled round emits exactly one well-formed span document' {
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId)
+    Assert-Equal 1 $result.Spans.Count 'exactly one span per subagentStop'
+    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Match '^[0-9a-f]{32}$' $span.traceId 'traceId must be 16 lowercase hex bytes'
+    Assert-Match '^[0-9a-f]{16}$' $span.spanId 'spanId must be 8 lowercase hex bytes'
+    if ($span.traceId -match '^0+$') { throw 'an all-zero trace id is invalid' }
+    if ($span.spanId -match '^0+$') { throw 'an all-zero span id is invalid' }
+    # OTLP/JSON encodes every int64 as a decimal string; a JSON number would lose precision.
+    if ($span.startTimeUnixNano -isnot [string]) { throw 'startTimeUnixNano must be a JSON string' }
+    if ($span.endTimeUnixNano -isnot [string]) { throw 'endTimeUnixNano must be a JSON string' }
+    if ([long]$span.startTimeUnixNano -gt [long]$span.endTimeUnixNano) {
+        throw 'span starts after it ends'
+    }
+    Assert-Equal 'autodev.gate architecture' $span.name
+    Assert-Equal 'github-copilot' $result.Spans[0].resourceSpans[0].resource.attributes[0].value.stringValue
+}
+
+Test-Case 'autodev.issues counts an ISSUES verdict and nothing else' {
+    $issues = Invoke-TelemetryRound -SessionId (New-SessionId) -Verdict 'ISSUES'
+    Assert-Equal '1' (Get-SpanAttribute $issues.Spans[0] 'autodev.issues')
+    Assert-Equal 'ISSUES' (Get-SpanAttribute $issues.Spans[0] 'autodev.verdict')
+    # A gate never reports BLOCKED, but the attribute must still be present and zero so a query
+    # summing it does not have to special-case this plugin.
+    Assert-Equal '0' (Get-SpanAttribute $issues.Spans[0] 'autodev.blocked')
+
+    $pass = Invoke-TelemetryRound -SessionId (New-SessionId) -Verdict 'PASS'
+    Assert-Equal '0' (Get-SpanAttribute $pass.Spans[0] 'autodev.issues')
+    Assert-Equal 'PASS' (Get-SpanAttribute $pass.Spans[0] 'autodev.verdict')
+}
+
+Test-Case 'the span carries the identifiers a backend needs to correlate' {
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId) -Gate 'security' -AgentId 'agent-xyz'
+    $doc = $result.Spans[0]
+    Assert-Equal 'autodev-plan' (Get-SpanAttribute $doc 'autodev.plugin')
+    Assert-Equal 'security' (Get-SpanAttribute $doc 'autodev.gate')
+    Assert-Equal 'agent-xyz' (Get-SpanAttribute $doc 'github.copilot.agent.id')
+    Assert-Equal 'autodev-plan:autodev-security-review' (Get-SpanAttribute $doc 'github.copilot.agent.name')
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.attempt')
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.total_invocations')
+}
+
+Test-Case 'the exported session id is the raw one, not the filename-safe one' {
+    # Copilot puts the session id on its own spans as gen_ai.conversation.id. Exporting the
+    # sanitized form used for filenames would silently break that join for any session id
+    # containing a character the sanitizer rewrites.
+    $rawSession = 'sess:with/unsafe chars'
+    $dir = Join-Path $script:Root ('otel-raw-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $sink = Join-Path $dir 'spans.jsonl'
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $rawSession; cwd = $dir; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $rawSession; cwd = $dir; agentName = $agentName; agentId = 'a1'
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal $rawSession (Get-SpanAttribute $doc 'gen_ai.conversation.id')
+    Assert-Equal $rawSession (Get-SpanAttribute $doc 'github.copilot.session.id')
+}
+
+Test-Case 'the span duration comes from the recorded start time' {
+    $session = New-SessionId
+    $result = Invoke-TelemetryRound -SessionId $session
+    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
+    $durationMs = ([long]$span.endTimeUnixNano - [long]$span.startTimeUnixNano) / 1000000
+    # subagentStart runs a whole process before subagentStop does, so a real recorded start time
+    # always yields a positive duration. Zero would mean the timestamp never survived the state
+    # file, which is exactly the regression this guards.
+    if ($durationMs -le 0) { throw "expected a positive span duration but got ${durationMs}ms" }
+}
+
+Test-Case 'a start time belonging to a different sub-agent is not reused' {
+    # Guards the agent-identity check: a stale start time from another invocation would produce
+    # a span with a nonsense duration, so a mismatch must fall back to zero duration.
+    $session = New-SessionId
+    Start-Gate -SessionId $session -Gate 'architecture'
+    Start-Sleep -Milliseconds 50
+    $result = Invoke-TelemetryRound -SessionId $session -Gate 'security' -SkipStart
+    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'a mismatched agent must yield a zero-duration span'
+}
+
+Test-Case 'a grpc-configured exporter emits nothing' {
+    # We cannot speak gRPC from a script, and posting JSON at a gRPC port would be meaningless
+    # traffic rather than a dropped span.
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId) -ExtraEnv @{ OTEL_EXPORTER_OTLP_PROTOCOL = 'grpc' }
+    Assert-Equal 0 $result.Spans.Count 'grpc must suppress export entirely'
+    Assert-Match 'gate tracker' (Get-Footer $result.Output) 'the footer must be unaffected'
+}
+
+Test-Case 'telemetry never alters the hook output or exit code' {
+    <#
+        The safety property the whole design exists for. A telemetry child that writes to stdout
+        and stderr and exits non-zero must leave the hook byte-for-byte identical to a run with
+        telemetry off. This is what would catch an emitter being sourced in-process, or its
+        output leaking into the single JSON document the CLI parses.
+    #>
+    $session = New-SessionId
+    $baseline = Invoke-Hook 'subagentStop' @{
+        sessionId = $session
+        agentName = 'autodev-plan:autodev-architecture-review'
+        agentId   = 'a1'
+        response  = "Body text.`n`nAUTODEV-VERDICT: ISSUES"
+    }
+
+    # Replace the emitter with one that misbehaves as badly as it can, in a private copy of the
+    # scripts directory so the real emitter is untouched.
+    $sandbox = Join-Path $script:Root ('otel-hostile-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+    Copy-Item -LiteralPath $script:GateScript -Destination (Join-Path $sandbox 'autodev-gates.ps1')
+    Set-Content -LiteralPath (Join-Path $sandbox 'autodev-otel.ps1') -Encoding UTF8 -Value @'
+param([string]$PayloadPath)
+Write-Output '{"permissionDecision":"deny"}'
+Write-Output 'stray text that would break JSON parsing'
+[Console]::Error.WriteLine('exploding')
+exit 3
+'@
+
+    $session2 = New-SessionId
+    $payload = @{
+        sessionId = $session2
+        cwd       = (Get-SessionCwd $session2)
+        agentName = 'autodev-plan:autodev-architecture-review'
+        agentId   = 'a1'
+        response  = "Body text.`n`nAUTODEV-VERDICT: ISSUES"
+    } | ConvertTo-Json -Compress
+    $previous = [Environment]::GetEnvironmentVariable('COPILOT_OTEL_ENABLED')
+    [Environment]::SetEnvironmentVariable('COPILOT_OTEL_ENABLED', 'true')
+    try {
+        $raw = $payload | powershell -NoProfile -ExecutionPolicy Bypass `
+            -File (Join-Path $sandbox 'autodev-gates.ps1') subagentStop
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('COPILOT_OTEL_ENABLED', $previous)
+    }
+    $hostile = ($raw | Out-String).Trim()
+
+    Assert-Equal 0 $exitCode 'a failing telemetry child must not change the exit code'
+    # Exactly one JSON document, and it must still be the tracker footer rather than the stray
+    # decision object the hostile emitter tried to inject.
+    $parsed = $hostile | ConvertFrom-Json
+    if ($null -ne $parsed.permissionDecision) { throw 'the telemetry child leaked a decision into hook output' }
+    Assert-Match 'gate tracker' $parsed.modifiedResponse 'the footer must survive'
+    # Session ids differ between the two runs, so compare the shape rather than the bytes.
+    Assert-Equal ((Get-Footer $baseline) -replace $session, 'S') ($parsed.modifiedResponse -replace $session2, 'S') `
+        'telemetry must not change the hook output at all'
+}
+
+Test-Case 'an unreachable collector leaves the hook output intact' {
+    # No debug sink, so the emitter takes the real network path against a closed port.
+    $session = New-SessionId
+    $vars = @{
+        COPILOT_OTEL_ENABLED        = 'true'
+        OTEL_EXPORTER_OTLP_ENDPOINT = 'http://127.0.0.1:9'
+        AUTODEV_OTEL_TIMEOUT_SEC    = '1'
+    }
+    $out = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session
+        agentName = 'autodev-plan:autodev-architecture-review'
+        agentId   = 'a1'
+        response  = "Body text.`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars
+    Assert-Match 'gate tracker' (Get-Footer $out) 'the footer must survive a failed export'
+    Assert-Match 'Recorded verdict: ISSUES' (Get-Footer $out)
+}
+
+Test-Case 'a malformed endpoint is rejected rather than used' {
+    $session = New-SessionId
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; OTEL_EXPORTER_OTLP_ENDPOINT = 'file:///tmp/nope' }
+    $out = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session
+        agentName = 'autodev-plan:autodev-architecture-review'
+        agentId   = 'a1'
+        response  = "Body text.`n`nAUTODEV-VERDICT: PASS"
+    } $vars
+    Assert-Match 'gate tracker' (Get-Footer $out) 'a non-http scheme must be ignored, not attempted'
+}
+
+Test-Case 'enforcement still works with telemetry enabled' {
+    # Proves the emitter is strictly additive: the attempt budget, verdict recording and
+    # escalation all behave exactly as they do without it.
+    $session = New-SessionId
+    $result = Invoke-TelemetryRound -SessionId $session -Verdict 'PASS'
+    Assert-Match 'Recorded verdict: PASS' (Get-Footer $result.Output)
+    Assert-Match 'autodev-security-review' (Get-Footer $result.Output) 'the next gate must still be named'
+    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
+    Assert-Equal 'PASS' $state.architectureVerdict
+    Assert-Equal 1 $state.architectureAttempts
+    Assert-Equal '' $state.activeAgentId 'the active agent must be cleared once it stops'
+}
+
+Test-Case 'the emitter ships beside the gate script' {
+    # hooks.json invokes the gate script by path and the gate script finds the emitter next to
+    # itself, so a missing copy would silently disable telemetry for the whole plugin.
+    $emitterPs = Join-Path (Split-Path $script:GateScript -Parent) 'autodev-otel.ps1'
+    $emitterSh = Join-Path (Split-Path $script:GateScript -Parent) 'autodev-otel.sh'
+    if (-not (Test-Path -LiteralPath $emitterPs)) { throw "missing $emitterPs" }
+    if (-not (Test-Path -LiteralPath $emitterSh)) { throw "missing $emitterSh" }
+}
+
+# ------------------------------------------------------------------------------------------
 
 Remove-Item -LiteralPath $script:Root -Recurse -Force -ErrorAction SilentlyContinue
 

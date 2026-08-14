@@ -53,6 +53,10 @@ $script:MaxBlocks = 5
 # GateOrder.Count * MaxAttempts, or it would fire before a single pass could spend the per-gate
 # budget and would silently become the real limit.
 $script:MaxTotalInvocations = 40
+# Hard ceiling on how long the telemetry child process may run before the parent kills it. Sits
+# well below the hook's own 20 second timeout so a hung collector can never cost the gate its
+# tracker footer.
+$script:OtelParentTimeoutMs = 6000
 
 function Get-StateDirectory {
     # Enforcement state stays outside the workspace, keyed by session id. Two sessions running
@@ -116,6 +120,12 @@ function New-DefaultState {
         $state["${gate}Attempts"] = 0
         $state["${gate}Verdict"] = 'pending'
     }
+    # Records which sub-agent is currently running and when it started, so subagentStop can give
+    # its telemetry span a real duration. Deliberately keyed by agent id rather than by gate: a
+    # re-gate or an overlapping invocation would otherwise let a stale start time produce a span
+    # with an absurd duration.
+    $state['activeAgentId'] = ''
+    $state['activeAgentStartedAtMs'] = [long]0
     return $state
 }
 
@@ -173,6 +183,32 @@ function Read-State {
                 $prop = $parsed.PSObject.Properties[$key]
                 if ($null -ne $prop -and $null -ne $prop.Value) {
                     $state[$key] = [string]$prop.Value
+                }
+            }
+
+            # Telemetry bookkeeping. This reader copies an explicit allowlist, so a field that is
+            # written but not listed here is silently dropped before the next event can read it.
+            # An epoch-millisecond value does not fit the counter validation above, which caps at
+            # int32, so it is validated separately as a long.
+            $prop = $parsed.PSObject.Properties['activeAgentId']
+            if ($null -ne $prop -and $null -ne $prop.Value) {
+                $state['activeAgentId'] = [string]$prop.Value
+            }
+            $prop = $parsed.PSObject.Properties['activeAgentStartedAtMs']
+            if ($null -ne $prop -and $null -ne $prop.Value) {
+                $startedAt = [long]0
+                $renderedStart = [Convert]::ToString(
+                    $prop.Value,
+                    [Globalization.CultureInfo]::InvariantCulture)
+                if ($renderedStart -match '^[0-9]+$' -and
+                    [long]::TryParse($renderedStart, [ref]$startedAt) -and
+                    $startedAt -ge 0) {
+                    $state['activeAgentStartedAtMs'] = $startedAt
+                }
+                else {
+                    # Corrupt timing is not worth failing enforcement over; drop it and let the
+                    # span fall back to zero duration.
+                    $state['activeAgentStartedAtMs'] = [long]0
                 }
             }
             return $state
@@ -477,6 +513,81 @@ function Write-JsonResult {
     Write-Output ($Result | ConvertTo-Json -Depth 5 -Compress)
 }
 
+function Test-TelemetryEnabled {
+    # Cheap early-out. For the overwhelming majority of users COPILOT_OTEL_ENABLED is unset, and
+    # this is the entire cost of the telemetry feature for them: no temp file, no child process.
+    $value = [Environment]::GetEnvironmentVariable('COPILOT_OTEL_ENABLED')
+    if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+    return ($value.Trim().ToLowerInvariant() -in @('1', 'true', 'yes', 'on'))
+}
+
+function Get-PowerShellPath {
+    foreach ($candidate in @('powershell.exe', 'pwsh.exe')) {
+        $path = Join-Path $PSHOME $candidate
+        if (Test-Path -LiteralPath $path) { return $path }
+    }
+    return 'powershell.exe'
+}
+
+function Send-OtelSpan {
+    <#
+        Runs the OTLP emitter as an ISOLATED CHILD PROCESS with both output streams redirected
+        and discarded. This is a safety requirement, not a style preference: this script's stdout
+        is parsed as a single JSON document and it runs under $ErrorActionPreference = 'Stop', so
+        an in-process Invoke-RestMethod could put a response body on the success stream or turn a
+        transport warning into a terminating error. Neither can happen across a process boundary.
+
+        The parent also enforces a hard wall-clock bound by killing the child, because
+        Invoke-RestMethod's -TimeoutSec does not bound DNS resolution on Windows PowerShell 5.1
+        and this hook shares a 20 second budget.
+
+        Telemetry failure is never worth a failed hook, so every path returns quietly.
+    #>
+    param([hashtable]$Request)
+    try {
+        if (-not (Test-TelemetryEnabled)) { return }
+        $emitter = Join-Path $PSScriptRoot 'autodev-otel.ps1'
+        if (-not (Test-Path -LiteralPath $emitter)) { return }
+
+        $payloadPath = Join-Path ([IO.Path]::GetTempPath()) ("autodev-otel-$PID-$([guid]::NewGuid().ToString('N')).json")
+        Set-Content -LiteralPath $payloadPath -Encoding UTF8 `
+            -Value ($Request | ConvertTo-Json -Depth 5 -Compress)
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = Get-PowerShellPath
+            $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $emitter +
+            '" -PayloadPath "' + $payloadPath + '"'
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.RedirectStandardInput = $true
+
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            if ($null -eq $proc) { return }
+            try {
+                $proc.StandardInput.Close()
+                # Drain both pipes so a child that unexpectedly wrote a lot could not block on a
+                # full buffer and burn the whole timeout.
+                $null = $proc.StandardOutput.ReadToEndAsync()
+                $null = $proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($script:OtelParentTimeoutMs)) {
+                    try { $proc.Kill() } catch { }
+                }
+            }
+            finally {
+                $proc.Dispose()
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        # No telemetry, unchanged hook.
+    }
+}
+
 # --------------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------------
@@ -530,6 +641,11 @@ try {
             $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
             # Real progress was made, so forgive any earlier blocked stops.
             $state['blocks'] = 0
+            # Remember which sub-agent is running and when it started, so subagentStop can report
+            # a real duration. subagentStart carries no agentId, so the agent name is the only
+            # identity available; subagentStop verifies it before trusting the timestamp.
+            $state['activeAgentId'] = [string]$payload.agentName
+            $state['activeAgentStartedAtMs'] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Gate $gate `
                 -Attempt ([int]$state["${gate}Attempts"]) -Action 'invoked' -Verdict '-'
@@ -554,6 +670,15 @@ try {
                 $state["${gate}Attempts"] = 1
             }
             $state["${gate}Verdict"] = $verdict
+            # Claim the recorded start time only when it belongs to this sub-agent. A stale value
+            # from a different or earlier invocation would produce a span with a nonsense
+            # duration, so a mismatch falls back to a zero-duration span instead.
+            $startedAtMs = [long]0
+            if ([string]$state['activeAgentId'] -eq [string]$payload.agentName) {
+                $startedAtMs = [long]$state['activeAgentStartedAtMs']
+            }
+            $state['activeAgentId'] = ''
+            $state['activeAgentStartedAtMs'] = [long]0
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = [int]$state["${gate}Attempts"]
@@ -604,6 +729,24 @@ try {
             }
 
             $footer = $footerLines -join [Environment]::NewLine
+            # Telemetry last, after every piece of enforcement state is durable. The raw session
+            # id is used deliberately: the sanitized form exists only to build a safe filename,
+            # and exporting it would break the join against Copilot's own spans for any session
+            # id containing a character the sanitizer rewrites.
+            Send-OtelSpan -Request @{
+                spanName         = "autodev.gate $gate"
+                sessionId        = [string]$payload.sessionId
+                agentName        = [string]$payload.agentName
+                agentId          = [string]$payload.agentId
+                plugin           = 'autodev-plan'
+                unitKey          = 'autodev.gate'
+                unitValue        = $gate
+                verdict          = $verdict
+                attempt          = $attempt
+                totalInvocations = [int]$state['totalInvocations']
+                startTimeMs      = $startedAtMs
+                endTimeMs        = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            }
             Write-JsonResult @{ modifiedResponse = ($response + [Environment]::NewLine + $footer) }
             exit 0
         }

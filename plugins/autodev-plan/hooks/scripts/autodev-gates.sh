@@ -91,7 +91,8 @@ default_state() {
   sessionId: $sid, createdAt: $now, updatedAt: $now, blocks: 0, totalInvocations: 0,
     architectureAttempts: 0, architectureVerdict: "pending",
     securityAttempts: 0,     securityVerdict: "pending",
-    privacyAttempts: 0,      privacyVerdict: "pending"
+    privacyAttempts: 0,      privacyVerdict: "pending",
+    activeAgentId: "", activeAgentStartedAtMs: 0
   }'
 }
 
@@ -117,6 +118,13 @@ read_state_file() {
           and test("^[0-9]+$")
           and (tonumber <= 2147483647));
     def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    # Telemetry bookkeeping. An epoch-millisecond value does not fit nonnegint, which caps at
+    # int32 to match the counter validation, so it is checked separately.
+    def millis_ok($key):
+      (has($key) | not)
+      or (.[$key] | (type == "number" and . >= 0 and floor == .)
+                    or (type == "string" and test("^[0-9]+$")));
+    def string_ok($key): (has($key) | not) or (.[$key] | type == "string");
     def verdict_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
@@ -129,6 +137,8 @@ read_state_file() {
     and verdict_ok("architectureVerdict")
     and verdict_ok("securityVerdict")
     and verdict_ok("privacyVerdict")
+    and string_ok("activeAgentId")
+    and millis_ok("activeAgentStartedAtMs")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
@@ -175,6 +185,47 @@ write_state() {
 
 state_num() { printf '%s' "$1" | jq -r ".$2 // 0" 2>/dev/null; }
 state_str() { printf '%s' "$1" | jq -r ".$2 // \"pending\"" 2>/dev/null; }
+
+# Directory this script lives in, so the telemetry emitter beside it can be found regardless of
+# the hook's working directory. The '|| SCRIPT_DIR=' keeps a failure here off the ERR trap.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
+
+telemetry_enabled() {
+  # Cheap early-out. For the overwhelming majority of users COPILOT_OTEL_ENABLED is unset, and
+  # this is the entire cost of the telemetry feature for them: no temp file, no child process.
+  case "$(printf '%s' "${COPILOT_OTEL_ENABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1 | true | yes | on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+send_otel_span() {
+  # Runs the OTLP emitter as an ISOLATED CHILD PROCESS with stdin closed and both output streams
+  # discarded. This is a safety requirement, not a style preference: this script installs an ERR
+  # trap that prints '{}' and exits, so a non-zero return from curl running in this process would
+  # destroy the tracker footer the gate depends on. The trailing '|| :' below is what keeps a
+  # failing child off that trap; do not remove it.
+  local request="$1" emitter tmp
+  telemetry_enabled || return 0
+  [ -n "$SCRIPT_DIR" ] || return 0
+  emitter="$SCRIPT_DIR/autodev-otel.sh"
+  [ -f "$emitter" ] || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  printf '%s' "$request" > "$tmp" 2>/dev/null || :
+  bash "$emitter" "$tmp" >/dev/null 2>&1 </dev/null || :
+  rm -f "$tmp" 2>/dev/null || :
+  return 0
+}
+
+now_ms() {
+  # Epoch milliseconds without depending on GNU date's %3N, which BSD date on macOS lacks.
+  local secs
+  secs="$(date -u +%s 2>/dev/null)" || secs=""
+  case "$secs" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s000' "$secs" ;;
+  esac
+}
 
 add_audit_row() {
   local gate="$1" attempt="$2" action="$3" verdict="$4" session_marker
@@ -360,6 +411,11 @@ case "$EVENT_NAME" in
     # "complete" while downstream gates hold verdicts for a plan that changed.
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
       ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
+    # Remember which sub-agent is running and when it started, so subagentStop can report a real
+    # duration. subagentStart carries no agentId, so the agent name is the only identity
+    # available; subagentStop verifies it before trusting the timestamp.
+    STATE="$(printf '%s' "$STATE" | jq --arg id "$(json_get '.agentName')" --argjson ms "$(now_ms)" \
+      '.activeAgentId = $id | .activeAgentStartedAtMs = $ms')"
     SEEN_CURRENT=0
     for LATER in $GATE_ORDER; do
       if [ "$SEEN_CURRENT" -eq 1 ]; then
@@ -385,8 +441,15 @@ case "$EVENT_NAME" in
     ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
     # subagentStart was missed somehow; still count this attempt.
     [ "$ATTEMPTS" -lt 1 ] 2>/dev/null && ATTEMPTS=1
+    # Claim the recorded start time only when it belongs to this sub-agent. A stale value from a
+    # different or earlier invocation would produce a span with a nonsense duration, so a
+    # mismatch falls back to a zero-duration span instead.
+    STARTED_AT_MS=0
+    if [ "$(printf '%s' "$STATE" | jq -r '.activeAgentId // ""' 2>/dev/null)" = "$(json_get '.agentName')" ]; then
+      STARTED_AT_MS="$(state_num "$STATE" 'activeAgentStartedAtMs')"
+    fi
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v")"
+      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .activeAgentId = \"\" | .activeAgentStartedAtMs = 0")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
     # Capture the review itself, not just that it happened, so the findings survive the session
@@ -424,6 +487,26 @@ Reviewer feedback log: $FEEDBACK_PATH"
 Gate: $GATE | Attempt $ATTEMPTS of $MAX_ATTEMPTS | Recorded verdict: $VERDICT
 Gate status: $STATUS_LINE
 $NEXT_ACTION"
+
+    # Telemetry last, after every piece of enforcement state is durable. The raw session id is
+    # used deliberately: SAFE_SESSION_ID exists only to build a safe filename, and exporting it
+    # would break the join against Copilot's own spans for any session id containing a character
+    # the sanitizer rewrites.
+    send_otel_span "$(jq -cn \
+      --arg span "autodev.gate $GATE" \
+      --arg sid "$SESSION_ID" \
+      --arg agentName "$(json_get '.agentName')" \
+      --arg agentId "$(json_get '.agentId')" \
+      --arg unitValue "$GATE" \
+      --arg verdict "$VERDICT" \
+      --argjson attempt "$ATTEMPTS" \
+      --argjson total "$(state_num "$STATE" 'totalInvocations')" \
+      --argjson startMs "$STARTED_AT_MS" \
+      --argjson endMs "$(now_ms)" \
+      '{spanName: $span, sessionId: $sid, agentName: $agentName, agentId: $agentId,
+        plugin: "autodev-plan", unitKey: "autodev.gate", unitValue: $unitValue,
+        verdict: $verdict, attempt: $attempt, totalInvocations: $total,
+        startTimeMs: $startMs, endTimeMs: $endMs}' 2>/dev/null)" || :
 
     jq -cn --arg r "$RESPONSE
 $FOOTER" '{modifiedResponse: $r}'

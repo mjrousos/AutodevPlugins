@@ -84,3 +84,9 @@ jobs:
             if grep -qU $'\r' "$f"; then echo "FAIL $f contains CR"; status=1; else echo "ok   $f"; fi
           done < <(find . -name '*.sh' -not -path './.git/*')
           exit $status
+      - name: Telemetry emitter copies must not drift
+        run: |
+          # The emitter is shipped inside each plugin because plugins install as independent
+          # directories. autodev-plan holds the canonical copy; this fails if another plugin's
+          # copy was edited directly instead of the canonical one.
+          bash scripts/sync-otel-emitter.sh --check

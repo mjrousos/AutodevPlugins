@@ -243,13 +243,71 @@ agent. That refusal is driven by the out-of-workspace state, so an orchestrator 
 editing `.autodev/`. Non-reviewer sub-agents stay available so it can still write up the
 escalation.
 
+## OpenTelemetry
+
+When a run is being observed with OpenTelemetry, each `subagentStop` also emits one span
+describing the gate that just finished, so `ISSUES` verdicts can be counted across sessions
+instead of only being readable in `.autodev/`.
+
+### Enabling it
+
+The emitter reuses Copilot CLI's own telemetry variables, so hook telemetry switches on and off
+with Copilot's. It exports only when **both** are set:
+
+| Variable | Purpose |
+| --- | --- |
+| `COPILOT_OTEL_ENABLED` | Must be truthy (`1`, `true`, `yes`, `on`). Unset means no telemetry, and no child process is spawned at all. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Copilot's implicit `http://127.0.0.1:4318` default is deliberately not assumed. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON, which collectors accept on the same port. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` | Comma-separated `key=value` pairs, percent-decoded. The signal-specific variable wins. Header values are never logged. |
+| `OTEL_SERVICE_NAME` | Resource `service.name`; defaults to `github-copilot` so hook spans land beside Copilot's own. |
+| `AUTODEV_OTEL_TIMEOUT_SEC` | Request timeout, default 2, clamped to a maximum of 5. |
+| `AUTODEV_OTEL_DEBUG_FILE` | Writes each span document to this file, one per line, **instead of** posting it. Use this to see exactly what would be exported. |
+
+### What is emitted
+
+One span per `subagentStop`, named `autodev.gate <gate>`, covering the reviewer's real runtime.
+
+| Attribute | Value |
+| --- | --- |
+| `gen_ai.conversation.id`, `github.copilot.session.id` | The session id, matching Copilot's own spans |
+| `github.copilot.agent.name`, `github.copilot.agent.id` | The reviewer sub-agent |
+| `autodev.plugin` | `autodev-plan` |
+| `autodev.gate` | `architecture`, `security` or `privacy` |
+| `autodev.verdict` | `PASS` or `ISSUES` |
+| `autodev.issues` | `1` for an `ISSUES` verdict, else `0` |
+| `autodev.blocked` | Always `0` here; present so a query spanning both plugins needs no special case |
+| `autodev.attempt`, `autodev.total_invocations` | Attempt counters for this gate and session |
+
+To count issues, sum `autodev.issues`, or count spans where `autodev.verdict = "ISSUES"`.
+
+**No reviewer content is ever exported** — not the response body, not the plan, not the prompt,
+and not `transcriptPath`. Only verdicts and identifiers leave the machine.
+
+### Correlating with Copilot's own traces
+
+Hook payloads carry no W3C trace context, so these spans **cannot** be children of Copilot's
+spans; each is its own root trace. They are correlated by attribute instead: Copilot records its
+session id as `gen_ai.conversation.id`, and the emitter exports the same raw value, so joining on
+it in your backend is exact rather than manual.
+
+### Reliability
+
+Export is **best-effort and never authoritative**. A network failure drops a span silently, and a
+redelivered hook would double-count; `github.copilot.agent.id` and `autodev.attempt` are exported
+so duplicates can be identified at query time. Telemetry can never affect a session: the emitter
+runs as a separate process with both output streams discarded, is killed if it exceeds its
+budget, and its failure cannot change the hook's stdout or exit code.
+
 ## Requirements
 
 - **Windows** — no extra prerequisites. Hooks run through the built-in `powershell.exe`, and the
   script is Windows PowerShell 5.1 compatible.
 - **Linux / macOS** — hooks require [`jq`](https://jqlang.github.io/jq/). If `jq` is missing the
   hooks degrade to a no-op: enforcement and the audit trail are disabled, but sessions are never
-  broken.
+  broken. OpenTelemetry export additionally needs `curl`; without it telemetry is skipped and
+  everything else still works.
 
 ## Layout
 
@@ -265,15 +323,21 @@ plugins/autodev-plan/
 │   └── autodev-privacy-review.agent.md
 ├── hooks/scripts/
 │   ├── autodev-gates.ps1             # Gate tracker (Windows)
-│   └── autodev-gates.sh              # Gate tracker (Linux/macOS, needs jq)
+│   ├── autodev-gates.sh              # Gate tracker (Linux/macOS, needs jq)
+│   ├── autodev-otel.ps1              # OTLP span emitter (Windows) - canonical copy
+│   └── autodev-otel.sh               # OTLP span emitter (Linux/macOS) - canonical copy
 └── tests/
     ├── gates.tests.ps1               # Gate tracker tests (Windows)
     └── gates.tests.sh                # Gate tracker tests (Linux/macOS)
 ```
 
-Both scripts implement the same state machine and are dispatched by event name. They are written
+Both trackers implement the same state machine and are dispatched by event name. They are written
 to **fail open**: `preToolUse` hooks are fail-closed by design in the CLI, so a crash there would
 permanently break `ask_user`. Every path is wrapped, always emits valid JSON, and always exits 0.
+
+The two `autodev-otel.*` files are the canonical copies. `autodev-implement` ships byte-identical
+copies of them, kept in sync by `scripts/sync-otel-emitter.sh`; CI runs that script in `--check`
+mode and fails on any drift. Edit the copies here, never the ones in the other plugin.
 
 ## Tests
 

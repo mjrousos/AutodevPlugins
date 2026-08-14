@@ -1259,6 +1259,308 @@ Test-Case 'the tracker still enforces when there is no workspace to write to' {
 }
 
 # ------------------------------------------------------------------------------------------
+Write-Section 'OpenTelemetry span emission'
+# ------------------------------------------------------------------------------------------
+
+function Get-TelemetryDir {
+    param([string]$SessionId)
+    $dir = Join-Path $script:Root "otel-$SessionId"
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Invoke-HookWithEnv {
+    # Runs the hook with extra environment variables set only for that invocation, so telemetry
+    # configuration cannot leak between cases running in the same worker.
+    param([string]$EventName, [hashtable]$Payload, [hashtable]$EnvVars)
+    $saved = @{}
+    foreach ($key in $EnvVars.Keys) {
+        $saved[$key] = [Environment]::GetEnvironmentVariable($key)
+        [Environment]::SetEnvironmentVariable($key, $EnvVars[$key])
+    }
+    try {
+        return Invoke-Hook $EventName $Payload
+    }
+    finally {
+        foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
+    }
+}
+
+function Invoke-TelemetryRound {
+    <#
+        Drives one full subagentStart/subagentStop round with the debug sink enabled and returns
+        the hook output plus every span document that was written.
+    #>
+    param(
+        [string]$SessionId,
+        [string]$Agent = 'tasking',
+        [string]$Verdict = 'DONE',
+        [hashtable]$ExtraEnv = @{},
+        [string]$AgentId = 'agent-1'
+    )
+    $sink = Join-Path (Get-TelemetryDir $SessionId) 'spans.jsonl'
+    # Note: PowerShell variable names are case insensitive, so this must not be called '$env'
+    # or it would alias the $ExtraEnv parameter.
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    foreach ($key in $ExtraEnv.Keys) { $vars[$key] = $ExtraEnv[$key] }
+
+    $agentName = "autodev-implement:autodev-$Agent"
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $SessionId; agentName = $agentName } $vars | Out-Null
+    $output = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $SessionId
+        agentName = $agentName
+        agentId   = $AgentId
+        response  = "Body text.`n`nAUTODEV-VERDICT: $Verdict"
+    } $vars
+
+    $spans = @()
+    if (Test-Path -LiteralPath $sink) {
+        foreach ($line in @(Get-Content -LiteralPath $sink)) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) { $spans += ($line | ConvertFrom-Json) }
+        }
+    }
+    return [pscustomobject]@{ Output = $output; Spans = $spans; SinkPath = $sink }
+}
+
+function Get-SpanAttribute {
+    param($Document, [string]$Key)
+    $span = $Document.resourceSpans[0].scopeSpans[0].spans[0]
+    foreach ($attr in $span.attributes) {
+        if ($attr.key -eq $Key) {
+            if ($null -ne $attr.value.stringValue) { return [string]$attr.value.stringValue }
+            return [string]$attr.value.intValue
+        }
+    }
+    return $null
+}
+
+Test-Case 'telemetry is off by default and writes nothing' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+    # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $sid; agentName = 'autodev-implement:autodev-tasking' } @{ AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+    $out = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $sid
+        agentName = 'autodev-implement:autodev-tasking'
+        response  = "x`n`nAUTODEV-VERDICT: DONE"
+    } @{ AUTODEV_OTEL_DEBUG_FILE = $sink }
+    if (Test-Path -LiteralPath $sink) { throw 'a span was emitted while telemetry was disabled' }
+    Assert-Match 'stage tracker' (Get-Footer $out) 'the footer must be unaffected'
+}
+
+Test-Case 'an enabled round emits exactly one well-formed span document' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $result = Invoke-TelemetryRound -SessionId $sid -Agent 'tasking' -Verdict 'DONE'
+    Assert-Equal 1 $result.Spans.Count 'exactly one span per subagentStop'
+    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Match '^[0-9a-f]{32}$' $span.traceId 'traceId must be 16 lowercase hex bytes'
+    Assert-Match '^[0-9a-f]{16}$' $span.spanId 'spanId must be 8 lowercase hex bytes'
+    if ($span.traceId -match '^0+$') { throw 'an all-zero trace id is invalid' }
+    if ($span.spanId -match '^0+$') { throw 'an all-zero span id is invalid' }
+    # OTLP/JSON encodes every int64 as a decimal string; a JSON number would lose precision.
+    if ($span.startTimeUnixNano -isnot [string]) { throw 'startTimeUnixNano must be a JSON string' }
+    if ($span.endTimeUnixNano -isnot [string]) { throw 'endTimeUnixNano must be a JSON string' }
+    if ([long]$span.startTimeUnixNano -gt [long]$span.endTimeUnixNano) { throw 'span starts after it ends' }
+    Assert-Equal 'autodev.stage tasking' $span.name
+    Assert-Equal 'autodev-implement' (Get-SpanAttribute $result.Spans[0] 'autodev.plugin')
+    Assert-Equal 'tasking' (Get-SpanAttribute $result.Spans[0] 'autodev.stage')
+}
+
+Test-Case 'a review ISSUES verdict is counted as an issue' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $result = Invoke-TelemetryRound -SessionId $sid -Agent 'code-review' -Verdict 'ISSUES'
+    Assert-Equal 'ISSUES' (Get-SpanAttribute $result.Spans[0] 'autodev.verdict')
+    Assert-Equal '1' (Get-SpanAttribute $result.Spans[0] 'autodev.issues')
+    Assert-Equal '0' (Get-SpanAttribute $result.Spans[0] 'autodev.blocked')
+}
+
+Test-Case 'a review PASS verdict is not counted as an issue' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $result = Invoke-TelemetryRound -SessionId $sid -Agent 'code-security-review' -Verdict 'PASS'
+    Assert-Equal 'PASS' (Get-SpanAttribute $result.Spans[0] 'autodev.verdict')
+    Assert-Equal '0' (Get-SpanAttribute $result.Spans[0] 'autodev.issues')
+    Assert-Equal '0' (Get-SpanAttribute $result.Spans[0] 'autodev.blocked')
+}
+
+Test-Case 'a BLOCKED worker counts as blocked, not as a review issue' {
+    <#
+        The two vocabularies must stay separate. A blocked implementation worker is an
+        operational stall, not a review finding, so folding it into autodev.issues would inflate
+        the ISSUES count the whole feature exists to report.
+    #>
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $result = Invoke-TelemetryRound -SessionId $sid -Agent 'implementation' -Verdict 'BLOCKED'
+    Assert-Equal 'BLOCKED' (Get-SpanAttribute $result.Spans[0] 'autodev.verdict')
+    Assert-Equal '0' (Get-SpanAttribute $result.Spans[0] 'autodev.issues')
+    Assert-Equal '1' (Get-SpanAttribute $result.Spans[0] 'autodev.blocked')
+}
+
+Test-Case 'a DONE worker counts as neither' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $result = Invoke-TelemetryRound -SessionId $sid -Agent 'implementation' -Verdict 'DONE'
+    Assert-Equal 'DONE' (Get-SpanAttribute $result.Spans[0] 'autodev.verdict')
+    Assert-Equal '0' (Get-SpanAttribute $result.Spans[0] 'autodev.issues')
+    Assert-Equal '0' (Get-SpanAttribute $result.Spans[0] 'autodev.blocked')
+}
+
+Test-Case 'the exported session id is the raw one, not the filename-safe one' {
+    # Copilot puts the session id on its own spans as gen_ai.conversation.id. Exporting the
+    # sanitized form used for filenames would silently break that join.
+    $rawSession = 'sess:with/unsafe chars'
+    $dir = Join-Path $script:Root ('otel-raw-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $sink = Join-Path $dir 'spans.jsonl'
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-implement:autodev-code-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $rawSession; cwd = $dir; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $rawSession; cwd = $dir; agentName = $agentName; agentId = 'a1'
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal $rawSession (Get-SpanAttribute $doc 'gen_ai.conversation.id')
+    Assert-Equal $rawSession (Get-SpanAttribute $doc 'github.copilot.session.id')
+}
+
+Test-Case 'the span duration comes from the recorded start time' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $result = Invoke-TelemetryRound -SessionId $sid
+    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
+    $durationMs = ([long]$span.endTimeUnixNano - [long]$span.startTimeUnixNano) / 1000000
+    # subagentStart runs a whole process before subagentStop does, so a start time that survived
+    # the state file always yields a positive duration. Zero would mean the state reader dropped
+    # it, which is exactly the regression this guards.
+    if ($durationMs -le 0) { throw "expected a positive span duration but got ${durationMs}ms" }
+}
+
+Test-Case 'a start time belonging to a different sub-agent is not reused' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    Start-Agent -SessionId $sid -Agent 'tasking'
+    Start-Sleep -Milliseconds 50
+    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $sid
+        agentName = 'autodev-implement:autodev-code-review'
+        agentId   = 'a1'
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'a mismatched agent must yield a zero-duration span'
+}
+
+Test-Case 'a grpc-configured exporter emits nothing' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $result = Invoke-TelemetryRound -SessionId $sid -ExtraEnv @{ OTEL_EXPORTER_OTLP_PROTOCOL = 'grpc' }
+    Assert-Equal 0 $result.Spans.Count 'grpc must suppress export entirely'
+    Assert-Match 'stage tracker' (Get-Footer $result.Output) 'the footer must be unaffected'
+}
+
+Test-Case 'telemetry never alters the hook output or exit code' {
+    <#
+        The safety property the whole design exists for. A telemetry child that writes to stdout
+        and stderr and exits non-zero must leave the hook byte-for-byte identical to a run with
+        telemetry off.
+    #>
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $baseline = Invoke-Hook 'subagentStop' @{
+        sessionId = $sid
+        agentName = 'autodev-implement:autodev-code-review'
+        agentId   = 'a1'
+        response  = "Body text.`n`nAUTODEV-VERDICT: ISSUES"
+    }
+
+    $sandbox = Join-Path $script:Root ('otel-hostile-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+    Copy-Item -LiteralPath $script:StageScript -Destination (Join-Path $sandbox 'autodev-stages.ps1')
+    Set-Content -LiteralPath (Join-Path $sandbox 'autodev-otel.ps1') -Encoding UTF8 -Value @'
+param([string]$PayloadPath)
+Write-Output '{"permissionDecision":"deny"}'
+Write-Output 'stray text that would break JSON parsing'
+[Console]::Error.WriteLine('exploding')
+exit 3
+'@
+
+    $sid2 = New-SessionId
+    Set-TodoList -SessionId $sid2 -Milestones 1
+    $payload = @{
+        sessionId = $sid2
+        cwd       = (Get-SessionCwd $sid2)
+        agentName = 'autodev-implement:autodev-code-review'
+        agentId   = 'a1'
+        response  = "Body text.`n`nAUTODEV-VERDICT: ISSUES"
+    } | ConvertTo-Json -Compress
+    $previous = [Environment]::GetEnvironmentVariable('COPILOT_OTEL_ENABLED')
+    [Environment]::SetEnvironmentVariable('COPILOT_OTEL_ENABLED', 'true')
+    try {
+        $raw = $payload | powershell -NoProfile -ExecutionPolicy Bypass `
+            -File (Join-Path $sandbox 'autodev-stages.ps1') subagentStop
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('COPILOT_OTEL_ENABLED', $previous)
+    }
+    $hostile = ($raw | Out-String).Trim()
+
+    Assert-Equal 0 $exitCode 'a failing telemetry child must not change the exit code'
+    $parsed = $hostile | ConvertFrom-Json
+    if ($null -ne $parsed.permissionDecision) { throw 'the telemetry child leaked a decision into hook output' }
+    Assert-Match 'stage tracker' $parsed.modifiedResponse 'the footer must survive'
+    # Session ids differ between the two runs, so compare the shape rather than the bytes.
+    Assert-Equal ((Get-Footer $baseline) -replace $sid, 'S') ($parsed.modifiedResponse -replace $sid2, 'S') `
+        'telemetry must not change the hook output at all'
+}
+
+Test-Case 'an unreachable collector leaves the hook output intact' {
+    # No debug sink, so the emitter takes the real network path against a closed port.
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $out = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $sid
+        agentName = 'autodev-implement:autodev-code-review'
+        agentId   = 'a1'
+        response  = "Body text.`n`nAUTODEV-VERDICT: ISSUES"
+    } @{
+        COPILOT_OTEL_ENABLED        = 'true'
+        OTEL_EXPORTER_OTLP_ENDPOINT = 'http://127.0.0.1:9'
+        AUTODEV_OTEL_TIMEOUT_SEC    = '1'
+    }
+    Assert-Match 'stage tracker' (Get-Footer $out) 'the footer must survive a failed export'
+    Assert-Match 'Recorded verdict: ISSUES' (Get-Footer $out)
+}
+
+Test-Case 'enforcement still works with telemetry enabled' {
+    # Proves the emitter is strictly additive.
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 2
+    $result = Invoke-TelemetryRound -SessionId $sid -Agent 'tasking' -Verdict 'DONE'
+    Assert-Match 'Recorded verdict: DONE' (Get-Footer $result.Output)
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal 'DONE' $state.taskingVerdict
+    Assert-Equal 2 $state.milestoneCount 'the todo list must still be parsed'
+    Assert-Equal '' $state.activeAgentId 'the active agent must be cleared once it stops'
+}
+
+Test-Case 'the emitter ships beside the stage script' {
+    # hooks.json invokes the stage script by path and the stage script finds the emitter next to
+    # itself, so a missing copy would silently disable telemetry for the whole plugin.
+    $emitterPs = Join-Path (Split-Path $script:StageScript -Parent) 'autodev-otel.ps1'
+    $emitterSh = Join-Path (Split-Path $script:StageScript -Parent) 'autodev-otel.sh'
+    if (-not (Test-Path -LiteralPath $emitterPs)) { throw "missing $emitterPs" }
+    if (-not (Test-Path -LiteralPath $emitterSh)) { throw "missing $emitterSh" }
+}
+
+# ------------------------------------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------------------------------------
 
