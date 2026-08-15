@@ -186,7 +186,9 @@ function New-SpanDocument {
     $sessionId = Get-Field -Object $Request -Name 'sessionId'
     $verdict = Get-Field -Object $Request -Name 'verdict'
     $unitKey = Get-Field -Object $Request -Name 'unitKey'
-    if ([string]::IsNullOrWhiteSpace($unitKey)) { $unitKey = 'autodev.gate' }
+    # An attribute key must never be empty, and never come from an unexpected value: a bad key
+    # makes the attribute unusable in a query.
+    if ($unitKey -ne 'autodev.gate' -and $unitKey -ne 'autodev.stage') { $unitKey = 'autodev.gate' }
     $unitValue = Get-Field -Object $Request -Name 'unitValue'
     $plugin = Get-Field -Object $Request -Name 'plugin'
 

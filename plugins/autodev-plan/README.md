@@ -259,7 +259,7 @@ with Copilot's. It exports only when **both** are set:
 | `COPILOT_OTEL_ENABLED` | Must be truthy (`1`, `true`, `yes`, `on`). Unset means no telemetry, and no child process is spawned at all. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Copilot's implicit `http://127.0.0.1:4318` default is deliberately not assumed. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON, which collectors accept on the same port. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON. See the caveat below. |
 | `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` | Comma-separated `key=value` pairs, percent-decoded. The signal-specific variable wins. Header values are never logged. |
 | `OTEL_SERVICE_NAME` | Resource `service.name`; defaults to `github-copilot` so hook spans land beside Copilot's own. |
 | `AUTODEV_OTEL_TIMEOUT_SEC` | Request timeout, default 2, clamped to a maximum of 5. |
@@ -284,6 +284,24 @@ To count issues, sum `autodev.issues`, or count spans where `autodev.verdict = "
 
 **No reviewer content is ever exported** — not the response body, not the plan, not the prompt,
 and not `transcriptPath`. Only verdicts and identifiers leave the machine.
+
+### The emitter only speaks OTLP/JSON
+
+This is worth knowing before you point it at a non-Collector backend. The emitter always sends
+HTTP/JSON, because building protobuf from a shell script is not practical. `grpc` is therefore
+refused outright rather than sent JSON at a gRPC port.
+
+`http/protobuf` is a softer case and is **not** refused. The OTLP specification requires a
+receiver to support protobuf but makes JSON support optional, so a backend configured for
+protobuf is permitted to reject the JSON body. In practice the OpenTelemetry Collector — by far
+the most common target, and what Copilot CLI's own documented setup points at — accepts both on
+the same port, so refusing to export would break the common case to protect against the rare one.
+
+The trade-off is that against a strict protobuf-only backend, spans are dropped at the receiver
+and the emitter cannot tell: it discards transport errors by design, because surfacing them would
+mean writing to a hook's stdout. If you are exporting somewhere other than a Collector and see no
+`autodev.*` spans, set `AUTODEV_OTEL_DEBUG_FILE` to confirm the emitter is producing them, then
+check whether your endpoint accepts `Content-Type: application/json`.
 
 ### Correlating with Copilot's own traces
 

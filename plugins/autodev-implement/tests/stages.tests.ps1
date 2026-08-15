@@ -1440,21 +1440,71 @@ Test-Case 'the span duration comes from the recorded start time' {
     if ($durationMs -le 0) { throw "expected a positive span duration but got ${durationMs}ms" }
 }
 
-Test-Case 'a start time belonging to a different sub-agent is not reused' {
+Test-Case 'overlapping sub-agents each keep their own start time' {
+    # A single shared start slot would let the second sub-agent's start overwrite the first, and
+    # the first stop would then report a truncated duration and clear a timestamp belonging to
+    # the other agent. Each agent keeps its own slot.
     $sid = New-SessionId
     Set-TodoList -SessionId $sid -Milestones 1
     Start-Agent -SessionId $sid -Agent 'tasking'
-    Start-Sleep -Milliseconds 50
+    Start-Agent -SessionId $sid -Agent 'code-review'
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    $taskStart = [long]$state.taskingStartedAtMs
+    $reviewStart = [long]$state.codereviewStartedAtMs
+    if ($taskStart -eq 0 -or $reviewStart -eq 0) {
+        throw "both agents must hold their own start time (tasking=$taskStart review=$reviewStart)"
+    }
+
+    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $sid; agentName = 'autodev-implement:autodev-code-review'; agentId = 'a1'
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal ($reviewStart * 1000000) $span.startTimeUnixNano 'the review span must carry the review start time'
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal $taskStart ([long]$state.taskingStartedAtMs) 'a concurrent agent stopping must not clear another start time'
+}
+
+Test-Case 'a duplicate start for one sub-agent is reported as zero duration' {
+    # Two concurrent invocations of the SAME agent cannot be told apart: subagentStart carries no
+    # agent id, so report an honest zero duration rather than one agent's start time for another.
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    Start-Agent -SessionId $sid -Agent 'tasking'
+    Start-Agent -SessionId $sid -Agent 'tasking'
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal 0 ([long]$state.taskingStartedAtMs) 'a duplicate start must mark the start time unusable'
     $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
     Invoke-HookWithEnv 'subagentStop' @{
-        sessionId = $sid
-        agentName = 'autodev-implement:autodev-code-review'
-        agentId   = 'a1'
-        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+        sessionId = $sid; agentName = 'autodev-implement:autodev-tasking'; agentId = 'a1'
+        response  = "x`n`nAUTODEV-VERDICT: DONE"
     } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
     $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
     $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'a mismatched agent must yield a zero-duration span'
+    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'an ambiguous start must yield a zero-duration span'
+}
+
+Test-Case 'an empty agentId does not shift the other span attributes' {
+    # Splitting the emitter's field list on newline as IFS collapsed an empty field and shifted
+    # every later value left, reporting autodev.issues=0 for an ISSUES verdict.
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-implement:autodev-code-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $sid; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $sid; agentName = $agentName
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal 'ISSUES' (Get-SpanAttribute $doc 'autodev.verdict') 'verdict must survive an empty agentId'
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.issues') 'the issue count must survive an empty agentId'
+    Assert-Equal 'autodev-implement' (Get-SpanAttribute $doc 'autodev.plugin')
+    Assert-Equal 'code-review' (Get-SpanAttribute $doc 'autodev.stage')
 }
 
 Test-Case 'a grpc-configured exporter emits nothing' {
@@ -1548,7 +1598,7 @@ Test-Case 'enforcement still works with telemetry enabled' {
     $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
     Assert-Equal 'DONE' $state.taskingVerdict
     Assert-Equal 2 $state.milestoneCount 'the todo list must still be parsed'
-    Assert-Equal '' $state.activeAgentId 'the active agent must be cleared once it stops'
+    Assert-Equal 0 $state.taskingStartedAtMs 'the start time must be cleared once the agent stops'
 }
 
 Test-Case 'the emitter ships beside the stage script' {

@@ -102,8 +102,16 @@ default_state() {
     securityAttempts: 0, securityVerdict: "pending",
     privacyAttempts: 0, privacyVerdict: "pending",
     cappedMilestones: "",
-    activeAgentId: "", activeAgentStartedAtMs: 0
+    taskingStartedAtMs: 0, implementationStartedAtMs: 0, codereviewStartedAtMs: 0,
+    codefixStartedAtMs: 0, codesecurityreviewStartedAtMs: 0, codeprivacyreviewStartedAtMs: 0
   }'
+}
+
+# Telemetry start-time field for an agent. One field PER AGENT rather than a single global slot,
+# so an overlapping sub-agent cannot overwrite another's start time. The agent names contain
+# hyphens, which the key strips.
+started_at_key() { # agent
+  printf '%sStartedAtMs' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9')"
 }
 
 read_state_file() {
@@ -160,8 +168,12 @@ read_state_file() {
     and review_ok("reviewVerdict")
     and review_ok("securityVerdict")
     and review_ok("privacyVerdict")
-    and string_ok("activeAgentId")
-    and millis_ok("activeAgentStartedAtMs")
+    and millis_ok("taskingStartedAtMs")
+    and millis_ok("implementationStartedAtMs")
+    and millis_ok("codereviewStartedAtMs")
+    and millis_ok("codefixStartedAtMs")
+    and millis_ok("codesecurityreviewStartedAtMs")
+    and millis_ok("codeprivacyreviewStartedAtMs")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
@@ -845,11 +857,19 @@ case "$EVENT_NAME" in
     STATE="$(printf '%s' "$STATE" | jq \
       --argjson t "$(( $(state_num "$STATE" 'totalInvocations') + 1 ))" \
       '.totalInvocations = $t | .blocks = 0')"
-    # Remember which sub-agent is running and when it started, so subagentStop can report a real
-    # duration. subagentStart carries no agentId, so the agent name is the only identity
-    # available; subagentStop verifies it before trusting the timestamp.
-    STATE="$(printf '%s' "$STATE" | jq --arg id "$(json_get '.agentName')" --argjson ms "$(now_ms)" \
-      '.activeAgentId = $id | .activeAgentStartedAtMs = $ms')"
+    # Remember when this agent started, so subagentStop can report a real duration. Recorded
+    # against this agent alone, so an overlapping sub-agent cannot overwrite it. A start that
+    # finds a timestamp already pending for the same agent means two are running concurrently;
+    # there is no agent id on subagentStart to tell their stops apart, so mark it unusable rather
+    # than hand one the other's start time.
+    STARTED_AT_KEY="$(started_at_key "$AGENT")"
+    if [ "$(state_num "$STATE" "$STARTED_AT_KEY")" != "0" ]; then
+      AGENT_START_MS=0
+    else
+      AGENT_START_MS="$(now_ms)"
+    fi
+    STATE="$(printf '%s' "$STATE" | jq --arg k "$STARTED_AT_KEY" --argjson ms "$AGENT_START_MS" \
+      '.[$k] = $ms')"
     write_state "$STATE"
     add_audit_row "$AGENT" "$MILESTONE_LABEL" "$ATTEMPT" "invoked" "-"
     emit_empty
@@ -868,13 +888,9 @@ case "$EVENT_NAME" in
 
     MILESTONE_LABEL='-'
     EXTRA_NOTES=''
-    # Claim the recorded start time only when it belongs to this sub-agent. A stale value from a
-    # different or earlier invocation would produce a span with a nonsense duration, so a
-    # mismatch falls back to a zero-duration span instead.
-    STARTED_AT_MS=0
-    if [ "$(printf '%s' "$STATE" | jq -r '.activeAgentId // ""' 2>/dev/null)" = "$(json_get '.agentName')" ]; then
-      STARTED_AT_MS="$(state_num "$STATE" 'activeAgentStartedAtMs')"
-    fi
+    # Consume this agent's own start time; it is cleared further below, after the stage handlers
+    # have run. Zero means none was usable, which yields an honest zero-duration span.
+    STARTED_AT_MS="$(state_num "$STATE" "$(started_at_key "$AGENT")")"
     add_note() { if [ -z "$EXTRA_NOTES" ]; then EXTRA_NOTES="$1"; else EXTRA_NOTES="$EXTRA_NOTES
 $1"; fi; }
 
@@ -957,7 +973,8 @@ $1"; fi; }
     CLOSED_MILESTONE="$(state_num "$STATE" 'currentMilestone')"
     advance_milestone
     ADVANCED="$ADVANCE_REASON"
-    STATE="$(printf '%s' "$STATE" | jq '.activeAgentId = "" | .activeAgentStartedAtMs = 0')"
+    # Clear only this agent's start time, so a sub-agent running concurrently keeps its own.
+    STATE="$(printf '%s' "$STATE" | jq --arg k "$(started_at_key "$AGENT")" '.[$k] = 0')"
     write_state "$STATE"
 
     add_audit_row "$AGENT" "$MILESTONE_LABEL" "$ATTEMPT" "completed" "$VERDICT"

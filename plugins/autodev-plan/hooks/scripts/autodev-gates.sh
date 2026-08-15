@@ -92,7 +92,7 @@ default_state() {
     architectureAttempts: 0, architectureVerdict: "pending",
     securityAttempts: 0,     securityVerdict: "pending",
     privacyAttempts: 0,      privacyVerdict: "pending",
-    activeAgentId: "", activeAgentStartedAtMs: 0
+    architectureStartedAtMs: 0, securityStartedAtMs: 0, privacyStartedAtMs: 0
   }'
 }
 
@@ -124,7 +124,6 @@ read_state_file() {
       (has($key) | not)
       or (.[$key] | (type == "number" and . >= 0 and floor == .)
                     or (type == "string" and test("^[0-9]+$")));
-    def string_ok($key): (has($key) | not) or (.[$key] | type == "string");
     def verdict_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
@@ -137,8 +136,9 @@ read_state_file() {
     and verdict_ok("architectureVerdict")
     and verdict_ok("securityVerdict")
     and verdict_ok("privacyVerdict")
-    and string_ok("activeAgentId")
-    and millis_ok("activeAgentStartedAtMs")
+    and millis_ok("architectureStartedAtMs")
+    and millis_ok("securityStartedAtMs")
+    and millis_ok("privacyStartedAtMs")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
@@ -430,11 +430,18 @@ case "$EVENT_NAME" in
     # "complete" while downstream gates hold verdicts for a plan that changed.
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
       ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
-    # Remember which sub-agent is running and when it started, so subagentStop can report a real
-    # duration. subagentStart carries no agentId, so the agent name is the only identity
-    # available; subagentStop verifies it before trusting the timestamp.
-    STATE="$(printf '%s' "$STATE" | jq --arg id "$(json_get '.agentName')" --argjson ms "$(now_ms)" \
-      '.activeAgentId = $id | .activeAgentStartedAtMs = $ms')"
+    # Remember when this gate's reviewer started, so subagentStop can report a real duration.
+    # Recorded against this gate alone, so an overlapping reviewer cannot overwrite it. A start
+    # that finds a timestamp already pending for the same gate means two of them are running
+    # concurrently; there is no agent id on subagentStart to tell their stops apart, so mark it
+    # unusable rather than hand one reviewer the other's start time.
+    if [ "$(state_num "$STATE" "${GATE}StartedAtMs")" != "0" ]; then
+      GATE_START_MS=0
+    else
+      GATE_START_MS="$(now_ms)"
+    fi
+    STATE="$(printf '%s' "$STATE" | jq --arg k "${GATE}StartedAtMs" --argjson ms "$GATE_START_MS" \
+      '.[$k] = $ms')"
     SEEN_CURRENT=0
     for LATER in $GATE_ORDER; do
       if [ "$SEEN_CURRENT" -eq 1 ]; then
@@ -460,15 +467,13 @@ case "$EVENT_NAME" in
     ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
     # subagentStart was missed somehow; still count this attempt.
     [ "$ATTEMPTS" -lt 1 ] 2>/dev/null && ATTEMPTS=1
-    # Claim the recorded start time only when it belongs to this sub-agent. A stale value from a
-    # different or earlier invocation would produce a span with a nonsense duration, so a
-    # mismatch falls back to a zero-duration span instead.
-    STARTED_AT_MS=0
-    if [ "$(printf '%s' "$STATE" | jq -r '.activeAgentId // ""' 2>/dev/null)" = "$(json_get '.agentName')" ]; then
-      STARTED_AT_MS="$(state_num "$STATE" 'activeAgentStartedAtMs')"
-    fi
+    # Consume this gate's own start time and clear only that one, so a reviewer running
+    # concurrently for a different gate keeps its own. Zero means none was usable, which yields
+    # an honest zero-duration span rather than a fabricated one.
+    STARTED_AT_MS="$(state_num "$STATE" "${GATE}StartedAtMs")"
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .activeAgentId = \"\" | .activeAgentStartedAtMs = 0")"
+      --arg k "${GATE}StartedAtMs" \
+      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .[\$k] = 0")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
     # Capture the review itself, not just that it happened, so the findings survive the session

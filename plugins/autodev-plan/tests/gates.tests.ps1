@@ -1231,15 +1231,73 @@ Test-Case 'the span duration comes from the recorded start time' {
     if ($durationMs -le 0) { throw "expected a positive span duration but got ${durationMs}ms" }
 }
 
-Test-Case 'a start time belonging to a different sub-agent is not reused' {
-    # Guards the agent-identity check: a stale start time from another invocation would produce
-    # a span with a nonsense duration, so a mismatch must fall back to zero duration.
+Test-Case 'overlapping gates each keep their own start time' {
+    <#
+        Regression test for overlapping reviewers. Gates are meant to run one at a time, but if
+        two ever overlap, a single shared start slot would let the second start overwrite the
+        first, and the first stop would then report a truncated duration and clear a timestamp
+        belonging to the other reviewer. Each gate keeps its own slot.
+    #>
     $session = New-SessionId
     Start-Gate -SessionId $session -Gate 'architecture'
-    Start-Sleep -Milliseconds 50
-    $result = Invoke-TelemetryRound -SessionId $session -Gate 'security' -SkipStart
-    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'a mismatched agent must yield a zero-duration span'
+    Start-Gate -SessionId $session -Gate 'security'
+    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
+    $archStart = [long]$state.architectureStartedAtMs
+    $secStart = [long]$state.securityStartedAtMs
+    if ($archStart -eq 0 -or $secStart -eq 0) {
+        throw "both gates must hold their own start time (architecture=$archStart security=$secStart)"
+    }
+
+    # The second gate stops first. It must use its own start time, not the first gate's.
+    $secResult = Invoke-TelemetryRound -SessionId $session -Gate 'security' -SkipStart
+    $secSpan = $secResult.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal ($secStart * 1000000) $secSpan.startTimeUnixNano 'the security span must carry the security start time'
+    # Stopping security must not disturb the architecture reviewer still running.
+    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
+    Assert-Equal $archStart ([long]$state.architectureStartedAtMs) 'a concurrent gate stopping must not clear another gate start time'
+
+    $archResult = Invoke-TelemetryRound -SessionId $session -Gate 'architecture' -SkipStart
+    $archSpan = $archResult.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal ($archStart * 1000000) $archSpan.startTimeUnixNano 'the architecture span must still carry its own start time'
+}
+
+Test-Case 'a duplicate start for one gate is reported as zero duration' {
+    # Two concurrent reviewers for the SAME gate cannot be told apart: subagentStart carries no
+    # agent id, so there is no way to know which stop belongs to which start. Report an honest
+    # zero duration rather than hand one reviewer the other's start time.
+    $session = New-SessionId
+    Start-Gate -SessionId $session -Gate 'architecture'
+    Start-Gate -SessionId $session -Gate 'architecture'
+    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
+    Assert-Equal 0 ([long]$state.architectureStartedAtMs) 'a duplicate start must mark the start time unusable'
+    $result = Invoke-TelemetryRound -SessionId $session -Gate 'architecture' -SkipStart
+    $span = $result.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'an ambiguous start must yield a zero-duration span'
+}
+
+Test-Case 'an empty agentId does not shift the other span attributes' {
+    <#
+        The bash emitter reads all its fields from one jq call. Splitting that on newline as IFS
+        collapsed an empty field and shifted every later value left, so an absent agentId put the
+        attempt count in autodev.verdict and reported autodev.issues=0 for an ISSUES verdict.
+        Both emitters are covered so the two implementations cannot diverge here.
+    #>
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    # No agentId at all, which is what the tracker forwards when the payload omits it.
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal 'ISSUES' (Get-SpanAttribute $doc 'autodev.verdict') 'verdict must survive an empty agentId'
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.issues') 'the issue count must survive an empty agentId'
+    Assert-Equal 'autodev-plan' (Get-SpanAttribute $doc 'autodev.plugin')
+    Assert-Equal 'architecture' (Get-SpanAttribute $doc 'autodev.gate')
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.attempt')
 }
 
 Test-Case 'a grpc-configured exporter emits nothing' {
@@ -1349,7 +1407,7 @@ Test-Case 'enforcement still works with telemetry enabled' {
     $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
     Assert-Equal 'PASS' $state.architectureVerdict
     Assert-Equal 1 $state.architectureAttempts
-    Assert-Equal '' $state.activeAgentId 'the active agent must be cleared once it stops'
+    Assert-Equal 0 $state.architectureStartedAtMs 'the start time must be cleared once the gate stops'
 }
 
 Test-Case 'the emitter ships beside the gate script' {

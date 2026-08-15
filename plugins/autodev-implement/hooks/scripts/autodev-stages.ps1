@@ -134,6 +134,20 @@ $script:NumericKeys = @(
 # Verdict keys and the vocabulary each one accepts. 'pending' and 'running' are shared.
 $script:WorkerVerdictKeys = @('taskingVerdict', 'implementVerdict')
 $script:ReviewVerdictKeys = @('reviewVerdict', 'securityVerdict', 'privacyVerdict')
+# Per-agent telemetry start times, so subagentStop can give its span a real duration. One field
+# PER AGENT rather than a single global slot: a shared slot would let a second sub-agent's start
+# overwrite the first, and the first stop would then report a truncated duration and clear a
+# timestamp belonging to the other agent. Zero means "no usable start time", which yields an
+# honest zero-duration span. The agent names contain hyphens, so the field key strips them.
+$script:StartedAtKeys = @(
+    'taskingStartedAtMs', 'implementationStartedAtMs', 'codereviewStartedAtMs',
+    'codefixStartedAtMs', 'codesecurityreviewStartedAtMs', 'codeprivacyreviewStartedAtMs'
+)
+
+function Get-StartedAtKey {
+    param([string]$Agent)
+    return (($Agent -replace '[^A-Za-z0-9]', '') + 'StartedAtMs')
+}
 
 function New-DefaultState {
     param([string]$SessionId)
@@ -146,12 +160,7 @@ function New-DefaultState {
     foreach ($key in $script:NumericKeys) { $state[$key] = 0 }
     foreach ($key in $script:WorkerVerdictKeys) { $state[$key] = 'pending' }
     foreach ($key in $script:ReviewVerdictKeys) { $state[$key] = 'pending' }
-    # Records which sub-agent is currently running and when it started, so subagentStop can give
-    # its telemetry span a real duration. Deliberately keyed by agent identity rather than by
-    # stage: a retry or an overlapping invocation would otherwise let a stale start time produce
-    # a span with an absurd duration.
-    $state['activeAgentId'] = ''
-    $state['activeAgentStartedAtMs'] = [long]0
+    foreach ($key in $script:StartedAtKeys) { $state[$key] = [long]0 }
     return $state
 }
 
@@ -223,12 +232,9 @@ function Read-State {
             # written but not listed here is silently dropped before the next event can read it.
             # An epoch-millisecond value does not fit the counter validation above, which caps at
             # int32, so it is validated separately as a long.
-            $prop = $parsed.PSObject.Properties['activeAgentId']
-            if ($null -ne $prop -and $null -ne $prop.Value) {
-                $state['activeAgentId'] = [string]$prop.Value
-            }
-            $prop = $parsed.PSObject.Properties['activeAgentStartedAtMs']
-            if ($null -ne $prop -and $null -ne $prop.Value) {
+            foreach ($key in $script:StartedAtKeys) {
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
                 $startedAt = [long]0
                 $renderedStart = [Convert]::ToString(
                     $prop.Value,
@@ -236,12 +242,12 @@ function Read-State {
                 if ($renderedStart -match '^[0-9]+$' -and
                     [long]::TryParse($renderedStart, [ref]$startedAt) -and
                     $startedAt -ge 0) {
-                    $state['activeAgentStartedAtMs'] = $startedAt
+                    $state[$key] = $startedAt
                 }
                 else {
                     # Corrupt timing is not worth failing enforcement over; drop it and let the
                     # span fall back to zero duration.
-                    $state['activeAgentStartedAtMs'] = [long]0
+                    $state[$key] = [long]0
                 }
             }
             return $state
@@ -1019,11 +1025,18 @@ try {
             $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
             # Real progress was made, so forgive any earlier blocked stops.
             $state['blocks'] = 0
-            # Remember which sub-agent is running and when it started, so subagentStop can report
-            # a real duration. subagentStart carries no agentId, so the agent name is the only
-            # identity available; subagentStop verifies it before trusting the timestamp.
-            $state['activeAgentId'] = [string]$payload.agentName
-            $state['activeAgentStartedAtMs'] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            # Remember when this agent started, so subagentStop can report a real duration.
+            # Recorded against this agent alone, so an overlapping sub-agent cannot overwrite it.
+            # A start that finds a timestamp already pending for the same agent means two of them
+            # are running concurrently; there is no agent id on subagentStart to tell their stops
+            # apart, so mark it unusable rather than hand one the other's start time.
+            $startedAtKey = Get-StartedAtKey -Agent $agent
+            if ([long]$state[$startedAtKey] -ne 0) {
+                $state[$startedAtKey] = [long]0
+            }
+            else {
+                $state[$startedAtKey] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = 0
@@ -1132,15 +1145,12 @@ try {
 
             $closedMilestone = [int]$state['currentMilestone']
             $advanced = Invoke-MilestoneAdvance -State $state
-            # Claim the recorded start time only when it belongs to this sub-agent. A stale value
-            # from a different or earlier invocation would produce a span with a nonsense
-            # duration, so a mismatch falls back to a zero-duration span instead.
-            $startedAtMs = [long]0
-            if ([string]$state['activeAgentId'] -eq [string]$payload.agentName) {
-                $startedAtMs = [long]$state['activeAgentStartedAtMs']
-            }
-            $state['activeAgentId'] = ''
-            $state['activeAgentStartedAtMs'] = [long]0
+            # Consume this agent's own start time and clear only that one, so a sub-agent running
+            # concurrently keeps its own. Zero means none was usable, which yields an honest
+            # zero-duration span rather than a fabricated one.
+            $startedAtKey = Get-StartedAtKey -Agent $agent
+            $startedAtMs = [long]$state[$startedAtKey]
+            $state[$startedAtKey] = [long]0
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $agent `

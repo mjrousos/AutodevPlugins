@@ -173,20 +173,43 @@ main() {
   printf '%s' "$request" | jq -e . >/dev/null 2>&1 || die_ok
 
   # One jq invocation for every field, newline separated in a fixed order. Reading them one at a
-  # time would spawn a dozen jq processes inside a hook that shares a 20 second budget. None of
-  # these values can legitimately contain a newline, and jq renders any that did as an escape.
-  # Carriage returns are stripped so a payload file written with CRLF cannot corrupt every value.
-  local span_name session_id agent_name agent_id plugin unit_key unit_value verdict
-  local attempt total start_ms end_ms
-  IFS=$'\n' read -r -d '' \
-    span_name session_id agent_name agent_id plugin unit_key unit_value verdict \
-    attempt total start_ms end_ms < <(printf '%s' "$request" | jq -r '
+  # time would spawn a dozen jq processes inside a hook that shares a 20 second budget.
+  #
+  # Read line by line into an indexed array rather than with `IFS=$'\n' read -r -d ''`. Newline
+  # is IFS whitespace, so `read` collapses a run of them into one delimiter: a single empty
+  # field (an absent agentId, say) would silently shift every later value left, putting the
+  # attempt count in autodev.verdict and reporting autodev.issues=0 for an ISSUES verdict. A
+  # `while IFS= read -r` loop preserves empty lines exactly.
+  local -a fields=()
+  local line
+  while IFS= read -r line; do
+    fields[${#fields[@]}]="$line"
+  done < <(printf '%s' "$request" | jq -r '
       [ .spanName, .sessionId, .agentName, .agentId, .plugin, .unitKey, .unitValue, .verdict,
         .attempt, .totalInvocations, .startTimeMs, .endTimeMs ]
       | map(if . == null then "" else (. | tostring) end)
       | .[]' 2>/dev/null | tr -d '\r')
 
-  [ -n "$unit_key" ] || unit_key='autodev.gate'
+  local span_name session_id agent_name agent_id plugin unit_key unit_value verdict
+  local attempt total start_ms end_ms
+  span_name="${fields[0]:-}"
+  session_id="${fields[1]:-}"
+  agent_name="${fields[2]:-}"
+  agent_id="${fields[3]:-}"
+  plugin="${fields[4]:-}"
+  unit_key="${fields[5]:-}"
+  unit_value="${fields[6]:-}"
+  verdict="${fields[7]:-}"
+  attempt="${fields[8]:-}"
+  total="${fields[9]:-}"
+  start_ms="${fields[10]:-}"
+  end_ms="${fields[11]:-}"
+
+  # A key must never be empty or the attribute would be unusable, and never attacker-chosen.
+  case "$unit_key" in
+    autodev.gate | autodev.stage) ;;
+    *) unit_key='autodev.gate' ;;
+  esac
   [ -n "$span_name" ] || span_name='autodev.subagent'
 
   attempt="$(digits_or_zero "$attempt")"

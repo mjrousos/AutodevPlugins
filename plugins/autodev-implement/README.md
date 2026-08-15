@@ -144,7 +144,7 @@ with Copilot's. It exports only when **both** `COPILOT_OTEL_ENABLED` is truthy (
 | `COPILOT_OTEL_ENABLED` | Master switch. Unset means no telemetry, and no child process is spawned at all. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Copilot's implicit `http://127.0.0.1:4318` default is deliberately not assumed. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON, which collectors accept on the same port. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON. See the caveat below. |
 | `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` | Comma-separated `key=value` pairs, percent-decoded. The signal-specific variable wins. Header values are never logged. |
 | `OTEL_SERVICE_NAME` | Resource `service.name`; defaults to `github-copilot` so hook spans land beside Copilot's own. |
 | `AUTODEV_OTEL_TIMEOUT_SEC` | Request timeout, default 2, clamped to a maximum of 5. |
@@ -171,6 +171,19 @@ for review findings and `autodev.blocked` for stalls.
 
 **No sub-agent content is ever exported** — not the response body, not the todo list, not the
 prompt, and not `transcriptPath`. Only verdicts and identifiers leave the machine.
+
+### The emitter only speaks OTLP/JSON
+
+The emitter always sends HTTP/JSON, because building protobuf from a shell script is not
+practical. `grpc` is refused outright rather than sent JSON at a gRPC port.
+
+`http/protobuf` is **not** refused. The OTLP specification requires a receiver to support
+protobuf but makes JSON support optional, so a protobuf-configured backend is permitted to reject
+the JSON body. In practice the OpenTelemetry Collector accepts both on the same port, so refusing
+to export would break the common case to protect against the rare one. Against a strict
+protobuf-only backend, spans are dropped at the receiver and the emitter cannot tell, since it
+discards transport errors by design. Set `AUTODEV_OTEL_DEBUG_FILE` to confirm the emitter is
+producing spans, then check whether your endpoint accepts `Content-Type: application/json`.
 
 ### Correlating with Copilot's own traces
 

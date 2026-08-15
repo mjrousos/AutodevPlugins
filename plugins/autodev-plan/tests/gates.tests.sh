@@ -1363,7 +1363,7 @@ t_otel_duration_from_state() {
   local sid recorded start end
   sid="$(new_session_id)"
   start_gate "$sid" architecture
-  recorded="$(jq -r '.activeAgentStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
+  recorded="$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
   [ -n "$recorded" ] && [ "$recorded" != "0" ] ||
     fail "subagentStart did not persist a start timestamp (got '$recorded')" || return 1
   telemetry_round_stop_only "$sid" architecture ISSUES
@@ -1374,23 +1374,74 @@ t_otel_duration_from_state() {
 }
 run_test "the span duration comes from the recorded start time" t_otel_duration_from_state
 
-t_otel_mismatched_agent_start_time() {
-  # Guards the agent-identity check: a stale start time from another invocation would produce a
-  # span with a nonsense duration, so a mismatch must fall back to zero duration.
+t_otel_overlapping_starts_keep_own_times() {
+  # Regression test for overlapping reviewers. Gates are meant to run one at a time, but if two
+  # ever overlap, a single shared start slot would let the second start overwrite the first, and
+  # the first stop would then report a truncated duration and clear a timestamp belonging to the
+  # other reviewer. Each gate keeps its own slot, so both stops report their own start time.
+  local sid arch_start sec_start
+  sid="$(new_session_id)"
+  start_gate "$sid" architecture
+  start_gate "$sid" security
+  arch_start="$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
+  sec_start="$(jq -r '.securityStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
+  { [ "$arch_start" != "0" ] && [ "$sec_start" != "0" ]; } ||
+    fail "both gates must hold their own start time (architecture=$arch_start security=$sec_start)" ||
+    return 1
+
+  # The second gate stops first. It must use its own start time, not the first gate's.
+  telemetry_round_stop_only "$sid" security ISSUES
+  assert_equal "${sec_start}000000" "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
+    'the security span must carry the security start time' || return 1
+  # Stopping security must not disturb the architecture reviewer still running.
+  assert_equal "$arch_start" "$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'a concurrent gate stopping must not clear another gate start time' || return 1
+
+  rm -f "$TELEMETRY_SINK"
+  telemetry_round_stop_only "$sid" architecture ISSUES
+  assert_equal "${arch_start}000000" "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
+    'the architecture span must still carry its own start time'
+}
+run_test "overlapping gates each keep their own start time" t_otel_overlapping_starts_keep_own_times
+
+t_otel_duplicate_start_is_ambiguous() {
+  # Two concurrent reviewers for the SAME gate cannot be told apart: subagentStart carries no
+  # agent id, so there is no way to know which stop belongs to which start. Report an honest
+  # zero duration rather than hand one reviewer the other's start time.
+  local sid
+  sid="$(new_session_id)"
+  start_gate "$sid" architecture
+  start_gate "$sid" architecture
+  assert_equal 0 "$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'a duplicate start must mark the start time unusable' || return 1
+  telemetry_round_stop_only "$sid" architecture ISSUES
+  assert_equal "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
+    "$(span_field "$TELEMETRY_SINK" endTimeUnixNano)" \
+    'an ambiguous start must yield a zero-duration span'
+}
+run_test "a duplicate start for one gate is reported as zero duration" t_otel_duplicate_start_is_ambiguous
+
+t_otel_empty_agent_id_does_not_shift_fields() {
+  # The emitter reads all its fields from one jq call. Splitting that on newline as IFS would
+  # collapse an empty field, shifting every later value left: an absent agentId put the attempt
+  # count in autodev.verdict and reported autodev.issues=0 for an ISSUES verdict, silently
+  # corrupting the one number this feature exists to produce.
   local sid cwd sink
   sid="$(new_session_id)"
   cwd="$(session_cwd "$sid")"
   sink="$(telemetry_dir "$sid")/spans.jsonl"
   start_gate "$sid" architecture
-  sleep 1
   COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
     hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
-      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-security-review",
-        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
-  assert_equal "$(span_field "$sink" startTimeUnixNano)" "$(span_field "$sink" endTimeUnixNano)" \
-    'a mismatched agent must yield a zero-duration span'
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+        response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" 'verdict must survive an empty agentId' || return 1
+  assert_equal 1 "$(span_attr "$sink" 'autodev.issues')" 'the issue count must survive an empty agentId' || return 1
+  assert_equal autodev-plan "$(span_attr "$sink" 'autodev.plugin')" || return 1
+  assert_equal architecture "$(span_attr "$sink" 'autodev.gate')" || return 1
+  assert_equal 1 "$(span_attr "$sink" 'autodev.attempt')"
 }
-run_test "a start time belonging to a different sub-agent is not reused" t_otel_mismatched_agent_start_time
+run_test "an empty agentId does not shift the other span attributes" t_otel_empty_agent_id_does_not_shift_fields
 
 t_otel_grpc_suppressed() {
   # We cannot speak gRPC from a script, and posting JSON at a gRPC port would be meaningless
@@ -1523,8 +1574,8 @@ t_otel_enforcement_unchanged() {
   state="$(cat "$(state_path "$sid")")"
   assert_equal PASS "$(printf '%s' "$state" | jq -r '.architectureVerdict')" || return 1
   assert_equal 1 "$(printf '%s' "$state" | jq -r '.architectureAttempts')" || return 1
-  assert_equal '' "$(printf '%s' "$state" | jq -r '.activeAgentId')" \
-    'the active agent must be cleared once it stops'
+  assert_equal 0 "$(printf '%s' "$state" | jq -r '.architectureStartedAtMs')" \
+    'the start time must be cleared once the gate stops'
 }
 run_test "enforcement still works with telemetry enabled" t_otel_enforcement_unchanged
 

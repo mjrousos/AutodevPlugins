@@ -119,13 +119,14 @@ function New-DefaultState {
     foreach ($gate in $script:GateOrder) {
         $state["${gate}Attempts"] = 0
         $state["${gate}Verdict"] = 'pending'
+        # When this gate's reviewer started, so subagentStop can give its telemetry span a real
+        # duration. One field PER GATE rather than a single global slot: gates are meant to run
+        # one at a time, but if two ever overlap a shared slot would let the second start
+        # overwrite the first, and the first stop would then report a truncated duration and
+        # clear a timestamp belonging to the other reviewer. Zero means "no usable start time",
+        # which yields an honest zero-duration span.
+        $state["${gate}StartedAtMs"] = [long]0
     }
-    # Records which sub-agent is currently running and when it started, so subagentStop can give
-    # its telemetry span a real duration. Deliberately keyed by agent id rather than by gate: a
-    # re-gate or an overlapping invocation would otherwise let a stale start time produce a span
-    # with an absurd duration.
-    $state['activeAgentId'] = ''
-    $state['activeAgentStartedAtMs'] = [long]0
     return $state
 }
 
@@ -190,12 +191,10 @@ function Read-State {
             # written but not listed here is silently dropped before the next event can read it.
             # An epoch-millisecond value does not fit the counter validation above, which caps at
             # int32, so it is validated separately as a long.
-            $prop = $parsed.PSObject.Properties['activeAgentId']
-            if ($null -ne $prop -and $null -ne $prop.Value) {
-                $state['activeAgentId'] = [string]$prop.Value
-            }
-            $prop = $parsed.PSObject.Properties['activeAgentStartedAtMs']
-            if ($null -ne $prop -and $null -ne $prop.Value) {
+            foreach ($gate in $script:GateOrder) {
+                $key = "${gate}StartedAtMs"
+                $prop = $parsed.PSObject.Properties[$key]
+                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
                 $startedAt = [long]0
                 $renderedStart = [Convert]::ToString(
                     $prop.Value,
@@ -203,12 +202,12 @@ function Read-State {
                 if ($renderedStart -match '^[0-9]+$' -and
                     [long]::TryParse($renderedStart, [ref]$startedAt) -and
                     $startedAt -ge 0) {
-                    $state['activeAgentStartedAtMs'] = $startedAt
+                    $state[$key] = $startedAt
                 }
                 else {
                     # Corrupt timing is not worth failing enforcement over; drop it and let the
                     # span fall back to zero duration.
-                    $state['activeAgentStartedAtMs'] = [long]0
+                    $state[$key] = [long]0
                 }
             }
             return $state
@@ -641,11 +640,18 @@ try {
             $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
             # Real progress was made, so forgive any earlier blocked stops.
             $state['blocks'] = 0
-            # Remember which sub-agent is running and when it started, so subagentStop can report
-            # a real duration. subagentStart carries no agentId, so the agent name is the only
-            # identity available; subagentStop verifies it before trusting the timestamp.
-            $state['activeAgentId'] = [string]$payload.agentName
-            $state['activeAgentStartedAtMs'] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            # Remember when this gate's reviewer started, so subagentStop can report a real
+            # duration. Recorded against this gate alone, so an overlapping reviewer cannot
+            # overwrite it. A start that finds a timestamp already pending for the same gate
+            # means two of them are running concurrently; there is no agent id on subagentStart
+            # to tell their stops apart, so mark it unusable rather than hand one reviewer the
+            # other's start time.
+            if ([long]$state["${gate}StartedAtMs"] -ne 0) {
+                $state["${gate}StartedAtMs"] = [long]0
+            }
+            else {
+                $state["${gate}StartedAtMs"] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Gate $gate `
                 -Attempt ([int]$state["${gate}Attempts"]) -Action 'invoked' -Verdict '-'
@@ -670,15 +676,11 @@ try {
                 $state["${gate}Attempts"] = 1
             }
             $state["${gate}Verdict"] = $verdict
-            # Claim the recorded start time only when it belongs to this sub-agent. A stale value
-            # from a different or earlier invocation would produce a span with a nonsense
-            # duration, so a mismatch falls back to a zero-duration span instead.
-            $startedAtMs = [long]0
-            if ([string]$state['activeAgentId'] -eq [string]$payload.agentName) {
-                $startedAtMs = [long]$state['activeAgentStartedAtMs']
-            }
-            $state['activeAgentId'] = ''
-            $state['activeAgentStartedAtMs'] = [long]0
+            # Consume this gate's own start time and clear only that one, so a reviewer running
+            # concurrently for a different gate keeps its own. Zero means none was usable, which
+            # yields an honest zero-duration span rather than a fabricated one.
+            $startedAtMs = [long]$state["${gate}StartedAtMs"]
+            $state["${gate}StartedAtMs"] = [long]0
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = [int]$state["${gate}Attempts"]
