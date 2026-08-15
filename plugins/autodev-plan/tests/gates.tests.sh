@@ -1253,6 +1253,17 @@ span_field() { # sinkPath jq-path
   jq -r ".resourceSpans[0].scopeSpans[0].spans[0].$2" "$1" 2>/dev/null | head -1
 }
 
+# The subagentStop half of telemetry_round, for tests that need to inspect state in between.
+telemetry_round_stop_only() { # sid gate verdict [agentId]
+  local sid="$1" gate="$2" verdict="$3" agent_id="${4:-agent-1}" cwd
+  cwd="$(session_cwd "$sid")"
+  TELEMETRY_SINK="$(telemetry_dir "$sid")/spans.jsonl"
+  TELEMETRY_OUTPUT="$(COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$TELEMETRY_SINK" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg g "$gate" --arg a "$agent_id" --arg c "$cwd" --arg v "$verdict" \
+      '{sessionId:$s, cwd:$c, agentName:("autodev-plan:autodev-" + $g + "-review"),
+        agentId:$a, response:("Body text.\n\nAUTODEV-VERDICT: " + $v)}')")"
+}
+
 t_otel_disabled_by_default() {
   # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
   local sid sink footer
@@ -1344,16 +1355,22 @@ t_otel_raw_session_id() {
 run_test "the exported session id is the raw one, not the filename-safe one" t_otel_raw_session_id
 
 t_otel_duration_from_state() {
-  # subagentStart runs a whole process before subagentStop does, so a start time that survived
-  # the state file always yields a positive duration. Equal timestamps would mean the field was
-  # dropped by the state reader, which is exactly the regression this guards.
-  local sid start end
+  # Asserts the exact value rather than merely a positive duration. A wall-clock comparison would
+  # be flaky whenever now_ms falls back to whole-second resolution and both hooks land in the
+  # same second, and it would not actually prove the recorded timestamp was the one used. Reading
+  # the value the state file holds between the two events and requiring the span to carry it is
+  # deterministic and tests the real claim: that the timestamp survives the state reader.
+  local sid recorded start end
   sid="$(new_session_id)"
-  telemetry_round "$sid" architecture ISSUES
+  start_gate "$sid" architecture
+  recorded="$(jq -r '.activeAgentStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
+  [ -n "$recorded" ] && [ "$recorded" != "0" ] ||
+    fail "subagentStart did not persist a start timestamp (got '$recorded')" || return 1
+  telemetry_round_stop_only "$sid" architecture ISSUES
   start="$(span_field "$TELEMETRY_SINK" startTimeUnixNano)"
   end="$(span_field "$TELEMETRY_SINK" endTimeUnixNano)"
-  [ "$start" -lt "$end" ] 2>/dev/null ||
-    fail "expected a positive span duration but got start=$start end=$end"
+  assert_equal "${recorded}000000" "$start" 'the span must carry the recorded start time' || return 1
+  [ "$start" -le "$end" ] 2>/dev/null || fail "span starts after it ends ($start > $end)"
 }
 run_test "the span duration comes from the recorded start time" t_otel_duration_from_state
 
@@ -1430,23 +1447,37 @@ run_test "telemetry never alters the hook output or exit code" t_otel_hostile_ch
 t_otel_missing_curl_is_harmless() {
   # Puts a PATH in front that has no curl at all, exercising the real network path's absence
   # rather than the debug sink.
-  local sid cwd empty_bin footer
+  local sid cwd empty_bin footer sink payload
   sid="$(new_session_id)"
   cwd="$(session_cwd "$sid")"
   empty_bin="$COPILOT_HOME/nocurl-$$-$RANDOM"
   mkdir -p "$empty_bin"
-  # jq and the shell must still resolve, so link only what the scripts genuinely need.
-  for tool in jq bash date mktemp cat rm mkdir mv tr sed grep head od cp printf; do
+  # jq and the shell must still resolve, so link only what the scripts genuinely need. 'dirname'
+  # is included even though the tracker no longer calls it: omitting a tool the tracker needs
+  # makes it bail out before reaching the emitter, which silently turned this test into a no-op.
+  for tool in jq bash date dirname mktemp cat rm mkdir mv tr sed grep head od cp printf perl; do
     if command -v "$tool" >/dev/null 2>&1; then
       ln -sf "$(command -v "$tool")" "$empty_bin/$tool" 2>/dev/null || :
     fi
   done
+  payload="$(jq -cn --arg s "$sid" --arg c "$cwd" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+      agentId:"a1", response:"Body text.\n\nAUTODEV-VERDICT: ISSUES"}')"
+
+  # First prove the emitter is genuinely reachable under this restricted PATH. Without this the
+  # assertion below would pass just as happily if the tracker never invoked the emitter at all.
+  sink="$(telemetry_dir "$sid")/reachable.jsonl"
+  PATH="$empty_bin" COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$payload" >/dev/null
+  [ -s "$sink" ] ||
+    fail 'the emitter was never reached under the restricted PATH, so this test proves nothing' ||
+    return 1
+
+  # Now the real case: same PATH, no debug sink, so the emitter takes the network path and finds
+  # no curl.
   footer="$(PATH="$empty_bin" COPILOT_OTEL_ENABLED=true \
     OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:9 \
-    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
-      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
-        agentId:"a1", response:"Body text.\n\nAUTODEV-VERDICT: ISSUES"}')" |
-    jq -r '.modifiedResponse // ""')"
+    hook subagentStop "$payload" | jq -r '.modifiedResponse // ""')"
   assert_match 'gate tracker' "$footer" 'a missing curl must leave the hook untouched'
 }
 run_test "a missing curl leaves the hook output intact" t_otel_missing_curl_is_harmless

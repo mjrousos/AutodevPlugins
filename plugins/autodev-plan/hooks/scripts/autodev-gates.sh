@@ -187,8 +187,15 @@ state_num() { printf '%s' "$1" | jq -r ".$2 // 0" 2>/dev/null; }
 state_str() { printf '%s' "$1" | jq -r ".$2 // \"pending\"" 2>/dev/null; }
 
 # Directory this script lives in, so the telemetry emitter beside it can be found regardless of
-# the hook's working directory. The '|| SCRIPT_DIR=' keeps a failure here off the ERR trap.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
+# the hook's working directory. Resolved with parameter expansion rather than 'dirname' so it
+# still works on a minimal PATH -- 'cd' and 'pwd' are builtins, 'dirname' is not. The
+# '|| SCRIPT_DIR=' keeps a failure here off the ERR trap.
+SCRIPT_SELF="${BASH_SOURCE[0]}"
+SCRIPT_SELF_DIR="${SCRIPT_SELF%/*}"
+# No slash at all means the script was invoked by bare name, so it lives in the current directory.
+# Written as if/fi rather than '&&' because a false test at top level would fire the ERR trap.
+if [ "$SCRIPT_SELF_DIR" = "$SCRIPT_SELF" ]; then SCRIPT_SELF_DIR="."; fi
+SCRIPT_DIR="$(cd "$SCRIPT_SELF_DIR" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
 
 telemetry_enabled() {
   # Cheap early-out. For the overwhelming majority of users COPILOT_OTEL_ENABLED is unset, and
@@ -218,13 +225,25 @@ send_otel_span() {
 }
 
 now_ms() {
-  # Epoch milliseconds without depending on GNU date's %3N, which BSD date on macOS lacks.
-  local secs
-  secs="$(date -u +%s 2>/dev/null)" || secs=""
-  case "$secs" in
-    '' | *[!0-9]*) printf '0' ;;
-    *) printf '%s000' "$secs" ;;
-  esac
+  # Millisecond resolution wherever it is available. GNU date supports %3N; BSD date on macOS
+  # does not and passes the specifier through literally, which the digit check rejects. Perl
+  # ships with macOS and covers that case. The whole-second fallback is correct but coarse
+  # enough that a sub-agent finishing inside one second would report a zero-duration span.
+  local ms secs
+  ms="$(date -u +%s%3N 2>/dev/null)" || ms=""
+  case "$ms" in '' | *[!0-9]*) ms="" ;; esac
+  if [ -z "$ms" ] && command -v perl >/dev/null 2>&1; then
+    ms="$(perl -MTime::HiRes=time -e 'printf "%.0f", time * 1000' 2>/dev/null)" || ms=""
+    case "$ms" in '' | *[!0-9]*) ms="" ;; esac
+  fi
+  if [ -z "$ms" ]; then
+    secs="$(date -u +%s 2>/dev/null)" || secs=""
+    case "$secs" in
+      '' | *[!0-9]*) ms="0" ;;
+      *) ms="${secs}000" ;;
+    esac
+  fi
+  printf '%s' "$ms"
 }
 
 add_audit_row() {
