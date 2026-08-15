@@ -148,6 +148,16 @@ digits_or_zero() {
   esac
 }
 
+curl_config_escape() {
+  # curl's config file parser understands backslash escapes inside a quoted value, so both the
+  # backslash and the quote have to be escaped or a crafted header value could terminate the
+  # quoted string early.
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
 main() {
   is_truthy "${COPILOT_OTEL_ENABLED:-}" || die_ok
   command -v jq >/dev/null 2>&1 || die_ok
@@ -302,20 +312,31 @@ main() {
     die_ok
   fi
 
-  local timeout_sec header_args=() header_line
+  local timeout_sec config header_line
   timeout_sec="$(resolve_timeout)"
-  while IFS= read -r header_line; do
-    [ -n "$header_line" ] || continue
-    header_args+=(-H "$header_line")
-  done <<EOF
+
+  # Headers and the endpoint go in a curl config file rather than on the command line. OTLP
+  # headers routinely carry a bearer token, and argv is world readable on Linux through
+  # /proc/<pid>/cmdline, so any local process could read the credential while the request is in
+  # flight. mktemp creates the file 0600, and it is removed immediately after the request.
+  config="$(mktemp 2>/dev/null)" || die_ok
+  {
+    printf 'url = "%s"\n' "$(curl_config_escape "$endpoint")"
+    printf 'header = "Content-Type: application/json"\n'
+    while IFS= read -r header_line; do
+      [ -n "$header_line" ] || continue
+      printf 'header = "%s"\n' "$(curl_config_escape "$header_line")"
+    done <<EOF
 $(collect_headers)
 EOF
+  } > "$config" 2>/dev/null
 
   # -o /dev/null discards the response body; --max-time is a hard bound on the whole exchange.
   printf '%s' "$document" | curl -sS -o /dev/null \
     --max-time "$timeout_sec" --connect-timeout "$timeout_sec" \
-    -X POST -H 'Content-Type: application/json' \
-    "${header_args[@]}" --data-binary @- "$endpoint" >/dev/null 2>&1
+    -X POST --data-binary @- -K "$config" >/dev/null 2>&1
+
+  rm -f "$config" 2>/dev/null || :
 
   die_ok
 }

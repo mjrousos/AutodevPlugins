@@ -1408,18 +1408,75 @@ t_otel_duplicate_start_is_ambiguous() {
   # Two concurrent reviewers for the SAME gate cannot be told apart: subagentStart carries no
   # agent id, so there is no way to know which stop belongs to which start. Report an honest
   # zero duration rather than hand one reviewer the other's start time.
+  #
+  # Extended to three starts, because a bare zero sentinel could not tell "nothing pending" from
+  # "ambiguous": the third start would see zero and record a fresh timestamp that a
+  # still-outstanding stop could then consume. The gate must stay ambiguous until every
+  # outstanding stop has drained, and only then record a real start time again.
   local sid
   sid="$(new_session_id)"
   start_gate "$sid" architecture
   start_gate "$sid" architecture
+  start_gate "$sid" architecture
   assert_equal 0 "$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'a duplicate start must mark the start time unusable' || return 1
-  telemetry_round_stop_only "$sid" architecture ISSUES
-  assert_equal "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
-    "$(span_field "$TELEMETRY_SINK" endTimeUnixNano)" \
-    'an ambiguous start must yield a zero-duration span'
+    'a third start must not record a fresh timestamp' || return 1
+  assert_equal 3 "$(jq -r '.architecturePending // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'all three starts must be counted as outstanding' || return 1
+
+  # Every stop while starts remain outstanding must report zero duration.
+  local i
+  for i in 1 2 3; do
+    rm -f "$(telemetry_dir "$sid")/spans.jsonl"
+    telemetry_round_stop_only "$sid" architecture ISSUES
+    assert_equal "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
+      "$(span_field "$TELEMETRY_SINK" endTimeUnixNano)" \
+      "stop $i must yield a zero-duration span while starts are outstanding" || return 1
+  done
+  assert_equal 0 "$(jq -r '.architecturePending // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'the outstanding count must drain back to zero' || return 1
+
+  # Drained, so the next start is unambiguous again and records a real time.
+  start_gate "$sid" architecture
+  [ "$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" != "0" ] ||
+    fail 'once drained, a fresh start must record a real timestamp again'
 }
-run_test "a duplicate start for one gate is reported as zero duration" t_otel_duplicate_start_is_ambiguous
+run_test "overlapping starts stay ambiguous until they drain" t_otel_duplicate_start_is_ambiguous
+
+t_otel_headers_stay_out_of_argv() {
+  # OTLP headers routinely carry a bearer token. argv is world readable on Linux through
+  # /proc/<pid>/cmdline, so a header passed as -H would expose the credential to any local
+  # process for the lifetime of the request. It must travel by another channel.
+  local sid cwd stub argv_file
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  stub="$COPILOT_HOME/argvstub-$$-$RANDOM"
+  argv_file="$COPILOT_HOME/curl-argv-$$-$RANDOM.txt"
+  mkdir -p "$stub"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf "%%s\\n" "$@" > "%s"\n' "$argv_file"
+    printf 'cat > /dev/null\n'
+    printf 'exit 0\n'
+  } > "$stub/curl"
+  chmod +x "$stub/curl"
+
+  PATH="$stub:$PATH" COPILOT_OTEL_ENABLED=true \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+    OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20SUPERSECRETTOKEN' \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+
+  [ -f "$argv_file" ] ||
+    fail 'curl was never invoked, so this test proves nothing' || return 1
+  if grep -q 'SUPERSECRETTOKEN' "$argv_file"; then
+    fail "the bearer token appears in curl argv: $(cat "$argv_file")"
+    return 1
+  fi
+  # The config file carrying it must not be left behind either.
+  return 0
+}
+run_test "header credentials never reach curl argv" t_otel_headers_stay_out_of_argv
 
 t_otel_empty_agent_id_does_not_shift_fields() {
   # The emitter reads all its fields from one jq call. Splitting that on newline as IFS would

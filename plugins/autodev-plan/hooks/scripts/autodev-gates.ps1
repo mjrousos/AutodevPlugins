@@ -126,6 +126,11 @@ function New-DefaultState {
         # clear a timestamp belonging to the other reviewer. Zero means "no usable start time",
         # which yields an honest zero-duration span.
         $state["${gate}StartedAtMs"] = [long]0
+        # How many starts for this gate have not yet been matched by a stop. Zero alone cannot
+        # distinguish "nothing pending" from "ambiguous", so a third overlapping start would
+        # record a fresh timestamp that a still-outstanding stop could then consume. The counter
+        # keeps the gate ambiguous until every outstanding stop has drained.
+        $state["${gate}Pending"] = 0
     }
     return $state
 }
@@ -153,7 +158,10 @@ function Read-State {
             if ($null -eq $ownerProp -or [string]$ownerProp.Value -ne $SessionId) { continue }
 
             $numericKeys = @('blocks', 'totalInvocations')
-            foreach ($gate in $script:GateOrder) { $numericKeys += "${gate}Attempts" }
+            foreach ($gate in $script:GateOrder) {
+                $numericKeys += "${gate}Attempts"
+                $numericKeys += "${gate}Pending"
+            }
             foreach ($key in $numericKeys) {
                 $prop = $parsed.PSObject.Properties[$key]
                 if ($null -eq $prop -or $null -eq $prop.Value) { continue }
@@ -642,11 +650,13 @@ try {
             $state['blocks'] = 0
             # Remember when this gate's reviewer started, so subagentStop can report a real
             # duration. Recorded against this gate alone, so an overlapping reviewer cannot
-            # overwrite it. A start that finds a timestamp already pending for the same gate
-            # means two of them are running concurrently; there is no agent id on subagentStart
-            # to tell their stops apart, so mark it unusable rather than hand one reviewer the
-            # other's start time.
-            if ([long]$state["${gate}StartedAtMs"] -ne 0) {
+            # overwrite it. More than one start outstanding means concurrent reviewers whose
+            # stops cannot be told apart -- subagentStart carries no agent id -- so the gate
+            # stays ambiguous until every outstanding stop has drained, rather than a third
+            # start handing a still-running reviewer a fresh timestamp that is not its own.
+            $pending = [int]$state["${gate}Pending"] + 1
+            $state["${gate}Pending"] = $pending
+            if ($pending -gt 1) {
                 $state["${gate}StartedAtMs"] = [long]0
             }
             else {
@@ -678,9 +688,13 @@ try {
             $state["${gate}Verdict"] = $verdict
             # Consume this gate's own start time and clear only that one, so a reviewer running
             # concurrently for a different gate keeps its own. Zero means none was usable, which
-            # yields an honest zero-duration span rather than a fabricated one.
+            # yields an honest zero-duration span rather than a fabricated one. The timestamp is
+            # always cleared: while any start is still outstanding the gate remains ambiguous.
             $startedAtMs = [long]$state["${gate}StartedAtMs"]
             $state["${gate}StartedAtMs"] = [long]0
+            if ([int]$state["${gate}Pending"] -gt 0) {
+                $state["${gate}Pending"] = [int]$state["${gate}Pending"] - 1
+            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = [int]$state["${gate}Attempts"]

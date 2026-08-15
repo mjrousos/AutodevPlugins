@@ -103,7 +103,9 @@ default_state() {
     privacyAttempts: 0, privacyVerdict: "pending",
     cappedMilestones: "",
     taskingStartedAtMs: 0, implementationStartedAtMs: 0, codereviewStartedAtMs: 0,
-    codefixStartedAtMs: 0, codesecurityreviewStartedAtMs: 0, codeprivacyreviewStartedAtMs: 0
+    codefixStartedAtMs: 0, codesecurityreviewStartedAtMs: 0, codeprivacyreviewStartedAtMs: 0,
+    taskingPending: 0, implementationPending: 0, codereviewPending: 0,
+    codefixPending: 0, codesecurityreviewPending: 0, codeprivacyreviewPending: 0
   }'
 }
 
@@ -112,6 +114,13 @@ default_state() {
 # hyphens, which the key strips.
 started_at_key() { # agent
   printf '%sStartedAtMs' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9')"
+}
+
+# Outstanding starts for an agent. Zero alone cannot distinguish "nothing pending" from
+# "ambiguous", so a third overlapping start would record a fresh timestamp that a
+# still-outstanding stop could then consume.
+pending_key() { # agent
+  printf '%sPending' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9')"
 }
 
 read_state_file() {
@@ -174,6 +183,12 @@ read_state_file() {
     and millis_ok("codefixStartedAtMs")
     and millis_ok("codesecurityreviewStartedAtMs")
     and millis_ok("codeprivacyreviewStartedAtMs")
+    and counter_ok("taskingPending")
+    and counter_ok("implementationPending")
+    and counter_ok("codereviewPending")
+    and counter_ok("codefixPending")
+    and counter_ok("codesecurityreviewPending")
+    and counter_ok("codeprivacyreviewPending")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
@@ -858,18 +873,22 @@ case "$EVENT_NAME" in
       --argjson t "$(( $(state_num "$STATE" 'totalInvocations') + 1 ))" \
       '.totalInvocations = $t | .blocks = 0')"
     # Remember when this agent started, so subagentStop can report a real duration. Recorded
-    # against this agent alone, so an overlapping sub-agent cannot overwrite it. A start that
-    # finds a timestamp already pending for the same agent means two are running concurrently;
-    # there is no agent id on subagentStart to tell their stops apart, so mark it unusable rather
-    # than hand one the other's start time.
+    # against this agent alone, so an overlapping sub-agent cannot overwrite it. More than one
+    # start outstanding means concurrent invocations whose stops cannot be told apart --
+    # subagentStart carries no agent id -- so the agent stays ambiguous until every outstanding
+    # stop has drained, rather than a third start handing a still-running invocation a fresh
+    # timestamp that is not its own.
     STARTED_AT_KEY="$(started_at_key "$AGENT")"
-    if [ "$(state_num "$STATE" "$STARTED_AT_KEY")" != "0" ]; then
+    PENDING_KEY="$(pending_key "$AGENT")"
+    AGENT_PENDING=$(( $(state_num "$STATE" "$PENDING_KEY") + 1 ))
+    if [ "$AGENT_PENDING" -gt 1 ]; then
       AGENT_START_MS=0
     else
       AGENT_START_MS="$(now_ms)"
     fi
     STATE="$(printf '%s' "$STATE" | jq --arg k "$STARTED_AT_KEY" --argjson ms "$AGENT_START_MS" \
-      '.[$k] = $ms')"
+      --arg pk "$PENDING_KEY" --argjson p "$AGENT_PENDING" \
+      '.[$k] = $ms | .[$pk] = $p')"
     write_state "$STATE"
     add_audit_row "$AGENT" "$MILESTONE_LABEL" "$ATTEMPT" "invoked" "-"
     emit_empty
@@ -973,8 +992,15 @@ $1"; fi; }
     CLOSED_MILESTONE="$(state_num "$STATE" 'currentMilestone')"
     advance_milestone
     ADVANCED="$ADVANCE_REASON"
-    # Clear only this agent's start time, so a sub-agent running concurrently keeps its own.
-    STATE="$(printf '%s' "$STATE" | jq --arg k "$(started_at_key "$AGENT")" '.[$k] = 0')"
+    # Clear only this agent's start time, so a sub-agent running concurrently keeps its own, and
+    # drain one outstanding start. While any start remains outstanding the agent stays ambiguous.
+    AGENT_PENDING="$(state_num "$STATE" "$(pending_key "$AGENT")")"
+    if [ "$AGENT_PENDING" -gt 0 ] 2>/dev/null; then
+      AGENT_PENDING=$(( AGENT_PENDING - 1 ))
+    fi
+    STATE="$(printf '%s' "$STATE" | jq --arg k "$(started_at_key "$AGENT")" \
+      --arg pk "$(pending_key "$AGENT")" --argjson p "$AGENT_PENDING" \
+      '.[$k] = 0 | .[$pk] = $p')"
     write_state "$STATE"
 
     add_audit_row "$AGENT" "$MILESTONE_LABEL" "$ATTEMPT" "completed" "$VERDICT"

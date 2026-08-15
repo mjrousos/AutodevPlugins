@@ -1569,24 +1569,74 @@ run_test 'overlapping sub-agents each keep their own start time' t_otel_overlapp
 
 t_otel_duplicate_start_is_ambiguous() {
   # Two concurrent invocations of the SAME agent cannot be told apart: subagentStart carries no
-  # agent id, so report an honest zero duration rather than one agent's start time for another.
-  local sid cwd sink
+  # agent id. Extended to three starts, because a bare zero sentinel could not tell "nothing
+  # pending" from "ambiguous": the third start would see zero and record a fresh timestamp that a
+  # still-outstanding stop could then consume.
+  local sid cwd sink i
   sid="$(new_session_id)"
   set_todo_list "$sid" 1
   cwd="$(session_cwd "$sid")"
   sink="$(telemetry_dir "$sid")/spans.jsonl"
   start_agent "$sid" tasking
   start_agent "$sid" tasking
+  start_agent "$sid" tasking
   assert_equal 0 "$(jq -r '.taskingStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'a duplicate start must mark the start time unusable' || return 1
-  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
-    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
-      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-tasking",
-        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: DONE"}')" >/dev/null
-  assert_equal "$(span_field "$sink" startTimeUnixNano)" "$(span_field "$sink" endTimeUnixNano)" \
-    'an ambiguous start must yield a zero-duration span'
+    'a third start must not record a fresh timestamp' || return 1
+  assert_equal 3 "$(jq -r '.taskingPending // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'all three starts must be counted as outstanding' || return 1
+
+  for i in 1 2 3; do
+    rm -f "$sink"
+    COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+      hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+        '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-tasking",
+          agentId:"a1", response:"x\n\nAUTODEV-VERDICT: DONE"}')" >/dev/null
+    assert_equal "$(span_field "$sink" startTimeUnixNano)" "$(span_field "$sink" endTimeUnixNano)" \
+      "stop $i must yield a zero-duration span while starts are outstanding" || return 1
+  done
+  assert_equal 0 "$(jq -r '.taskingPending // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'the outstanding count must drain back to zero' || return 1
+
+  start_agent "$sid" tasking
+  [ "$(jq -r '.taskingStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" != "0" ] ||
+    fail 'once drained, a fresh start must record a real timestamp again'
 }
-run_test 'a duplicate start for one sub-agent is reported as zero duration' t_otel_duplicate_start_is_ambiguous
+run_test 'overlapping starts stay ambiguous until they drain' t_otel_duplicate_start_is_ambiguous
+
+t_otel_headers_stay_out_of_argv() {
+  # OTLP headers routinely carry a bearer token. argv is world readable on Linux through
+  # /proc/<pid>/cmdline, so a header passed as -H would expose the credential to any local
+  # process for the lifetime of the request.
+  local sid cwd stub argv_file
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  stub="$COPILOT_HOME/argvstub-$$-$RANDOM"
+  argv_file="$COPILOT_HOME/curl-argv-$$-$RANDOM.txt"
+  mkdir -p "$stub"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf "%%s\\n" "$@" > "%s"\n' "$argv_file"
+    printf 'cat > /dev/null\n'
+    printf 'exit 0\n'
+  } > "$stub/curl"
+  chmod +x "$stub/curl"
+
+  PATH="$stub:$PATH" COPILOT_OTEL_ENABLED=true \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+    OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20SUPERSECRETTOKEN' \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+
+  [ -f "$argv_file" ] || fail 'curl was never invoked, so this test proves nothing' || return 1
+  if grep -q 'SUPERSECRETTOKEN' "$argv_file"; then
+    fail "the bearer token appears in curl argv: $(cat "$argv_file")"
+    return 1
+  fi
+  return 0
+}
+run_test 'header credentials never reach curl argv' t_otel_headers_stay_out_of_argv
 
 t_otel_empty_agent_id_does_not_shift_fields() {
   # The emitter reads all its fields from one jq call. Splitting that on newline as IFS would

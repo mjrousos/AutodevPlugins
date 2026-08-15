@@ -1468,23 +1468,39 @@ Test-Case 'overlapping sub-agents each keep their own start time' {
     Assert-Equal $taskStart ([long]$state.taskingStartedAtMs) 'a concurrent agent stopping must not clear another start time'
 }
 
-Test-Case 'a duplicate start for one sub-agent is reported as zero duration' {
-    # Two concurrent invocations of the SAME agent cannot be told apart: subagentStart carries no
-    # agent id, so report an honest zero duration rather than one agent's start time for another.
+Test-Case 'overlapping starts stay ambiguous until they drain' {
+    # Extended to three starts, because a bare zero sentinel could not tell "nothing pending"
+    # from "ambiguous": the third start would see zero and record a fresh timestamp that a
+    # still-outstanding stop could then consume.
     $sid = New-SessionId
     Set-TodoList -SessionId $sid -Milestones 1
     Start-Agent -SessionId $sid -Agent 'tasking'
     Start-Agent -SessionId $sid -Agent 'tasking'
+    Start-Agent -SessionId $sid -Agent 'tasking'
     $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
-    Assert-Equal 0 ([long]$state.taskingStartedAtMs) 'a duplicate start must mark the start time unusable'
+    Assert-Equal 0 ([long]$state.taskingStartedAtMs) 'a third start must not record a fresh timestamp'
+    Assert-Equal 3 ([int]$state.taskingPending) 'all three starts must be counted as outstanding'
+
     $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
-    Invoke-HookWithEnv 'subagentStop' @{
-        sessionId = $sid; agentName = 'autodev-implement:autodev-tasking'; agentId = 'a1'
-        response  = "x`n`nAUTODEV-VERDICT: DONE"
-    } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
-    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
-    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'an ambiguous start must yield a zero-duration span'
+    foreach ($i in 1, 2, 3) {
+        Remove-Item -LiteralPath $sink -Force -ErrorAction SilentlyContinue
+        Invoke-HookWithEnv 'subagentStop' @{
+            sessionId = $sid; agentName = 'autodev-implement:autodev-tasking'; agentId = 'a1'
+            response  = "x`n`nAUTODEV-VERDICT: DONE"
+        } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+        $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+        $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+        Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano `
+            "stop $i must yield a zero-duration span while starts are outstanding"
+    }
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal 0 ([int]$state.taskingPending) 'the outstanding count must drain back to zero'
+
+    Start-Agent -SessionId $sid -Agent 'tasking'
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    if ([long]$state.taskingStartedAtMs -eq 0) {
+        throw 'once drained, a fresh start must record a real timestamp again'
+    }
 }
 
 Test-Case 'an empty agentId does not shift the other span attributes' {

@@ -129,7 +129,13 @@ $script:NumericKeys = @(
     'milestoneCount', 'currentMilestone', 'completedMilestones',
     'implementAttempts', 'reviewAttempts', 'fixInvocations',
     'userReviewReached',
-    'securityAttempts', 'privacyAttempts'
+    'securityAttempts', 'privacyAttempts',
+    # Outstanding starts per agent. Zero alone cannot distinguish "nothing pending" from
+    # "ambiguous", so a third overlapping start would record a fresh timestamp that a
+    # still-outstanding stop could then consume. The counter keeps the agent ambiguous until
+    # every outstanding stop has drained.
+    'taskingPending', 'implementationPending', 'codereviewPending',
+    'codefixPending', 'codesecurityreviewPending', 'codeprivacyreviewPending'
 )
 # Verdict keys and the vocabulary each one accepts. 'pending' and 'running' are shared.
 $script:WorkerVerdictKeys = @('taskingVerdict', 'implementVerdict')
@@ -147,6 +153,11 @@ $script:StartedAtKeys = @(
 function Get-StartedAtKey {
     param([string]$Agent)
     return (($Agent -replace '[^A-Za-z0-9]', '') + 'StartedAtMs')
+}
+
+function Get-PendingKey {
+    param([string]$Agent)
+    return (($Agent -replace '[^A-Za-z0-9]', '') + 'Pending')
 }
 
 function New-DefaultState {
@@ -1027,11 +1038,15 @@ try {
             $state['blocks'] = 0
             # Remember when this agent started, so subagentStop can report a real duration.
             # Recorded against this agent alone, so an overlapping sub-agent cannot overwrite it.
-            # A start that finds a timestamp already pending for the same agent means two of them
-            # are running concurrently; there is no agent id on subagentStart to tell their stops
-            # apart, so mark it unusable rather than hand one the other's start time.
+            # More than one start outstanding means concurrent invocations whose stops cannot be
+            # told apart -- subagentStart carries no agent id -- so the agent stays ambiguous
+            # until every outstanding stop has drained, rather than a third start handing a
+            # still-running invocation a fresh timestamp that is not its own.
             $startedAtKey = Get-StartedAtKey -Agent $agent
-            if ([long]$state[$startedAtKey] -ne 0) {
+            $pendingKey = Get-PendingKey -Agent $agent
+            $pending = [int]$state[$pendingKey] + 1
+            $state[$pendingKey] = $pending
+            if ($pending -gt 1) {
                 $state[$startedAtKey] = [long]0
             }
             else {
@@ -1147,10 +1162,15 @@ try {
             $advanced = Invoke-MilestoneAdvance -State $state
             # Consume this agent's own start time and clear only that one, so a sub-agent running
             # concurrently keeps its own. Zero means none was usable, which yields an honest
-            # zero-duration span rather than a fabricated one.
+            # zero-duration span rather than a fabricated one. The timestamp is always cleared:
+            # while any start is still outstanding the agent remains ambiguous.
             $startedAtKey = Get-StartedAtKey -Agent $agent
+            $pendingKey = Get-PendingKey -Agent $agent
             $startedAtMs = [long]$state[$startedAtKey]
             $state[$startedAtKey] = [long]0
+            if ([int]$state[$pendingKey] -gt 0) {
+                $state[$pendingKey] = [int]$state[$pendingKey] - 1
+            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $agent `

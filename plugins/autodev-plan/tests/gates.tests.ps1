@@ -1261,18 +1261,36 @@ Test-Case 'overlapping gates each keep their own start time' {
     Assert-Equal ($archStart * 1000000) $archSpan.startTimeUnixNano 'the architecture span must still carry its own start time'
 }
 
-Test-Case 'a duplicate start for one gate is reported as zero duration' {
-    # Two concurrent reviewers for the SAME gate cannot be told apart: subagentStart carries no
-    # agent id, so there is no way to know which stop belongs to which start. Report an honest
-    # zero duration rather than hand one reviewer the other's start time.
+Test-Case 'overlapping starts stay ambiguous until they drain' {
+    <#
+        Two concurrent reviewers for the SAME gate cannot be told apart: subagentStart carries no
+        agent id. Extended to three starts, because a bare zero sentinel could not tell "nothing
+        pending" from "ambiguous": the third start would see zero and record a fresh timestamp
+        that a still-outstanding stop could then consume.
+    #>
     $session = New-SessionId
     Start-Gate -SessionId $session -Gate 'architecture'
     Start-Gate -SessionId $session -Gate 'architecture'
+    Start-Gate -SessionId $session -Gate 'architecture'
     $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
-    Assert-Equal 0 ([long]$state.architectureStartedAtMs) 'a duplicate start must mark the start time unusable'
-    $result = Invoke-TelemetryRound -SessionId $session -Gate 'architecture' -SkipStart
-    $span = $result.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'an ambiguous start must yield a zero-duration span'
+    Assert-Equal 0 ([long]$state.architectureStartedAtMs) 'a third start must not record a fresh timestamp'
+    Assert-Equal 3 ([int]$state.architecturePending) 'all three starts must be counted as outstanding'
+
+    foreach ($i in 1, 2, 3) {
+        $result = Invoke-TelemetryRound -SessionId $session -Gate 'architecture' -SkipStart
+        $span = $result.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
+        Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano `
+            "stop $i must yield a zero-duration span while starts are outstanding"
+    }
+    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
+    Assert-Equal 0 ([int]$state.architecturePending) 'the outstanding count must drain back to zero'
+
+    # Drained, so the next start is unambiguous again and records a real time.
+    Start-Gate -SessionId $session -Gate 'architecture'
+    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
+    if ([long]$state.architectureStartedAtMs -eq 0) {
+        throw 'once drained, a fresh start must record a real timestamp again'
+    }
 }
 
 Test-Case 'an empty agentId does not shift the other span attributes' {

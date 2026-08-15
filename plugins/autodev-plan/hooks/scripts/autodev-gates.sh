@@ -92,7 +92,8 @@ default_state() {
     architectureAttempts: 0, architectureVerdict: "pending",
     securityAttempts: 0,     securityVerdict: "pending",
     privacyAttempts: 0,      privacyVerdict: "pending",
-    architectureStartedAtMs: 0, securityStartedAtMs: 0, privacyStartedAtMs: 0
+    architectureStartedAtMs: 0, securityStartedAtMs: 0, privacyStartedAtMs: 0,
+    architecturePending: 0, securityPending: 0, privacyPending: 0
   }'
 }
 
@@ -139,6 +140,9 @@ read_state_file() {
     and millis_ok("architectureStartedAtMs")
     and millis_ok("securityStartedAtMs")
     and millis_ok("privacyStartedAtMs")
+    and counter_ok("architecturePending")
+    and counter_ok("securityPending")
+    and counter_ok("privacyPending")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
@@ -431,17 +435,20 @@ case "$EVENT_NAME" in
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
       ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
     # Remember when this gate's reviewer started, so subagentStop can report a real duration.
-    # Recorded against this gate alone, so an overlapping reviewer cannot overwrite it. A start
-    # that finds a timestamp already pending for the same gate means two of them are running
-    # concurrently; there is no agent id on subagentStart to tell their stops apart, so mark it
-    # unusable rather than hand one reviewer the other's start time.
-    if [ "$(state_num "$STATE" "${GATE}StartedAtMs")" != "0" ]; then
+    # Recorded against this gate alone, so an overlapping reviewer cannot overwrite it. More than
+    # one start outstanding means concurrent reviewers whose stops cannot be told apart --
+    # subagentStart carries no agent id -- so the gate stays ambiguous until every outstanding
+    # stop has drained, rather than a third start handing a still-running reviewer a fresh
+    # timestamp that is not its own.
+    GATE_PENDING=$(( $(state_num "$STATE" "${GATE}Pending") + 1 ))
+    if [ "$GATE_PENDING" -gt 1 ]; then
       GATE_START_MS=0
     else
       GATE_START_MS="$(now_ms)"
     fi
     STATE="$(printf '%s' "$STATE" | jq --arg k "${GATE}StartedAtMs" --argjson ms "$GATE_START_MS" \
-      '.[$k] = $ms')"
+      --arg pk "${GATE}Pending" --argjson p "$GATE_PENDING" \
+      '.[$k] = $ms | .[$pk] = $p')"
     SEEN_CURRENT=0
     for LATER in $GATE_ORDER; do
       if [ "$SEEN_CURRENT" -eq 1 ]; then
@@ -469,11 +476,16 @@ case "$EVENT_NAME" in
     [ "$ATTEMPTS" -lt 1 ] 2>/dev/null && ATTEMPTS=1
     # Consume this gate's own start time and clear only that one, so a reviewer running
     # concurrently for a different gate keeps its own. Zero means none was usable, which yields
-    # an honest zero-duration span rather than a fabricated one.
+    # an honest zero-duration span rather than a fabricated one. The timestamp is always cleared:
+    # while any start is still outstanding the gate remains ambiguous.
     STARTED_AT_MS="$(state_num "$STATE" "${GATE}StartedAtMs")"
+    GATE_PENDING="$(state_num "$STATE" "${GATE}Pending")"
+    if [ "$GATE_PENDING" -gt 0 ] 2>/dev/null; then
+      GATE_PENDING=$(( GATE_PENDING - 1 ))
+    fi
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
-      --arg k "${GATE}StartedAtMs" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .[\$k] = 0")"
+      --arg k "${GATE}StartedAtMs" --arg pk "${GATE}Pending" --argjson p "$GATE_PENDING" \
+      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .[\$k] = 0 | .[\$pk] = \$p")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
     # Capture the review itself, not just that it happened, so the findings survive the session
