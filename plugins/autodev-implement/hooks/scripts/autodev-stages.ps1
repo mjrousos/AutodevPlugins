@@ -1171,6 +1171,13 @@ try {
             if ([int]$state[$pendingKey] -gt 0) {
                 $state[$pendingKey] = [int]$state[$pendingKey] - 1
             }
+            else {
+                # A stop with no outstanding start means subagentStart never ran for this
+                # sub-agent, so the invocation was never counted. Count it now: otherwise the
+                # span would export a session total of zero for an invocation that demonstrably
+                # completed.
+                $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
+            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $agent `

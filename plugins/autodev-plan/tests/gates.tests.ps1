@@ -1293,6 +1293,26 @@ Test-Case 'overlapping starts stay ambiguous until they drain' {
     }
 }
 
+Test-Case 'a stop without its start still counts as an invocation' {
+    # A stop with no matching start is already recovered as attempt 1. The session total must be
+    # recovered too, or the span would export a total of zero for an invocation that
+    # demonstrably completed.
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    # Deliberately no Start-Gate.
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = 'autodev-plan:autodev-architecture-review'; agentId = 'a1'
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.attempt')
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.total_invocations') `
+        'a completed invocation must never export a session total of zero'
+    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
+    Assert-Equal 1 ([int]$state.totalInvocations) `
+        'the recovered invocation must also be counted against the session ceiling'
+}
+
 Test-Case 'an empty agentId does not shift the other span attributes' {
     <#
         The bash emitter reads all its fields from one jq call. Splitting that on newline as IFS

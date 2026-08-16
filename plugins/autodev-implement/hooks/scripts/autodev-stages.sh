@@ -256,10 +256,11 @@ if [ "$SCRIPT_SELF_DIR" = "$SCRIPT_SELF" ]; then SCRIPT_SELF_DIR="."; fi
 SCRIPT_DIR="$(cd "$SCRIPT_SELF_DIR" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
 
 telemetry_enabled() {
-  # Cheap early-out. For the overwhelming majority of users COPILOT_OTEL_ENABLED is unset, and
-  # this is the entire cost of the telemetry feature for them: no temp file, no child process.
-  case "$(printf '%s' "${COPILOT_OTEL_ENABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
-    1 | true | yes | on) return 0 ;;
+  # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
+  # Deliberately pure parameter matching: piping through 'tr' to normalise case would spawn two
+  # child processes on every hook event just to decide not to emit anything.
+  case "${COPILOT_OTEL_ENABLED:-}" in
+    1 | true | TRUE | True | yes | YES | Yes | on | ON | On) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -995,12 +996,19 @@ $1"; fi; }
     # Clear only this agent's start time, so a sub-agent running concurrently keeps its own, and
     # drain one outstanding start. While any start remains outstanding the agent stays ambiguous.
     AGENT_PENDING="$(state_num "$STATE" "$(pending_key "$AGENT")")"
+    TOTAL_INVOCATIONS="$(state_num "$STATE" 'totalInvocations')"
     if [ "$AGENT_PENDING" -gt 0 ] 2>/dev/null; then
       AGENT_PENDING=$(( AGENT_PENDING - 1 ))
+    else
+      # A stop with no outstanding start means subagentStart never ran for this sub-agent, so the
+      # invocation was never counted. Count it now: otherwise the span would export a session
+      # total of zero for an invocation that demonstrably completed.
+      TOTAL_INVOCATIONS=$(( TOTAL_INVOCATIONS + 1 ))
     fi
     STATE="$(printf '%s' "$STATE" | jq --arg k "$(started_at_key "$AGENT")" \
       --arg pk "$(pending_key "$AGENT")" --argjson p "$AGENT_PENDING" \
-      '.[$k] = 0 | .[$pk] = $p')"
+      --argjson t "$TOTAL_INVOCATIONS" \
+      '.[$k] = 0 | .[$pk] = $p | .totalInvocations = $t')"
     write_state "$STATE"
 
     add_audit_row "$AGENT" "$MILESTONE_LABEL" "$ATTEMPT" "completed" "$VERDICT"

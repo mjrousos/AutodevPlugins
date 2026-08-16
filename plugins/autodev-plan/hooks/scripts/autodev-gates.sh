@@ -202,10 +202,11 @@ if [ "$SCRIPT_SELF_DIR" = "$SCRIPT_SELF" ]; then SCRIPT_SELF_DIR="."; fi
 SCRIPT_DIR="$(cd "$SCRIPT_SELF_DIR" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
 
 telemetry_enabled() {
-  # Cheap early-out. For the overwhelming majority of users COPILOT_OTEL_ENABLED is unset, and
-  # this is the entire cost of the telemetry feature for them: no temp file, no child process.
-  case "$(printf '%s' "${COPILOT_OTEL_ENABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
-    1 | true | yes | on) return 0 ;;
+  # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
+  # Deliberately pure parameter matching: piping through 'tr' to normalise case would spawn two
+  # child processes on every hook event just to decide not to emit anything.
+  case "${COPILOT_OTEL_ENABLED:-}" in
+    1 | true | TRUE | True | yes | YES | Yes | on | ON | On) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -480,12 +481,20 @@ case "$EVENT_NAME" in
     # while any start is still outstanding the gate remains ambiguous.
     STARTED_AT_MS="$(state_num "$STATE" "${GATE}StartedAtMs")"
     GATE_PENDING="$(state_num "$STATE" "${GATE}Pending")"
+    TOTAL_INVOCATIONS="$(state_num "$STATE" 'totalInvocations')"
     if [ "$GATE_PENDING" -gt 0 ] 2>/dev/null; then
       GATE_PENDING=$(( GATE_PENDING - 1 ))
+    else
+      # A stop with no outstanding start means subagentStart never ran for this reviewer, so the
+      # invocation was never counted. Count it now: otherwise the span would export a session
+      # total of zero for an invocation that demonstrably completed, and the session ceiling
+      # would silently undercount real work.
+      TOTAL_INVOCATIONS=$(( TOTAL_INVOCATIONS + 1 ))
     fi
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
       --arg k "${GATE}StartedAtMs" --arg pk "${GATE}Pending" --argjson p "$GATE_PENDING" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .[\$k] = 0 | .[\$pk] = \$p")"
+      --argjson t "$TOTAL_INVOCATIONS" \
+      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .[\$k] = 0 | .[\$pk] = \$p | .totalInvocations = \$t")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
     # Capture the review itself, not just that it happened, so the findings survive the session

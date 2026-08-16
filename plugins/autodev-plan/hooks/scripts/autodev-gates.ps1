@@ -695,6 +695,13 @@ try {
             if ([int]$state["${gate}Pending"] -gt 0) {
                 $state["${gate}Pending"] = [int]$state["${gate}Pending"] - 1
             }
+            else {
+                # A stop with no outstanding start means subagentStart never ran for this
+                # reviewer, so the invocation was never counted. Count it now: otherwise the span
+                # would export a session total of zero for an invocation that demonstrably
+                # completed, and the session ceiling would silently undercount real work.
+                $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
+            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = [int]$state["${gate}Attempts"]

@@ -1603,6 +1603,27 @@ t_otel_duplicate_start_is_ambiguous() {
 }
 run_test 'overlapping starts stay ambiguous until they drain' t_otel_duplicate_start_is_ambiguous
 
+t_otel_missed_start_still_counts_the_invocation() {
+  # A stop with no matching start (state deleted mid-run, or the hooks installed part way
+  # through) is already recovered as attempt 1. The session total must be recovered too, or the
+  # span would export a total of zero for an invocation that demonstrably completed.
+  local sid cwd sink
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  # Deliberately no start_agent.
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal 1 "$(span_attr "$sink" 'autodev.total_invocations')" \
+    'a completed invocation must never export a session total of zero' || return 1
+  assert_equal 1 "$(jq -r '.totalInvocations // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'the recovered invocation must also be counted against the session ceiling'
+}
+run_test 'a stop without its start still counts as an invocation' t_otel_missed_start_still_counts_the_invocation
+
 t_otel_headers_stay_out_of_argv() {
   # OTLP headers routinely carry a bearer token. argv is world readable on Linux through
   # /proc/<pid>/cmdline, so a header passed as -H would expose the credential to any local

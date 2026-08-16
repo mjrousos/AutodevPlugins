@@ -256,7 +256,7 @@ with Copilot's. It exports only when **both** are set:
 
 | Variable | Purpose |
 | --- | --- |
-| `COPILOT_OTEL_ENABLED` | Must be truthy (`1`, `true`, `yes`, `on`). Unset means no telemetry, and no child process is spawned at all. |
+| `COPILOT_OTEL_ENABLED` | Must be truthy (`1`, `true`, `yes`, `on`). Unset means no telemetry: no emitter process, no temp file, no network call. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Copilot's implicit `http://127.0.0.1:4318` default is deliberately not assumed. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON. See the caveat below. |
@@ -302,6 +302,14 @@ and the emitter cannot tell: it discards transport errors by design, because sur
 mean writing to a hook's stdout. If you are exporting somewhere other than a Collector and see no
 `autodev.*` spans, set `AUTODEV_OTEL_DEBUG_FILE` to confirm the emitter is producing them, then
 check whether your endpoint accepts `Content-Type: application/json`.
+
+### Cost when telemetry is off
+
+With `COPILOT_OTEL_ENABLED` unset — the default for essentially every user — no emitter process
+is spawned, no temp file is written and no network call is made. The residual cost is a shell
+`case` on one environment variable, plus two small integer fields carried in the state file the
+tracker already writes on every event. The hooks still record when each reviewer started, so
+enabling telemetry part way through a session produces correct durations immediately.
 
 ### Correlating with Copilot's own traces
 

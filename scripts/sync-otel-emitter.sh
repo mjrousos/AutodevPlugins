@@ -14,6 +14,18 @@ set -u
 
 MODE="${1:-copy}"
 
+case "$MODE" in
+  copy | --check) ;;
+  *)
+    # Falling through to copy mode on an unrecognized argument would be dangerous: a typo such as
+    # '--chek' in CI would silently overwrite the target copies and exit 0, so drift would stop
+    # being detected without anyone noticing.
+    echo "FAIL unknown argument: $MODE" >&2
+    echo "usage: scripts/sync-otel-emitter.sh [--check]" >&2
+    exit 2
+    ;;
+esac
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || {
   echo "FAIL cannot resolve repository root" >&2
   exit 1
