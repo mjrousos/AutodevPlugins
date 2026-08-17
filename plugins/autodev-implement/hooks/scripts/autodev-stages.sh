@@ -857,22 +857,28 @@ case "$EVENT_NAME" in
 
     MILESTONE_LABEL='-'
     EXTRA_NOTES=''
-    # An attempt counter still at zero means subagentStart never ran for this sub-agent. Each
-    # branch below recovers the attempt itself; the session total has to be recovered too, or the
-    # ceiling would undercount real work and the span would export a total of zero for an
-    # invocation that demonstrably completed.
+    # Every branch below charges this stop against the agent's own attempt counter and reports
+    # that number, so both are done once here rather than six times. A counter still at zero means
+    # subagentStart never ran for this sub-agent: recover the attempt and the session total
+    # together, or the ceiling would undercount real work and the span would export a total of
+    # zero for an invocation that demonstrably completed. attempts_key is the single place that
+    # knows which counter belongs to which agent, because the names are not mechanically related
+    # (code-fix uses 'fixInvocations').
     ATTEMPTS_KEY="$(attempts_key "$AGENT")"
-    if [ -n "$ATTEMPTS_KEY" ] && [ "$(state_num "$STATE" "$ATTEMPTS_KEY")" -lt 1 ] 2>/dev/null; then
-      STATE="$(printf '%s' "$STATE" | jq \
-        --argjson t "$(( $(state_num "$STATE" 'totalInvocations') + 1 ))" '.totalInvocations = $t')"
+    if [ -n "$ATTEMPTS_KEY" ]; then
+      ATTEMPT="$(state_num "$STATE" "$ATTEMPTS_KEY")"
+      if [ "$ATTEMPT" -lt 1 ] 2>/dev/null; then
+        ATTEMPT=1
+        STATE="$(printf '%s' "$STATE" | jq \
+          --argjson t "$(( $(state_num "$STATE" 'totalInvocations') + 1 ))" '.totalInvocations = $t')"
+      fi
+      STATE="$(printf '%s' "$STATE" | jq --arg ak "$ATTEMPTS_KEY" --argjson a "$ATTEMPT" '.[$ak] = $a')"
     fi
     add_note() { if [ -z "$EXTRA_NOTES" ]; then EXTRA_NOTES="$1"; else EXTRA_NOTES="$EXTRA_NOTES
 $1"; fi; }
 
     case "$AGENT" in
       tasking)
-        ATTEMPT="$(state_num "$STATE" 'taskingAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
         if [ "$VERDICT" = "DONE" ]; then
           PARSED_COUNT="$(get_milestone_count)"
           if [ "$PARSED_COUNT" -gt 0 ] 2>/dev/null; then
@@ -897,14 +903,10 @@ $1"; fi; }
             add_note "WARNING: there is no workspace directory to read the todo list from, so milestone enforcement is degraded for this run."
           fi
         fi
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.taskingAttempts = $a | .taskingVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.taskingVerdict = $v')"
         ;;
       implementation)
-        ATTEMPT="$(state_num "$STATE" 'implementAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.implementAttempts = $a | .implementVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.implementVerdict = $v')"
         MILESTONE_LABEL="$(state_num "$STATE" 'currentMilestone')"
         if [ "$VERDICT" = "DONE" ]; then
           MILESTONE_STATUS="$(get_milestone_status "$MILESTONE_LABEL")"
@@ -914,16 +916,10 @@ $1"; fi; }
         fi
         ;;
       code-review)
-        ATTEMPT="$(state_num "$STATE" 'reviewAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.reviewAttempts = $a | .reviewVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.reviewVerdict = $v')"
         MILESTONE_LABEL="$(state_num "$STATE" 'currentMilestone')"
         ;;
       code-fix)
-        ATTEMPT="$(state_num "$STATE" 'fixInvocations')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" '.fixInvocations = $a')"
         if [ "$(state_num "$STATE" 'completedMilestones')" -lt "$(get_effective_milestone_count "$STATE")" ] 2>/dev/null; then
           MILESTONE_LABEL="$(state_num "$STATE" 'currentMilestone')"
         fi
@@ -932,16 +928,10 @@ $1"; fi; }
         fi
         ;;
       code-security-review)
-        ATTEMPT="$(state_num "$STATE" 'securityAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.securityAttempts = $a | .securityVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.securityVerdict = $v')"
         ;;
       code-privacy-review)
-        ATTEMPT="$(state_num "$STATE" 'privacyAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.privacyAttempts = $a | .privacyVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.privacyVerdict = $v')"
         ;;
     esac
 

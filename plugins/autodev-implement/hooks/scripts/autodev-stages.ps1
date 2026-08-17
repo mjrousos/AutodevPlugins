@@ -1006,14 +1006,8 @@ try {
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = 0
-            switch ($agent) {
-                'tasking' { $attempt = [int]$state['taskingAttempts'] }
-                'implementation' { $attempt = [int]$state['implementAttempts'] }
-                'code-review' { $attempt = [int]$state['reviewAttempts'] }
-                'code-fix' { $attempt = [int]$state['fixInvocations'] }
-                'code-security-review' { $attempt = [int]$state['securityAttempts'] }
-                'code-privacy-review' { $attempt = [int]$state['privacyAttempts'] }
-            }
+            $attemptsKey = Get-AttemptsKey -Agent $agent
+            if ($attemptsKey -ne '') { $attempt = [int]$state[$attemptsKey] }
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $agent `
                 -Milestone $milestoneLabel -Attempt $attempt -Action 'invoked' -Verdict '-'
 
@@ -1034,23 +1028,28 @@ try {
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
 
-            # An attempt counter still at zero means subagentStart never ran for this sub-agent.
-            # Each branch below recovers the attempt itself; the session total has to be
-            # recovered too, or the ceiling would undercount real work and the span would export
-            # a total of zero for an invocation that demonstrably completed.
-            $attemptsKey = Get-AttemptsKey -Agent $agent
-            if ($attemptsKey -ne '' -and [int]$state[$attemptsKey] -lt 1) {
-                $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
-            }
-
             $milestoneLabel = '-'
             $attempt = 0
             $extraNotes = @()
 
+            # Every branch below charges this stop against the agent's own attempt counter and
+            # reports that number, so both are done once here rather than six times. A counter
+            # still at zero means subagentStart never ran for this sub-agent: recover the attempt
+            # and the session total together, or the ceiling would undercount real work and the
+            # span would export a total of zero for an invocation that demonstrably completed.
+            # Get-AttemptsKey is the single place that knows which counter belongs to which agent,
+            # because the names are not mechanically related (code-fix uses 'fixInvocations').
+            $attemptsKey = Get-AttemptsKey -Agent $agent
+            if ($attemptsKey -ne '') {
+                if ([int]$state[$attemptsKey] -lt 1) {
+                    $state[$attemptsKey] = 1
+                    $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
+                }
+                $attempt = [int]$state[$attemptsKey]
+            }
+
             switch ($agent) {
                 'tasking' {
-                    if ([int]$state['taskingAttempts'] -lt 1) { $state['taskingAttempts'] = 1 }
-                    $attempt = [int]$state['taskingAttempts']
                     if ($verdict -eq 'DONE') {
                         $parsedCount = Get-MilestoneCount -TodoPath $todoPath
                         if ($parsedCount -gt 0) {
@@ -1079,9 +1078,7 @@ try {
                     $state['taskingVerdict'] = $verdict
                 }
                 'implementation' {
-                    if ([int]$state['implementAttempts'] -lt 1) { $state['implementAttempts'] = 1 }
                     $state['implementVerdict'] = $verdict
-                    $attempt = [int]$state['implementAttempts']
                     $milestoneLabel = [string][int]$state['currentMilestone']
                     if ($verdict -eq 'DONE') {
                         $status = Get-MilestoneStatus -TodoPath $todoPath -Milestone ([int]$state['currentMilestone'])
@@ -1091,14 +1088,10 @@ try {
                     }
                 }
                 'code-review' {
-                    if ([int]$state['reviewAttempts'] -lt 1) { $state['reviewAttempts'] = 1 }
                     $state['reviewVerdict'] = $verdict
-                    $attempt = [int]$state['reviewAttempts']
                     $milestoneLabel = [string][int]$state['currentMilestone']
                 }
                 'code-fix' {
-                    if ([int]$state['fixInvocations'] -lt 1) { $state['fixInvocations'] = 1 }
-                    $attempt = [int]$state['fixInvocations']
                     if ([int]$state['completedMilestones'] -lt (Get-EffectiveMilestoneCount -State $state)) {
                         $milestoneLabel = [string][int]$state['currentMilestone']
                     }
@@ -1107,14 +1100,10 @@ try {
                     }
                 }
                 'code-security-review' {
-                    if ([int]$state['securityAttempts'] -lt 1) { $state['securityAttempts'] = 1 }
                     $state['securityVerdict'] = $verdict
-                    $attempt = [int]$state['securityAttempts']
                 }
                 'code-privacy-review' {
-                    if ([int]$state['privacyAttempts'] -lt 1) { $state['privacyAttempts'] = 1 }
                     $state['privacyVerdict'] = $verdict
-                    $attempt = [int]$state['privacyAttempts']
                 }
             }
 
