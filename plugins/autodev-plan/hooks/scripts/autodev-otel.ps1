@@ -205,10 +205,16 @@ function Get-TraceParent {
     $version = $parts[0]
     $traceId = $parts[1]
     $spanId = $parts[2]
+    $flags = $parts[3]
     # 'ff' is reserved as invalid by the specification.
     if ($version -notmatch '^[0-9a-f]{2}$' -or $version -eq 'ff') { return $null }
     if ($traceId -notmatch '^[0-9a-f]{32}$' -or $traceId -match '^0+$') { return $null }
     if ($spanId -notmatch '^[0-9a-f]{16}$' -or $spanId -match '^0+$') { return $null }
+    # trace-flags is required, so a three-field header is malformed rather than "flags omitted".
+    if ($flags -notmatch '^[0-9a-f]{2}$') { return $null }
+    # Version 00 is exactly four fields. Later versions may append, and are parsed by reading the
+    # first four and ignoring the rest, which is what the specification asks future parsers to do.
+    if ($version -eq '00' -and $parts.Count -ne 4) { return $null }
     return @{ TraceId = $traceId; SpanId = $spanId }
 }
 

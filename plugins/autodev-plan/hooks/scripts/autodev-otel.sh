@@ -167,11 +167,13 @@ hex_only() { printf '%s' "${1:-}" | tr -cd '0-9a-f'; }
 parse_traceparent() {
   TRACE_PARENT_TRACE_ID=''
   TRACE_PARENT_SPAN_ID=''
-  local raw="${1:-}" version tid pid
+  local raw="${1:-}" version tid pid flags rest
   [ -n "$raw" ] || return 0
   # The spec requires lowercase hex, but normalise rather than reject a non-compliant producer.
   raw="$(printf '%s' "$raw" | tr 'A-Z' 'a-z')"
-  IFS='-' read -r version tid pid _ <<EOF
+  # A trailing delimiter leaves an empty final field, which no version permits.
+  case "$raw" in *-) return 0 ;; esac
+  IFS='-' read -r version tid pid flags rest <<EOF
 $raw
 EOF
   # 'ff' is reserved as invalid by the specification.
@@ -179,6 +181,11 @@ EOF
   [ "$version" != "ff" ] || return 0
   [ "${#tid}" -eq 32 ] && [ "$(hex_only "$tid")" = "$tid" ] || return 0
   [ "${#pid}" -eq 16 ] && [ "$(hex_only "$pid")" = "$pid" ] || return 0
+  # trace-flags is required, so a three-field header is malformed rather than "flags omitted".
+  [ "${#flags}" -eq 2 ] && [ "$(hex_only "$flags")" = "$flags" ] || return 0
+  # Version 00 is exactly four fields. Later versions may append, and are parsed by reading the
+  # first four and ignoring the rest, which is what the specification asks future parsers to do.
+  if [ "$version" = "00" ] && [ -n "$rest" ]; then return 0; fi
   # An all-zero id is invalid and must not be treated as a usable parent.
   case "$tid" in *[!0]*) ;; *) return 0 ;; esac
   case "$pid" in *[!0]*) ;; *) return 0 ;; esac

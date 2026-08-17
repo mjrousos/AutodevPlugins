@@ -1159,7 +1159,12 @@ try {
                 verdict          = $verdict
                 attempt          = $attempt
                 totalInvocations = [int]$state['totalInvocations']
-                timeMs           = [long]$payload.timestamp
+                # Passed through raw, NOT cast to [long] here. This hashtable is built before
+                # Send-OtelSpan is entered, so it is outside its protective try/catch: a
+                # non-numeric timestamp would throw under $ErrorActionPreference = 'Stop' and the
+                # outer catch would emit '{}' instead of the tracker footer -- even with
+                # telemetry disabled. The emitter validates it safely with Get-LongField.
+                timeMs           = $payload.timestamp
                 # Absent today, but forwarded so the span parents itself under Copilot's own
                 # sub-agent span the moment the CLI starts supplying trace context.
                 traceparent      = [string]$payload.traceparent

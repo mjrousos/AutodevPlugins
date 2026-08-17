@@ -32,19 +32,22 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)" || 
 }
 
 SOURCE_DIR="$REPO_ROOT/plugins/autodev-plan/hooks/scripts"
-TARGET_DIRS="$REPO_ROOT/plugins/autodev-implement/hooks/scripts"
-FILES="autodev-otel.ps1 autodev-otel.sh"
+# Arrays, expanded quoted below. A checkout path containing a space would otherwise be split by
+# word splitting into several bogus target directories, and both copy and --check would then
+# operate on paths that do not exist.
+TARGET_DIRS=("$REPO_ROOT/plugins/autodev-implement/hooks/scripts")
+FILES=("autodev-otel.ps1" "autodev-otel.sh")
 
 status=0
 
-for file in $FILES; do
+for file in "${FILES[@]}"; do
   source_path="$SOURCE_DIR/$file"
   if [ ! -f "$source_path" ]; then
     echo "FAIL canonical file missing: $source_path" >&2
     status=1
     continue
   fi
-  for target_dir in $TARGET_DIRS; do
+  for target_dir in "${TARGET_DIRS[@]}"; do
     target_path="$target_dir/$file"
     if [ "$MODE" = "--check" ]; then
       if cmp -s "$source_path" "$target_path"; then

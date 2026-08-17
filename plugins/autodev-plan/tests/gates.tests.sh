@@ -1426,7 +1426,12 @@ t_otel_malformed_traceparent_is_ignored() {
     'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
     '00-00000000000000000000000000000000-00f067aa0ba902b7-01' \
     '00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01' \
-    '00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01'; do
+    '00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01' \
+    '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7' \
+    '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz' \
+    '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0' \
+    '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra' \
+    '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-'; do
     sink="$(telemetry_dir "$sid")/bad.jsonl"
     rm -f "$sink"
     COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
@@ -1455,6 +1460,47 @@ t_otel_span_marks_the_verdict_instant() {
   printf '%s' "$start" | grep -qE '^[0-9]{16,}$' || fail "implausible span time '$start'"
 }
 run_test "the span marks the instant the verdict was recorded" t_otel_span_marks_the_verdict_instant
+
+t_otel_future_version_traceparent_is_honoured() {
+  # The spec tells future-unaware parsers to read the first four fields and ignore the rest, so a
+  # version above 00 must keep working rather than silently losing parentage.
+  local sid cwd sink
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/future.jsonl"
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review", agentId:"a1",
+        traceparent:"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-future",
+        response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal '4bf92f3577b34da6a3ce929d0e0e4736' "$(span_field "$sink" traceId)" || return 1
+  assert_equal '00f067aa0ba902b7' "$(span_field "$sink" parentSpanId)"
+}
+run_test "a later traceparent version with extension fields is still honoured" t_otel_future_version_traceparent_is_honoured
+
+t_otel_malformed_timestamp_cannot_break_the_hook() {
+  # A non-numeric timestamp must never cost the gate its tracker footer. Checked with telemetry
+  # both off and on, since the span payload is assembled either way.
+  local sid cwd footer
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  footer="$(hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review", agentId:"a1",
+      timestamp:"not-a-number", response:"Body text.\n\nAUTODEV-VERDICT: ISSUES"}')" |
+    jq -r '.modifiedResponse // ""')"
+  assert_match 'gate tracker' "$footer" 'the footer must survive a malformed timestamp' || return 1
+
+  footer="$(COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$(telemetry_dir "$sid")/ts.jsonl" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review", agentId:"a1",
+        timestamp:"not-a-number", response:"Body text.\n\nAUTODEV-VERDICT: ISSUES"}')" |
+    jq -r '.modifiedResponse // ""')"
+  assert_match 'gate tracker' "$footer" 'the footer must survive it with telemetry enabled too' || return 1
+  # The span still goes out, with the emitter's own fallback timestamp rather than a broken one.
+  assert_match '^[0-9]{16,}$' "$(span_field "$(telemetry_dir "$sid")/ts.jsonl" startTimeUnixNano)" \
+    'the emitter must substitute a usable timestamp'
+}
+run_test "a malformed timestamp cannot break the hook" t_otel_malformed_timestamp_cannot_break_the_hook
 
 t_otel_headers_stay_out_of_argv() {
   # OTLP headers routinely carry a bearer token. argv is world readable on Linux through

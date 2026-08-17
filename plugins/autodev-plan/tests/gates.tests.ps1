@@ -1279,7 +1279,14 @@ Test-Case 'a malformed traceparent falls back to a root span' {
         'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
         '00-00000000000000000000000000000000-00f067aa0ba902b7-01',
         '00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01',
-        '00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01'
+        '00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01',
+        # trace-flags is required, not optional.
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7',
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz',
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0',
+        # Version 00 permits no extension fields.
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra',
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-'
     )
     foreach ($tp in $bad) {
         $sink = Join-Path (Get-TelemetryDir $session) 'bad.jsonl'
@@ -1303,6 +1310,50 @@ Test-Case 'the span marks the instant the verdict was recorded' {
     $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
     Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'the span marks an instant, not a duration'
     Assert-Match '^[0-9]{16,}$' $span.startTimeUnixNano 'implausible span time'
+}
+
+Test-Case 'a later traceparent version with extension fields is still honoured' {
+    # The spec tells future-unaware parsers to read the first four fields and ignore the rest, so
+    # a version above 00 must keep working rather than silently losing parentage.
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId   = $session; agentName = 'autodev-plan:autodev-architecture-review'
+        agentId     = 'a1'
+        traceparent = '01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-future'
+        response    = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal '4bf92f3577b34da6a3ce929d0e0e4736' $span.traceId
+    Assert-Equal '00f067aa0ba902b7' $span.parentSpanId
+}
+
+Test-Case 'a malformed timestamp cannot break the hook' {
+    <#
+        The request hashtable is built by the tracker before Send-OtelSpan is entered, so it sits
+        outside that function's try/catch. Casting the payload timestamp there would throw under
+        $ErrorActionPreference = 'Stop' on a non-numeric value, and the outer catch would emit
+        '{}' instead of the tracker footer -- destroying enforcement output over telemetry.
+        Checked with telemetry both off and on, because the hashtable is built either way.
+    #>
+    foreach ($enabled in @($null, 'true')) {
+        $session = New-SessionId
+        $vars = @{ COPILOT_OTEL_ENABLED = $enabled }
+        if ($enabled) {
+            $vars['AUTODEV_OTEL_DEBUG_FILE'] = (Join-Path (Get-TelemetryDir $session) 'spans.jsonl')
+        }
+        $out = Invoke-HookWithEnv 'subagentStop' @{
+            sessionId = $session
+            agentName = 'autodev-plan:autodev-architecture-review'
+            agentId   = 'a1'
+            timestamp = 'not-a-number'
+            response  = "Body text.`n`nAUTODEV-VERDICT: ISSUES"
+        } $vars
+        $footer = Get-Footer $out
+        Assert-Match 'gate tracker' $footer "the footer must survive a malformed timestamp (enabled=$enabled)"
+        Assert-Match 'Recorded verdict: ISSUES' $footer
+    }
 }
 
 Test-Case 'an empty agentId does not shift the other span attributes' {
