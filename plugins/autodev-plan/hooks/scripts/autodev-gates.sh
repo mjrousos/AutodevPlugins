@@ -47,6 +47,17 @@ MAX_TOTAL_INVOCATIONS=40
 
 json_get() { printf '%s' "$RAW_INPUT" | jq -r "$1 // \"\"" 2>/dev/null; }
 
+# Numeric payload field, defaulting to 0. Kept separate from json_get because --argjson rejects
+# an empty string, which would abort the whole span document.
+json_get_num() {
+  local v
+  v="$(printf '%s' "$RAW_INPUT" | jq -r "$1 // 0" 2>/dev/null)"
+  case "$v" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
 SESSION_ID="$(json_get '.sessionId')"
 SESSION_CWD="$(json_get '.cwd')"
 
@@ -91,9 +102,7 @@ default_state() {
   sessionId: $sid, createdAt: $now, updatedAt: $now, blocks: 0, totalInvocations: 0,
     architectureAttempts: 0, architectureVerdict: "pending",
     securityAttempts: 0,     securityVerdict: "pending",
-    privacyAttempts: 0,      privacyVerdict: "pending",
-    architectureStartedAtMs: 0, securityStartedAtMs: 0, privacyStartedAtMs: 0,
-    architecturePending: 0, securityPending: 0, privacyPending: 0
+    privacyAttempts: 0,      privacyVerdict: "pending"
   }'
 }
 
@@ -119,12 +128,6 @@ read_state_file() {
           and test("^[0-9]+$")
           and (tonumber <= 2147483647));
     def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
-    # Telemetry bookkeeping. An epoch-millisecond value does not fit nonnegint, which caps at
-    # int32 to match the counter validation, so it is checked separately.
-    def millis_ok($key):
-      (has($key) | not)
-      or (.[$key] | (type == "number" and . >= 0 and floor == .)
-                    or (type == "string" and test("^[0-9]+$")));
     def verdict_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
@@ -137,12 +140,6 @@ read_state_file() {
     and verdict_ok("architectureVerdict")
     and verdict_ok("securityVerdict")
     and verdict_ok("privacyVerdict")
-    and millis_ok("architectureStartedAtMs")
-    and millis_ok("securityStartedAtMs")
-    and millis_ok("privacyStartedAtMs")
-    and counter_ok("architecturePending")
-    and counter_ok("securityPending")
-    and counter_ok("privacyPending")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
@@ -227,28 +224,6 @@ send_otel_span() {
   bash "$emitter" "$tmp" >/dev/null 2>&1 </dev/null || :
   rm -f "$tmp" 2>/dev/null || :
   return 0
-}
-
-now_ms() {
-  # Millisecond resolution wherever it is available. GNU date supports %3N; BSD date on macOS
-  # does not and passes the specifier through literally, which the digit check rejects. Perl
-  # ships with macOS and covers that case. The whole-second fallback is correct but coarse
-  # enough that a sub-agent finishing inside one second would report a zero-duration span.
-  local ms secs
-  ms="$(date -u +%s%3N 2>/dev/null)" || ms=""
-  case "$ms" in '' | *[!0-9]*) ms="" ;; esac
-  if [ -z "$ms" ] && command -v perl >/dev/null 2>&1; then
-    ms="$(perl -MTime::HiRes=time -e 'printf "%.0f", time * 1000' 2>/dev/null)" || ms=""
-    case "$ms" in '' | *[!0-9]*) ms="" ;; esac
-  fi
-  if [ -z "$ms" ]; then
-    secs="$(date -u +%s 2>/dev/null)" || secs=""
-    case "$secs" in
-      '' | *[!0-9]*) ms="0" ;;
-      *) ms="${secs}000" ;;
-    esac
-  fi
-  printf '%s' "$ms"
 }
 
 add_audit_row() {
@@ -435,21 +410,6 @@ case "$EVENT_NAME" in
     # "complete" while downstream gates hold verdicts for a plan that changed.
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
       ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
-    # Remember when this gate's reviewer started, so subagentStop can report a real duration.
-    # Recorded against this gate alone, so an overlapping reviewer cannot overwrite it. More than
-    # one start outstanding means concurrent reviewers whose stops cannot be told apart --
-    # subagentStart carries no agent id -- so the gate stays ambiguous until every outstanding
-    # stop has drained, rather than a third start handing a still-running reviewer a fresh
-    # timestamp that is not its own.
-    GATE_PENDING=$(( $(state_num "$STATE" "${GATE}Pending") + 1 ))
-    if [ "$GATE_PENDING" -gt 1 ]; then
-      GATE_START_MS=0
-    else
-      GATE_START_MS="$(now_ms)"
-    fi
-    STATE="$(printf '%s' "$STATE" | jq --arg k "${GATE}StartedAtMs" --argjson ms "$GATE_START_MS" \
-      --arg pk "${GATE}Pending" --argjson p "$GATE_PENDING" \
-      '.[$k] = $ms | .[$pk] = $p')"
     SEEN_CURRENT=0
     for LATER in $GATE_ORDER; do
       if [ "$SEEN_CURRENT" -eq 1 ]; then
@@ -473,28 +433,17 @@ case "$EVENT_NAME" in
     VERDICT="$(read_verdict "$RESPONSE")"
 
     ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
-    # subagentStart was missed somehow; still count this attempt.
-    [ "$ATTEMPTS" -lt 1 ] 2>/dev/null && ATTEMPTS=1
-    # Consume this gate's own start time and clear only that one, so a reviewer running
-    # concurrently for a different gate keeps its own. Zero means none was usable, which yields
-    # an honest zero-duration span rather than a fabricated one. The timestamp is always cleared:
-    # while any start is still outstanding the gate remains ambiguous.
-    STARTED_AT_MS="$(state_num "$STATE" "${GATE}StartedAtMs")"
-    GATE_PENDING="$(state_num "$STATE" "${GATE}Pending")"
     TOTAL_INVOCATIONS="$(state_num "$STATE" 'totalInvocations')"
-    if [ "$GATE_PENDING" -gt 0 ] 2>/dev/null; then
-      GATE_PENDING=$(( GATE_PENDING - 1 ))
-    else
-      # A stop with no outstanding start means subagentStart never ran for this reviewer, so the
-      # invocation was never counted. Count it now: otherwise the span would export a session
-      # total of zero for an invocation that demonstrably completed, and the session ceiling
-      # would silently undercount real work.
+    if [ "$ATTEMPTS" -lt 1 ] 2>/dev/null; then
+      # subagentStart was missed somehow; still count this attempt. The session total must be
+      # recovered too, or the ceiling would undercount real work and the span would export a
+      # total of zero for an invocation that demonstrably completed.
+      ATTEMPTS=1
       TOTAL_INVOCATIONS=$(( TOTAL_INVOCATIONS + 1 ))
     fi
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
-      --arg k "${GATE}StartedAtMs" --arg pk "${GATE}Pending" --argjson p "$GATE_PENDING" \
       --argjson t "$TOTAL_INVOCATIONS" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .[\$k] = 0 | .[\$pk] = \$p | .totalInvocations = \$t")"
+      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .totalInvocations = \$t")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
     # Capture the review itself, not just that it happened, so the findings survive the session
@@ -546,12 +495,13 @@ $NEXT_ACTION"
       --arg verdict "$VERDICT" \
       --argjson attempt "$ATTEMPTS" \
       --argjson total "$(state_num "$STATE" 'totalInvocations')" \
-      --argjson startMs "$STARTED_AT_MS" \
-      --argjson endMs "$(now_ms)" \
+      --argjson timeMs "$(json_get_num '.timestamp')" \
+      --arg traceparent "$(json_get '.traceparent')" \
+      --arg tracestate "$(json_get '.tracestate')" \
       '{spanName: $span, sessionId: $sid, agentName: $agentName, agentId: $agentId,
         plugin: "autodev-plan", unitKey: "autodev.gate", unitValue: $unitValue,
         verdict: $verdict, attempt: $attempt, totalInvocations: $total,
-        startTimeMs: $startMs, endTimeMs: $endMs}' 2>/dev/null)" || :
+        timeMs: $timeMs, traceparent: $traceparent, tracestate: $tracestate}' 2>/dev/null)" || :
 
     jq -cn --arg r "$RESPONSE
 $FOOTER" '{modifiedResponse: $r}'

@@ -1518,91 +1518,6 @@ t_otel_raw_session_id() {
 }
 run_test 'the exported session id is the raw one, not the filename-safe one' t_otel_raw_session_id
 
-t_otel_duration_from_state() {
-  # Asserts the exact value rather than merely a positive duration. A wall-clock comparison would
-  # be flaky whenever now_ms falls back to whole-second resolution and both hooks land in the
-  # same second, and it would not actually prove the recorded timestamp was the one used. Reading
-  # the value the state file holds between the two events and requiring the span to carry it is
-  # deterministic and tests the real claim: that the timestamp survives the state reader.
-  local sid recorded start end
-  sid="$(new_session_id)"
-  set_todo_list "$sid" 1
-  start_agent "$sid" tasking
-  recorded="$(jq -r '.taskingStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
-  [ -n "$recorded" ] && [ "$recorded" != "0" ] ||
-    fail "subagentStart did not persist a start timestamp (got '$recorded')" || return 1
-  telemetry_round_stop_only "$sid" tasking DONE
-  start="$(span_field "$TELEMETRY_SINK" startTimeUnixNano)"
-  end="$(span_field "$TELEMETRY_SINK" endTimeUnixNano)"
-  assert_equal "${recorded}000000" "$start" 'the span must carry the recorded start time' || return 1
-  [ "$start" -le "$end" ] 2>/dev/null || fail "span starts after it ends ($start > $end)"
-}
-run_test 'the span duration comes from the recorded start time' t_otel_duration_from_state
-
-t_otel_overlapping_starts_keep_own_times() {
-  # A single shared start slot would let the second sub-agent's start overwrite the first, and
-  # the first stop would then report a truncated duration and clear a timestamp belonging to the
-  # other agent. Each agent keeps its own slot.
-  local sid cwd sink task_start review_start
-  sid="$(new_session_id)"
-  set_todo_list "$sid" 1
-  cwd="$(session_cwd "$sid")"
-  sink="$(telemetry_dir "$sid")/spans.jsonl"
-  start_agent "$sid" tasking
-  start_agent "$sid" code-review
-  task_start="$(jq -r '.taskingStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
-  review_start="$(jq -r '.codereviewStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
-  { [ "$task_start" != "0" ] && [ "$review_start" != "0" ]; } ||
-    fail "both agents must hold their own start time (tasking=$task_start review=$review_start)" ||
-    return 1
-
-  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
-    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
-      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
-        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
-  assert_equal "${review_start}000000" "$(span_field "$sink" startTimeUnixNano)" \
-    'the review span must carry the review start time' || return 1
-  assert_equal "$task_start" "$(jq -r '.taskingStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'a concurrent agent stopping must not clear another start time'
-}
-run_test 'overlapping sub-agents each keep their own start time' t_otel_overlapping_starts_keep_own_times
-
-t_otel_duplicate_start_is_ambiguous() {
-  # Two concurrent invocations of the SAME agent cannot be told apart: subagentStart carries no
-  # agent id. Extended to three starts, because a bare zero sentinel could not tell "nothing
-  # pending" from "ambiguous": the third start would see zero and record a fresh timestamp that a
-  # still-outstanding stop could then consume.
-  local sid cwd sink i
-  sid="$(new_session_id)"
-  set_todo_list "$sid" 1
-  cwd="$(session_cwd "$sid")"
-  sink="$(telemetry_dir "$sid")/spans.jsonl"
-  start_agent "$sid" tasking
-  start_agent "$sid" tasking
-  start_agent "$sid" tasking
-  assert_equal 0 "$(jq -r '.taskingStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'a third start must not record a fresh timestamp' || return 1
-  assert_equal 3 "$(jq -r '.taskingPending // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'all three starts must be counted as outstanding' || return 1
-
-  for i in 1 2 3; do
-    rm -f "$sink"
-    COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
-      hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
-        '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-tasking",
-          agentId:"a1", response:"x\n\nAUTODEV-VERDICT: DONE"}')" >/dev/null
-    assert_equal "$(span_field "$sink" startTimeUnixNano)" "$(span_field "$sink" endTimeUnixNano)" \
-      "stop $i must yield a zero-duration span while starts are outstanding" || return 1
-  done
-  assert_equal 0 "$(jq -r '.taskingPending // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'the outstanding count must drain back to zero' || return 1
-
-  start_agent "$sid" tasking
-  [ "$(jq -r '.taskingStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" != "0" ] ||
-    fail 'once drained, a fresh start must record a real timestamp again'
-}
-run_test 'overlapping starts stay ambiguous until they drain' t_otel_duplicate_start_is_ambiguous
-
 t_otel_missed_start_still_counts_the_invocation() {
   # A stop with no matching start (state deleted mid-run, or the hooks installed part way
   # through) is already recovered as attempt 1. The session total must be recovered too, or the
@@ -1623,6 +1538,43 @@ t_otel_missed_start_still_counts_the_invocation() {
     'the recovered invocation must also be counted against the session ceiling'
 }
 run_test 'a stop without its start still counts as an invocation' t_otel_missed_start_still_counts_the_invocation
+
+t_otel_parents_under_copilot_trace() {
+  # The payload carries no trace context today, but the emitter already consumes it, so the day
+  # the CLI starts supplying one these spans join Copilot's trace with no code change.
+  local sid cwd sink tp
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  tp='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+  start_agent "$sid" code-review
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" --arg tp "$tp" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", traceparent:$tp, response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal '4bf92f3577b34da6a3ce929d0e0e4736' "$(span_field "$sink" traceId)" \
+    'the span must join the trace id from traceparent' || return 1
+  assert_equal '00f067aa0ba902b7' "$(span_field "$sink" parentSpanId)" \
+    'the span must hang off the parent span id from traceparent'
+}
+run_test "a traceparent parents the span under Copilot's trace" t_otel_parents_under_copilot_trace
+
+t_otel_without_traceparent_is_a_root_span() {
+  local sid trace
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  start_agent "$sid" tasking
+  telemetry_round_stop_only "$sid" tasking DONE
+  trace="$(span_field "$TELEMETRY_SINK" traceId)"
+  printf '%s' "$trace" | grep -qE '^[0-9a-f]{32}$' || fail "bad traceId '$trace'" || return 1
+  assert_equal null "$(span_field "$TELEMETRY_SINK" parentSpanId)" \
+    'a span with no trace context must not claim a parent' || return 1
+  assert_equal "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
+    "$(span_field "$TELEMETRY_SINK" endTimeUnixNano)" \
+    'the span marks an instant, not a duration'
+}
+run_test 'no traceparent still emits a correlatable root span' t_otel_without_traceparent_is_a_root_span
 
 t_otel_headers_stay_out_of_argv() {
   # OTLP headers routinely carry a bearer token. argv is world readable on Linux through
@@ -1760,8 +1712,8 @@ t_otel_enforcement_unchanged() {
   state="$(cat "$(state_path "$sid")")"
   assert_equal DONE "$(printf '%s' "$state" | jq -r '.taskingVerdict')" || return 1
   assert_equal 2 "$(printf '%s' "$state" | jq -r '.milestoneCount')" 'the todo list must still be parsed' || return 1
-  assert_equal 0 "$(printf '%s' "$state" | jq -r '.taskingStartedAtMs')" \
-    'the start time must be cleared once the agent stops'
+  assert_equal DONE "$(printf '%s' "$state" | jq -r '.taskingVerdict')" \
+    'the verdict must still be recorded'
 }
 run_test 'enforcement still works with telemetry enabled' t_otel_enforcement_unchanged
 

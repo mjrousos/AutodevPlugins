@@ -180,6 +180,31 @@ function Get-LongField {
     return [long]0
 }
 
+function Get-TraceParent {
+    <#
+        Parses a W3C traceparent, returning $null unless it is well formed. When Copilot supplies
+        one, our span becomes a child of the sub-agent span the CLI already records, which is a
+        far better correlation than any attribute we could invent -- and it means the parent, not
+        us, is responsible for timing.
+
+        Format is version-traceid-parentid-flags. Later versions may append fields, so only the
+        first four are read and the rest ignored, per the specification.
+    #>
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    # The spec requires lowercase hex, but normalise rather than reject a non-compliant producer.
+    $parts = $Value.Trim().ToLowerInvariant() -split '-'
+    if ($parts.Count -lt 4) { return $null }
+    $version = $parts[0]
+    $traceId = $parts[1]
+    $spanId = $parts[2]
+    # 'ff' is reserved as invalid by the specification.
+    if ($version -notmatch '^[0-9a-f]{2}$' -or $version -eq 'ff') { return $null }
+    if ($traceId -notmatch '^[0-9a-f]{32}$' -or $traceId -match '^0+$') { return $null }
+    if ($spanId -notmatch '^[0-9a-f]{16}$' -or $spanId -match '^0+$') { return $null }
+    return @{ TraceId = $traceId; SpanId = $spanId }
+}
+
 function New-SpanDocument {
     param($Request)
 
@@ -192,12 +217,9 @@ function New-SpanDocument {
     $unitValue = Get-Field -Object $Request -Name 'unitValue'
     $plugin = Get-Field -Object $Request -Name 'plugin'
 
-    $endMs = Get-LongField -Object $Request -Name 'endTimeMs'
-    if ($endMs -le 0) { $endMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
-    $startMs = Get-LongField -Object $Request -Name 'startTimeMs'
-    # A missing or stale start time yields an honest zero-duration span rather than a fabricated
-    # or negative one.
-    if ($startMs -le 0 -or $startMs -gt $endMs) { $startMs = $endMs }
+    $timeMs = Get-LongField -Object $Request -Name 'timeMs'
+    # The hook payload carries its own timestamp; this is only for a malformed one.
+    if ($timeMs -le 0) { $timeMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 
     $attributes = @(
         (New-StringAttribute -Key 'gen_ai.conversation.id' -Value $sessionId),
@@ -218,7 +240,19 @@ function New-SpanDocument {
     $serviceName = (Get-Env 'OTEL_SERVICE_NAME').Trim()
     if ([string]::IsNullOrWhiteSpace($serviceName)) { $serviceName = 'github-copilot' }
 
-    $traceId = New-RandomHex -ByteCount 16
+    $parent = Get-TraceParent -Value (Get-Field -Object $Request -Name 'traceparent')
+    $parentSpanId = ''
+    $spanTraceState = ''
+    if ($null -ne $parent) {
+        # Join Copilot's trace directly.
+        $traceId = $parent.TraceId
+        $parentSpanId = $parent.SpanId
+        $spanTraceState = Get-Field -Object $Request -Name 'tracestate'
+    }
+    else {
+        # No usable context, so this span is its own root and correlates by session id instead.
+        $traceId = New-RandomHex -ByteCount 16
+    }
     $spanId = New-RandomHex -ByteCount 8
     if ([string]::IsNullOrWhiteSpace($traceId) -or [string]::IsNullOrWhiteSpace($spanId)) {
         return $null
@@ -227,16 +261,22 @@ function New-SpanDocument {
     $spanName = Get-Field -Object $Request -Name 'spanName'
     if ([string]::IsNullOrWhiteSpace($spanName)) { $spanName = 'autodev.subagent' }
 
+    # This span marks the instant a verdict was recorded, so it is deliberately zero length: the
+    # sub-agent's duration belongs to Copilot's own span, which measures it from inside the
+    # process rather than across two separate hook invocations.
+    $timeNano = ($timeMs * 1000000).ToString([Globalization.CultureInfo]::InvariantCulture)
     $span = @{
         traceId           = $traceId
         spanId            = $spanId
         name              = $spanName
         kind              = 1
-        startTimeUnixNano = ($startMs * 1000000).ToString([Globalization.CultureInfo]::InvariantCulture)
-        endTimeUnixNano   = ($endMs * 1000000).ToString([Globalization.CultureInfo]::InvariantCulture)
+        startTimeUnixNano = $timeNano
+        endTimeUnixNano   = $timeNano
         attributes        = $attributes
         status            = @{ code = 0 }
     }
+    if (-not [string]::IsNullOrWhiteSpace($parentSpanId)) { $span['parentSpanId'] = $parentSpanId }
+    if (-not [string]::IsNullOrWhiteSpace($spanTraceState)) { $span['traceState'] = $spanTraceState }
 
     return @{
         resourceSpans = @(

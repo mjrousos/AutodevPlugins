@@ -1354,94 +1354,6 @@ t_otel_raw_session_id() {
 }
 run_test "the exported session id is the raw one, not the filename-safe one" t_otel_raw_session_id
 
-t_otel_duration_from_state() {
-  # Asserts the exact value rather than merely a positive duration. A wall-clock comparison would
-  # be flaky whenever now_ms falls back to whole-second resolution and both hooks land in the
-  # same second, and it would not actually prove the recorded timestamp was the one used. Reading
-  # the value the state file holds between the two events and requiring the span to carry it is
-  # deterministic and tests the real claim: that the timestamp survives the state reader.
-  local sid recorded start end
-  sid="$(new_session_id)"
-  start_gate "$sid" architecture
-  recorded="$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
-  [ -n "$recorded" ] && [ "$recorded" != "0" ] ||
-    fail "subagentStart did not persist a start timestamp (got '$recorded')" || return 1
-  telemetry_round_stop_only "$sid" architecture ISSUES
-  start="$(span_field "$TELEMETRY_SINK" startTimeUnixNano)"
-  end="$(span_field "$TELEMETRY_SINK" endTimeUnixNano)"
-  assert_equal "${recorded}000000" "$start" 'the span must carry the recorded start time' || return 1
-  [ "$start" -le "$end" ] 2>/dev/null || fail "span starts after it ends ($start > $end)"
-}
-run_test "the span duration comes from the recorded start time" t_otel_duration_from_state
-
-t_otel_overlapping_starts_keep_own_times() {
-  # Regression test for overlapping reviewers. Gates are meant to run one at a time, but if two
-  # ever overlap, a single shared start slot would let the second start overwrite the first, and
-  # the first stop would then report a truncated duration and clear a timestamp belonging to the
-  # other reviewer. Each gate keeps its own slot, so both stops report their own start time.
-  local sid arch_start sec_start
-  sid="$(new_session_id)"
-  start_gate "$sid" architecture
-  start_gate "$sid" security
-  arch_start="$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
-  sec_start="$(jq -r '.securityStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)"
-  { [ "$arch_start" != "0" ] && [ "$sec_start" != "0" ]; } ||
-    fail "both gates must hold their own start time (architecture=$arch_start security=$sec_start)" ||
-    return 1
-
-  # The second gate stops first. It must use its own start time, not the first gate's.
-  telemetry_round_stop_only "$sid" security ISSUES
-  assert_equal "${sec_start}000000" "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
-    'the security span must carry the security start time' || return 1
-  # Stopping security must not disturb the architecture reviewer still running.
-  assert_equal "$arch_start" "$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'a concurrent gate stopping must not clear another gate start time' || return 1
-
-  rm -f "$TELEMETRY_SINK"
-  telemetry_round_stop_only "$sid" architecture ISSUES
-  assert_equal "${arch_start}000000" "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
-    'the architecture span must still carry its own start time'
-}
-run_test "overlapping gates each keep their own start time" t_otel_overlapping_starts_keep_own_times
-
-t_otel_duplicate_start_is_ambiguous() {
-  # Two concurrent reviewers for the SAME gate cannot be told apart: subagentStart carries no
-  # agent id, so there is no way to know which stop belongs to which start. Report an honest
-  # zero duration rather than hand one reviewer the other's start time.
-  #
-  # Extended to three starts, because a bare zero sentinel could not tell "nothing pending" from
-  # "ambiguous": the third start would see zero and record a fresh timestamp that a
-  # still-outstanding stop could then consume. The gate must stay ambiguous until every
-  # outstanding stop has drained, and only then record a real start time again.
-  local sid
-  sid="$(new_session_id)"
-  start_gate "$sid" architecture
-  start_gate "$sid" architecture
-  start_gate "$sid" architecture
-  assert_equal 0 "$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'a third start must not record a fresh timestamp' || return 1
-  assert_equal 3 "$(jq -r '.architecturePending // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'all three starts must be counted as outstanding' || return 1
-
-  # Every stop while starts remain outstanding must report zero duration.
-  local i
-  for i in 1 2 3; do
-    rm -f "$(telemetry_dir "$sid")/spans.jsonl"
-    telemetry_round_stop_only "$sid" architecture ISSUES
-    assert_equal "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
-      "$(span_field "$TELEMETRY_SINK" endTimeUnixNano)" \
-      "stop $i must yield a zero-duration span while starts are outstanding" || return 1
-  done
-  assert_equal 0 "$(jq -r '.architecturePending // 0' "$(state_path "$sid")" 2>/dev/null)" \
-    'the outstanding count must drain back to zero' || return 1
-
-  # Drained, so the next start is unambiguous again and records a real time.
-  start_gate "$sid" architecture
-  [ "$(jq -r '.architectureStartedAtMs // 0' "$(state_path "$sid")" 2>/dev/null)" != "0" ] ||
-    fail 'once drained, a fresh start must record a real timestamp again'
-}
-run_test "overlapping starts stay ambiguous until they drain" t_otel_duplicate_start_is_ambiguous
-
 t_otel_missed_start_still_counts_the_invocation() {
   # A stop with no matching start (state deleted mid-run, or the hooks installed part way
   # through) is already recovered as attempt 1. The session total must be recovered too, or the
@@ -1462,6 +1374,87 @@ t_otel_missed_start_still_counts_the_invocation() {
     'the recovered invocation must also be counted against the session ceiling'
 }
 run_test "a stop without its start still counts as an invocation" t_otel_missed_start_still_counts_the_invocation
+
+t_otel_parents_under_copilot_trace() {
+  # The payload carries no trace context today, but the emitter already consumes it, so the day
+  # the CLI starts supplying one these spans join Copilot's trace with no code change.
+  local sid cwd sink tp
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  tp='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+  start_gate "$sid" architecture
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" --arg tp "$tp" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+        agentId:"a1", traceparent:$tp, tracestate:"vendor=abc",
+        response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal '4bf92f3577b34da6a3ce929d0e0e4736' "$(span_field "$sink" traceId)" \
+    'the span must join the trace id from traceparent' || return 1
+  assert_equal '00f067aa0ba902b7' "$(span_field "$sink" parentSpanId)" \
+    'the span must hang off the parent span id from traceparent' || return 1
+  assert_equal 'vendor=abc' "$(span_field "$sink" traceState)" || return 1
+  # Its own span id must still be fresh, never the parent's.
+  local own
+  own="$(span_field "$sink" spanId)"
+  printf '%s' "$own" | grep -qE '^[0-9a-f]{16}$' || fail "bad spanId '$own'" || return 1
+  [ "$own" != "00f067aa0ba902b7" ] || fail 'the span reused the parent id as its own'
+}
+run_test "a traceparent parents the span under Copilot's trace" t_otel_parents_under_copilot_trace
+
+t_otel_without_traceparent_is_a_root_span() {
+  # Today's behaviour: no context, so the span is its own root and correlates by session id.
+  local sid trace
+  sid="$(new_session_id)"
+  start_gate "$sid" architecture
+  telemetry_round_stop_only "$sid" architecture ISSUES
+  trace="$(span_field "$TELEMETRY_SINK" traceId)"
+  printf '%s' "$trace" | grep -qE '^[0-9a-f]{32}$' || fail "bad traceId '$trace'" || return 1
+  assert_equal null "$(span_field "$TELEMETRY_SINK" parentSpanId)" \
+    'a span with no trace context must not claim a parent'
+}
+run_test "no traceparent still emits a correlatable root span" t_otel_without_traceparent_is_a_root_span
+
+t_otel_malformed_traceparent_is_ignored() {
+  # A malformed or reserved header must not produce an invalid parent reference; falling back to
+  # a root span keeps the export usable.
+  local sid cwd sink bad
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  for bad in \
+    'garbage' \
+    'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+    '00-00000000000000000000000000000000-00f067aa0ba902b7-01' \
+    '00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01' \
+    '00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01'; do
+    sink="$(telemetry_dir "$sid")/bad.jsonl"
+    rm -f "$sink"
+    COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+      hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" --arg tp "$bad" \
+        '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+          agentId:"a1", traceparent:$tp, response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+    assert_equal null "$(span_field "$sink" parentSpanId)" \
+      "traceparent '$bad' must be rejected rather than used" || return 1
+    assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" \
+      "the verdict must still be exported for '$bad'" || return 1
+  done
+}
+run_test "a malformed traceparent falls back to a root span" t_otel_malformed_traceparent_is_ignored
+
+t_otel_span_marks_the_verdict_instant() {
+  # The span is deliberately zero length: it marks when the verdict was recorded, and the
+  # sub-agent's duration belongs to Copilot's own span, which measures it in-process.
+  local sid start end
+  sid="$(new_session_id)"
+  start_gate "$sid" architecture
+  telemetry_round_stop_only "$sid" architecture ISSUES
+  start="$(span_field "$TELEMETRY_SINK" startTimeUnixNano)"
+  end="$(span_field "$TELEMETRY_SINK" endTimeUnixNano)"
+  assert_equal "$start" "$end" 'the span marks an instant, not a duration' || return 1
+  # And it comes from the payload's own timestamp rather than a second clock read.
+  printf '%s' "$start" | grep -qE '^[0-9]{16,}$' || fail "implausible span time '$start'"
+}
+run_test "the span marks the instant the verdict was recorded" t_otel_span_marks_the_verdict_instant
 
 t_otel_headers_stay_out_of_argv() {
   # OTLP headers routinely carry a bearer token. argv is world readable on Linux through
@@ -1652,8 +1645,8 @@ t_otel_enforcement_unchanged() {
   state="$(cat "$(state_path "$sid")")"
   assert_equal PASS "$(printf '%s' "$state" | jq -r '.architectureVerdict')" || return 1
   assert_equal 1 "$(printf '%s' "$state" | jq -r '.architectureAttempts')" || return 1
-  assert_equal 0 "$(printf '%s' "$state" | jq -r '.architectureStartedAtMs')" \
-    'the start time must be cleared once the gate stops'
+  assert_equal 1 "$(printf '%s' "$state" | jq -r '.architectureAttempts')" \
+    'the attempt must still be recorded'
 }
 run_test "enforcement still works with telemetry enabled" t_otel_enforcement_unchanged
 

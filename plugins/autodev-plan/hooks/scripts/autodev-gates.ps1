@@ -55,8 +55,9 @@ $script:MaxBlocks = 5
 $script:MaxTotalInvocations = 40
 # Hard ceiling on how long the telemetry child process may run before the parent kills it. Sits
 # well below the hook's own 20 second timeout so a hung collector can never cost the gate its
-# tracker footer.
-$script:OtelParentTimeoutMs = 6000
+# tracker footer, but high enough to absorb PowerShell process startup on a loaded machine --
+# at 6s, spans were silently dropped whenever several agents ran concurrently.
+$script:OtelParentTimeoutMs = 12000
 
 function Get-StateDirectory {
     # Enforcement state stays outside the workspace, keyed by session id. Two sessions running
@@ -119,18 +120,6 @@ function New-DefaultState {
     foreach ($gate in $script:GateOrder) {
         $state["${gate}Attempts"] = 0
         $state["${gate}Verdict"] = 'pending'
-        # When this gate's reviewer started, so subagentStop can give its telemetry span a real
-        # duration. One field PER GATE rather than a single global slot: gates are meant to run
-        # one at a time, but if two ever overlap a shared slot would let the second start
-        # overwrite the first, and the first stop would then report a truncated duration and
-        # clear a timestamp belonging to the other reviewer. Zero means "no usable start time",
-        # which yields an honest zero-duration span.
-        $state["${gate}StartedAtMs"] = [long]0
-        # How many starts for this gate have not yet been matched by a stop. Zero alone cannot
-        # distinguish "nothing pending" from "ambiguous", so a third overlapping start would
-        # record a fresh timestamp that a still-outstanding stop could then consume. The counter
-        # keeps the gate ambiguous until every outstanding stop has drained.
-        $state["${gate}Pending"] = 0
     }
     return $state
 }
@@ -158,10 +147,7 @@ function Read-State {
             if ($null -eq $ownerProp -or [string]$ownerProp.Value -ne $SessionId) { continue }
 
             $numericKeys = @('blocks', 'totalInvocations')
-            foreach ($gate in $script:GateOrder) {
-                $numericKeys += "${gate}Attempts"
-                $numericKeys += "${gate}Pending"
-            }
+            foreach ($gate in $script:GateOrder) { $numericKeys += "${gate}Attempts" }
             foreach ($key in $numericKeys) {
                 $prop = $parsed.PSObject.Properties[$key]
                 if ($null -eq $prop -or $null -eq $prop.Value) { continue }
@@ -192,30 +178,6 @@ function Read-State {
                 $prop = $parsed.PSObject.Properties[$key]
                 if ($null -ne $prop -and $null -ne $prop.Value) {
                     $state[$key] = [string]$prop.Value
-                }
-            }
-
-            # Telemetry bookkeeping. This reader copies an explicit allowlist, so a field that is
-            # written but not listed here is silently dropped before the next event can read it.
-            # An epoch-millisecond value does not fit the counter validation above, which caps at
-            # int32, so it is validated separately as a long.
-            foreach ($gate in $script:GateOrder) {
-                $key = "${gate}StartedAtMs"
-                $prop = $parsed.PSObject.Properties[$key]
-                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
-                $startedAt = [long]0
-                $renderedStart = [Convert]::ToString(
-                    $prop.Value,
-                    [Globalization.CultureInfo]::InvariantCulture)
-                if ($renderedStart -match '^[0-9]+$' -and
-                    [long]::TryParse($renderedStart, [ref]$startedAt) -and
-                    $startedAt -ge 0) {
-                    $state[$key] = $startedAt
-                }
-                else {
-                    # Corrupt timing is not worth failing enforcement over; drop it and let the
-                    # span fall back to zero duration.
-                    $state[$key] = [long]0
                 }
             }
             return $state
@@ -648,20 +610,6 @@ try {
             $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
             # Real progress was made, so forgive any earlier blocked stops.
             $state['blocks'] = 0
-            # Remember when this gate's reviewer started, so subagentStop can report a real
-            # duration. Recorded against this gate alone, so an overlapping reviewer cannot
-            # overwrite it. More than one start outstanding means concurrent reviewers whose
-            # stops cannot be told apart -- subagentStart carries no agent id -- so the gate
-            # stays ambiguous until every outstanding stop has drained, rather than a third
-            # start handing a still-running reviewer a fresh timestamp that is not its own.
-            $pending = [int]$state["${gate}Pending"] + 1
-            $state["${gate}Pending"] = $pending
-            if ($pending -gt 1) {
-                $state["${gate}StartedAtMs"] = [long]0
-            }
-            else {
-                $state["${gate}StartedAtMs"] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Gate $gate `
                 -Attempt ([int]$state["${gate}Attempts"]) -Action 'invoked' -Verdict '-'
@@ -682,26 +630,13 @@ try {
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             if ([int]$state["${gate}Attempts"] -lt 1) {
-                # subagentStart was missed somehow; still count this attempt.
+                # subagentStart was missed somehow; still count this attempt. The session total
+                # must be recovered too, or the ceiling would undercount real work and the span
+                # would export a total of zero for an invocation that demonstrably completed.
                 $state["${gate}Attempts"] = 1
-            }
-            $state["${gate}Verdict"] = $verdict
-            # Consume this gate's own start time and clear only that one, so a reviewer running
-            # concurrently for a different gate keeps its own. Zero means none was usable, which
-            # yields an honest zero-duration span rather than a fabricated one. The timestamp is
-            # always cleared: while any start is still outstanding the gate remains ambiguous.
-            $startedAtMs = [long]$state["${gate}StartedAtMs"]
-            $state["${gate}StartedAtMs"] = [long]0
-            if ([int]$state["${gate}Pending"] -gt 0) {
-                $state["${gate}Pending"] = [int]$state["${gate}Pending"] - 1
-            }
-            else {
-                # A stop with no outstanding start means subagentStart never ran for this
-                # reviewer, so the invocation was never counted. Count it now: otherwise the span
-                # would export a session total of zero for an invocation that demonstrably
-                # completed, and the session ceiling would silently undercount real work.
                 $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
             }
+            $state["${gate}Verdict"] = $verdict
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = [int]$state["${gate}Attempts"]
@@ -767,8 +702,11 @@ try {
                 verdict          = $verdict
                 attempt          = $attempt
                 totalInvocations = [int]$state['totalInvocations']
-                startTimeMs      = $startedAtMs
-                endTimeMs        = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                timeMs           = [long]$payload.timestamp
+                # Absent today, but forwarded so the span parents itself under Copilot's own
+                # sub-agent span the moment the CLI starts supplying trace context.
+                traceparent      = [string]$payload.traceparent
+                tracestate       = [string]$payload.tracestate
             }
             Write-JsonResult @{ modifiedResponse = ($response + [Environment]::NewLine + $footer) }
             exit 0

@@ -1428,79 +1428,34 @@ Test-Case 'the exported session id is the raw one, not the filename-safe one' {
     Assert-Equal $rawSession (Get-SpanAttribute $doc 'github.copilot.session.id')
 }
 
-Test-Case 'the span duration comes from the recorded start time' {
+Test-Case 'a traceparent parents the span under Copilot''s trace' {
+    # The payload carries no trace context today, but the emitter already consumes it, so the day
+    # the CLI starts supplying one these spans join Copilot's trace with no code change.
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-implement:autodev-code-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $sid; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId   = $sid; agentName = $agentName; agentId = 'a1'
+        traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+        response    = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal '4bf92f3577b34da6a3ce929d0e0e4736' $span.traceId 'the span must join the trace id from traceparent'
+    Assert-Equal '00f067aa0ba902b7' $span.parentSpanId 'the span must hang off the parent span id'
+}
+
+Test-Case 'no traceparent still emits a correlatable root span' {
     $sid = New-SessionId
     Set-TodoList -SessionId $sid -Milestones 1
     $result = Invoke-TelemetryRound -SessionId $sid
     $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
-    $durationMs = ([long]$span.endTimeUnixNano - [long]$span.startTimeUnixNano) / 1000000
-    # subagentStart runs a whole process before subagentStop does, so a start time that survived
-    # the state file always yields a positive duration. Zero would mean the state reader dropped
-    # it, which is exactly the regression this guards.
-    if ($durationMs -le 0) { throw "expected a positive span duration but got ${durationMs}ms" }
-}
-
-Test-Case 'overlapping sub-agents each keep their own start time' {
-    # A single shared start slot would let the second sub-agent's start overwrite the first, and
-    # the first stop would then report a truncated duration and clear a timestamp belonging to
-    # the other agent. Each agent keeps its own slot.
-    $sid = New-SessionId
-    Set-TodoList -SessionId $sid -Milestones 1
-    Start-Agent -SessionId $sid -Agent 'tasking'
-    Start-Agent -SessionId $sid -Agent 'code-review'
-    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
-    $taskStart = [long]$state.taskingStartedAtMs
-    $reviewStart = [long]$state.codereviewStartedAtMs
-    if ($taskStart -eq 0 -or $reviewStart -eq 0) {
-        throw "both agents must hold their own start time (tasking=$taskStart review=$reviewStart)"
-    }
-
-    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
-    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
-    Invoke-HookWithEnv 'subagentStop' @{
-        sessionId = $sid; agentName = 'autodev-implement:autodev-code-review'; agentId = 'a1'
-        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
-    } $vars | Out-Null
-    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
-    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal ($reviewStart * 1000000) $span.startTimeUnixNano 'the review span must carry the review start time'
-    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
-    Assert-Equal $taskStart ([long]$state.taskingStartedAtMs) 'a concurrent agent stopping must not clear another start time'
-}
-
-Test-Case 'overlapping starts stay ambiguous until they drain' {
-    # Extended to three starts, because a bare zero sentinel could not tell "nothing pending"
-    # from "ambiguous": the third start would see zero and record a fresh timestamp that a
-    # still-outstanding stop could then consume.
-    $sid = New-SessionId
-    Set-TodoList -SessionId $sid -Milestones 1
-    Start-Agent -SessionId $sid -Agent 'tasking'
-    Start-Agent -SessionId $sid -Agent 'tasking'
-    Start-Agent -SessionId $sid -Agent 'tasking'
-    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
-    Assert-Equal 0 ([long]$state.taskingStartedAtMs) 'a third start must not record a fresh timestamp'
-    Assert-Equal 3 ([int]$state.taskingPending) 'all three starts must be counted as outstanding'
-
-    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
-    foreach ($i in 1, 2, 3) {
-        Remove-Item -LiteralPath $sink -Force -ErrorAction SilentlyContinue
-        Invoke-HookWithEnv 'subagentStop' @{
-            sessionId = $sid; agentName = 'autodev-implement:autodev-tasking'; agentId = 'a1'
-            response  = "x`n`nAUTODEV-VERDICT: DONE"
-        } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
-        $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
-        $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
-        Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano `
-            "stop $i must yield a zero-duration span while starts are outstanding"
-    }
-    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
-    Assert-Equal 0 ([int]$state.taskingPending) 'the outstanding count must drain back to zero'
-
-    Start-Agent -SessionId $sid -Agent 'tasking'
-    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
-    if ([long]$state.taskingStartedAtMs -eq 0) {
-        throw 'once drained, a fresh start must record a real timestamp again'
-    }
+    Assert-Match '^[0-9a-f]{32}$' $span.traceId
+    if ($null -ne $span.parentSpanId) { throw 'a span with no trace context must not claim a parent' }
+    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'the span marks an instant, not a duration'
 }
 
 Test-Case 'a stop without its start still counts as an invocation' {
@@ -1634,7 +1589,7 @@ Test-Case 'enforcement still works with telemetry enabled' {
     $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
     Assert-Equal 'DONE' $state.taskingVerdict
     Assert-Equal 2 $state.milestoneCount 'the todo list must still be parsed'
-    Assert-Equal 0 $state.taskingStartedAtMs 'the start time must be cleared once the agent stops'
+    Assert-Equal 'DONE' $state.taskingVerdict 'the verdict must still be recorded'
 }
 
 Test-Case 'the emitter ships beside the stage script' {

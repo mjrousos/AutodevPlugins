@@ -59,6 +59,17 @@ TOTAL_INVOCATIONS_PER_MILESTONE=30
 
 json_get() { printf '%s' "$RAW_INPUT" | jq -r "$1 // \"\"" 2>/dev/null; }
 
+# Numeric payload field, defaulting to 0. Kept separate from json_get because --argjson rejects
+# an empty string, which would abort the whole span document.
+json_get_num() {
+  local v
+  v="$(printf '%s' "$RAW_INPUT" | jq -r "$1 // 0" 2>/dev/null)"
+  case "$v" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
 SESSION_ID="$(json_get '.sessionId')"
 SESSION_CWD="$(json_get '.cwd')"
 
@@ -101,26 +112,8 @@ default_state() {
     fixInvocations: 0, userReviewReached: 0,
     securityAttempts: 0, securityVerdict: "pending",
     privacyAttempts: 0, privacyVerdict: "pending",
-    cappedMilestones: "",
-    taskingStartedAtMs: 0, implementationStartedAtMs: 0, codereviewStartedAtMs: 0,
-    codefixStartedAtMs: 0, codesecurityreviewStartedAtMs: 0, codeprivacyreviewStartedAtMs: 0,
-    taskingPending: 0, implementationPending: 0, codereviewPending: 0,
-    codefixPending: 0, codesecurityreviewPending: 0, codeprivacyreviewPending: 0
+    cappedMilestones: ""
   }'
-}
-
-# Telemetry start-time field for an agent. One field PER AGENT rather than a single global slot,
-# so an overlapping sub-agent cannot overwrite another's start time. The agent names contain
-# hyphens, which the key strips.
-started_at_key() { # agent
-  printf '%sStartedAtMs' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9')"
-}
-
-# Outstanding starts for an agent. Zero alone cannot distinguish "nothing pending" from
-# "ambiguous", so a third overlapping start would record a fresh timestamp that a
-# still-outstanding stop could then consume.
-pending_key() { # agent
-  printf '%sPending' "$(printf '%s' "$1" | tr -cd 'A-Za-z0-9')"
 }
 
 read_state_file() {
@@ -145,13 +138,6 @@ read_state_file() {
           and test("^[0-9]+$")
           and (tonumber <= 2147483647));
     def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
-    # Telemetry bookkeeping. An epoch-millisecond value does not fit nonnegint, which caps at
-    # int32 to match the counter validation, so it is checked separately.
-    def millis_ok($key):
-      (has($key) | not)
-      or (.[$key] | (type == "number" and . >= 0 and floor == .)
-                    or (type == "string" and test("^[0-9]+$")));
-    def string_ok($key): (has($key) | not) or (.[$key] | type == "string");
     def worker_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
@@ -177,18 +163,6 @@ read_state_file() {
     and review_ok("reviewVerdict")
     and review_ok("securityVerdict")
     and review_ok("privacyVerdict")
-    and millis_ok("taskingStartedAtMs")
-    and millis_ok("implementationStartedAtMs")
-    and millis_ok("codereviewStartedAtMs")
-    and millis_ok("codefixStartedAtMs")
-    and millis_ok("codesecurityreviewStartedAtMs")
-    and millis_ok("codeprivacyreviewStartedAtMs")
-    and counter_ok("taskingPending")
-    and counter_ok("implementationPending")
-    and counter_ok("codereviewPending")
-    and counter_ok("codefixPending")
-    and counter_ok("codesecurityreviewPending")
-    and counter_ok("codeprivacyreviewPending")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
   jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
@@ -283,26 +257,18 @@ send_otel_span() {
   return 0
 }
 
-now_ms() {
-  # Millisecond resolution wherever it is available. GNU date supports %3N; BSD date on macOS
-  # does not and passes the specifier through literally, which the digit check rejects. Perl
-  # ships with macOS and covers that case. The whole-second fallback is correct but coarse
-  # enough that a sub-agent finishing inside one second would report a zero-duration span.
-  local ms secs
-  ms="$(date -u +%s%3N 2>/dev/null)" || ms=""
-  case "$ms" in '' | *[!0-9]*) ms="" ;; esac
-  if [ -z "$ms" ] && command -v perl >/dev/null 2>&1; then
-    ms="$(perl -MTime::HiRes=time -e 'printf "%.0f", time * 1000' 2>/dev/null)" || ms=""
-    case "$ms" in '' | *[!0-9]*) ms="" ;; esac
-  fi
-  if [ -z "$ms" ]; then
-    secs="$(date -u +%s 2>/dev/null)" || secs=""
-    case "$secs" in
-      '' | *[!0-9]*) ms="0" ;;
-      *) ms="${secs}000" ;;
-    esac
-  fi
-  printf '%s' "$ms"
+
+# The state counter each agent charges its attempts against.
+attempts_key() { # agent
+  case "$1" in
+    tasking) printf 'taskingAttempts' ;;
+    implementation) printf 'implementAttempts' ;;
+    code-review) printf 'reviewAttempts' ;;
+    code-fix) printf 'fixInvocations' ;;
+    code-security-review) printf 'securityAttempts' ;;
+    code-privacy-review) printf 'privacyAttempts' ;;
+    *) printf '' ;;
+  esac
 }
 
 add_audit_row() {
@@ -873,23 +839,6 @@ case "$EVENT_NAME" in
     STATE="$(printf '%s' "$STATE" | jq \
       --argjson t "$(( $(state_num "$STATE" 'totalInvocations') + 1 ))" \
       '.totalInvocations = $t | .blocks = 0')"
-    # Remember when this agent started, so subagentStop can report a real duration. Recorded
-    # against this agent alone, so an overlapping sub-agent cannot overwrite it. More than one
-    # start outstanding means concurrent invocations whose stops cannot be told apart --
-    # subagentStart carries no agent id -- so the agent stays ambiguous until every outstanding
-    # stop has drained, rather than a third start handing a still-running invocation a fresh
-    # timestamp that is not its own.
-    STARTED_AT_KEY="$(started_at_key "$AGENT")"
-    PENDING_KEY="$(pending_key "$AGENT")"
-    AGENT_PENDING=$(( $(state_num "$STATE" "$PENDING_KEY") + 1 ))
-    if [ "$AGENT_PENDING" -gt 1 ]; then
-      AGENT_START_MS=0
-    else
-      AGENT_START_MS="$(now_ms)"
-    fi
-    STATE="$(printf '%s' "$STATE" | jq --arg k "$STARTED_AT_KEY" --argjson ms "$AGENT_START_MS" \
-      --arg pk "$PENDING_KEY" --argjson p "$AGENT_PENDING" \
-      '.[$k] = $ms | .[$pk] = $p')"
     write_state "$STATE"
     add_audit_row "$AGENT" "$MILESTONE_LABEL" "$ATTEMPT" "invoked" "-"
     emit_empty
@@ -908,9 +857,15 @@ case "$EVENT_NAME" in
 
     MILESTONE_LABEL='-'
     EXTRA_NOTES=''
-    # Consume this agent's own start time; it is cleared further below, after the stage handlers
-    # have run. Zero means none was usable, which yields an honest zero-duration span.
-    STARTED_AT_MS="$(state_num "$STATE" "$(started_at_key "$AGENT")")"
+    # An attempt counter still at zero means subagentStart never ran for this sub-agent. Each
+    # branch below recovers the attempt itself; the session total has to be recovered too, or the
+    # ceiling would undercount real work and the span would export a total of zero for an
+    # invocation that demonstrably completed.
+    ATTEMPTS_KEY="$(attempts_key "$AGENT")"
+    if [ -n "$ATTEMPTS_KEY" ] && [ "$(state_num "$STATE" "$ATTEMPTS_KEY")" -lt 1 ] 2>/dev/null; then
+      STATE="$(printf '%s' "$STATE" | jq \
+        --argjson t "$(( $(state_num "$STATE" 'totalInvocations') + 1 ))" '.totalInvocations = $t')"
+    fi
     add_note() { if [ -z "$EXTRA_NOTES" ]; then EXTRA_NOTES="$1"; else EXTRA_NOTES="$EXTRA_NOTES
 $1"; fi; }
 
@@ -993,22 +948,6 @@ $1"; fi; }
     CLOSED_MILESTONE="$(state_num "$STATE" 'currentMilestone')"
     advance_milestone
     ADVANCED="$ADVANCE_REASON"
-    # Clear only this agent's start time, so a sub-agent running concurrently keeps its own, and
-    # drain one outstanding start. While any start remains outstanding the agent stays ambiguous.
-    AGENT_PENDING="$(state_num "$STATE" "$(pending_key "$AGENT")")"
-    TOTAL_INVOCATIONS="$(state_num "$STATE" 'totalInvocations')"
-    if [ "$AGENT_PENDING" -gt 0 ] 2>/dev/null; then
-      AGENT_PENDING=$(( AGENT_PENDING - 1 ))
-    else
-      # A stop with no outstanding start means subagentStart never ran for this sub-agent, so the
-      # invocation was never counted. Count it now: otherwise the span would export a session
-      # total of zero for an invocation that demonstrably completed.
-      TOTAL_INVOCATIONS=$(( TOTAL_INVOCATIONS + 1 ))
-    fi
-    STATE="$(printf '%s' "$STATE" | jq --arg k "$(started_at_key "$AGENT")" \
-      --arg pk "$(pending_key "$AGENT")" --argjson p "$AGENT_PENDING" \
-      --argjson t "$TOTAL_INVOCATIONS" \
-      '.[$k] = 0 | .[$pk] = $p | .totalInvocations = $t')"
     write_state "$STATE"
 
     add_audit_row "$AGENT" "$MILESTONE_LABEL" "$ATTEMPT" "completed" "$VERDICT"
@@ -1057,12 +996,13 @@ Feedback log: $FEEDBACK_PATH"
       --arg verdict "$VERDICT" \
       --argjson attempt "$ATTEMPT" \
       --argjson total "$(state_num "$STATE" 'totalInvocations')" \
-      --argjson startMs "$STARTED_AT_MS" \
-      --argjson endMs "$(now_ms)" \
+      --argjson timeMs "$(json_get_num '.timestamp')" \
+      --arg traceparent "$(json_get '.traceparent')" \
+      --arg tracestate "$(json_get '.tracestate')" \
       '{spanName: $span, sessionId: $sid, agentName: $agentName, agentId: $agentId,
         plugin: "autodev-implement", unitKey: "autodev.stage", unitValue: $unitValue,
         verdict: $verdict, attempt: $attempt, totalInvocations: $total,
-        startTimeMs: $startMs, endTimeMs: $endMs}' 2>/dev/null)" || :
+        timeMs: $timeMs, traceparent: $traceparent, tracestate: $tracestate}' 2>/dev/null)" || :
 
     jq -cn --arg r "$RESPONSE
 $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty

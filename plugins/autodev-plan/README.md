@@ -267,7 +267,9 @@ with Copilot's. It exports only when **both** are set:
 
 ### What is emitted
 
-One span per `subagentStop`, named `autodev.gate <gate>`, covering the reviewer's real runtime.
+One span per `subagentStop`, named `autodev.gate <gate>`. The span marks the instant the verdict
+was recorded rather than spanning the review: the reviewer's duration belongs to Copilot's own
+sub-agent span, which measures it in-process.
 
 | Attribute | Value |
 | --- | --- |
@@ -313,10 +315,18 @@ enabling telemetry part way through a session produces correct durations immedia
 
 ### Correlating with Copilot's own traces
 
-Hook payloads carry no W3C trace context, so these spans **cannot** be children of Copilot's
-spans; each is its own root trace. They are correlated by attribute instead: Copilot records its
-session id as `gen_ai.conversation.id`, and the emitter exports the same raw value, so joining on
-it in your backend is exact rather than manual.
+The emitter reads `traceparent` (and `tracestate`) from the hook payload. When present, the span
+is emitted as a **child of Copilot's own sub-agent span**: it adopts that trace id, sets
+`parentSpanId`, and the verdict shows up directly on the sub-agent's trace.
+
+Copilot CLI does not supply trace context to command hooks yet. Until it does, each span is its
+own root trace and correlates by attribute instead: Copilot records its session id as
+`gen_ai.conversation.id`, and the emitter exports the same raw value, so joining on it in your
+backend is exact rather than manual. Nothing needs to change in this plugin when the CLI starts
+sending the header — the spans simply start arriving parented.
+
+A malformed, reserved (`ff`), or all-zero `traceparent` is ignored rather than trusted, and the
+span falls back to a root.
 
 ### Reliability
 

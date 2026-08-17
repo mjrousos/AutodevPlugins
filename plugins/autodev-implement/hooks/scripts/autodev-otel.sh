@@ -148,6 +148,38 @@ digits_or_zero() {
   esac
 }
 
+hex_only() { printf '%s' "${1:-}" | tr -cd '0-9a-f'; }
+
+# Parses a W3C traceparent into TRACE_PARENT_TRACE_ID / TRACE_PARENT_SPAN_ID, leaving both empty
+# unless the header is well formed. When Copilot supplies one, our span becomes a child of the
+# sub-agent span the CLI already records, which is a far better correlation than any attribute we
+# could invent -- and it means the parent, not us, is responsible for timing.
+#
+# Format is version-traceid-parentid-flags. Later versions may append fields, so only the first
+# four are read and the rest ignored, per the specification.
+parse_traceparent() {
+  TRACE_PARENT_TRACE_ID=''
+  TRACE_PARENT_SPAN_ID=''
+  local raw="${1:-}" version tid pid
+  [ -n "$raw" ] || return 0
+  # The spec requires lowercase hex, but normalise rather than reject a non-compliant producer.
+  raw="$(printf '%s' "$raw" | tr 'A-Z' 'a-z')"
+  IFS='-' read -r version tid pid _ <<EOF
+$raw
+EOF
+  # 'ff' is reserved as invalid by the specification.
+  [ "${#version}" -eq 2 ] && [ "$(hex_only "$version")" = "$version" ] || return 0
+  [ "$version" != "ff" ] || return 0
+  [ "${#tid}" -eq 32 ] && [ "$(hex_only "$tid")" = "$tid" ] || return 0
+  [ "${#pid}" -eq 16 ] && [ "$(hex_only "$pid")" = "$pid" ] || return 0
+  # An all-zero id is invalid and must not be treated as a usable parent.
+  case "$tid" in *[!0]*) ;; *) return 0 ;; esac
+  case "$pid" in *[!0]*) ;; *) return 0 ;; esac
+  TRACE_PARENT_TRACE_ID="$tid"
+  TRACE_PARENT_SPAN_ID="$pid"
+  return 0
+}
+
 curl_config_escape() {
   # curl's config file parser understands backslash escapes inside a quoted value, so both the
   # backslash and the quote have to be escaped or a crafted header value could terminate the
@@ -196,12 +228,12 @@ main() {
     fields[${#fields[@]}]="$line"
   done < <(printf '%s' "$request" | jq -r '
       [ .spanName, .sessionId, .agentName, .agentId, .plugin, .unitKey, .unitValue, .verdict,
-        .attempt, .totalInvocations, .startTimeMs, .endTimeMs ]
+        .attempt, .totalInvocations, .timeMs, .traceparent, .tracestate ]
       | map(if . == null then "" else (. | tostring) end)
       | .[]' 2>/dev/null | tr -d '\r')
 
   local span_name session_id agent_name agent_id plugin unit_key unit_value verdict
-  local attempt total start_ms end_ms
+  local attempt total time_ms traceparent tracestate
   span_name="${fields[0]:-}"
   session_id="${fields[1]:-}"
   agent_name="${fields[2]:-}"
@@ -212,8 +244,9 @@ main() {
   verdict="${fields[7]:-}"
   attempt="${fields[8]:-}"
   total="${fields[9]:-}"
-  start_ms="${fields[10]:-}"
-  end_ms="${fields[11]:-}"
+  time_ms="${fields[10]:-}"
+  traceparent="${fields[11]:-}"
+  tracestate="${fields[12]:-}"
 
   # A key must never be empty or the attribute would be unusable, and never attacker-chosen.
   case "$unit_key" in
@@ -224,32 +257,38 @@ main() {
 
   attempt="$(digits_or_zero "$attempt")"
   total="$(digits_or_zero "$total")"
-  end_ms="$(digits_or_zero "$end_ms")"
-  start_ms="$(digits_or_zero "$start_ms")"
-  if [ "$end_ms" = "0" ]; then
-    end_ms="$(date -u +%s 2>/dev/null)000"
-    end_ms="$(digits_or_zero "$end_ms")"
+  time_ms="$(digits_or_zero "$time_ms")"
+  if [ "$time_ms" = "0" ]; then
+    # The hook payload carries its own timestamp; this is only for a malformed one.
+    time_ms="$(date -u +%s 2>/dev/null)000"
+    time_ms="$(digits_or_zero "$time_ms")"
   fi
-  # A missing or stale start time yields an honest zero-duration span rather than a fabricated
-  # or negative one. Compared as strings of equal length only when lengths match, so a longer
-  # (larger) start value is also caught.
-  if [ "$start_ms" = "0" ] ||
-    [ "${#start_ms}" -gt "${#end_ms}" ] ||
-    { [ "${#start_ms}" -eq "${#end_ms}" ] && [ "$start_ms" \> "$end_ms" ]; }; then
-    start_ms="$end_ms"
-  fi
+  # This span marks the instant a verdict was recorded, so it is deliberately zero length: the
+  # sub-agent's duration belongs to Copilot's own span, which measures it from inside the process.
   # Concatenating '000000' converts milliseconds to nanoseconds without 64-bit shell arithmetic,
   # and keeps the value a decimal string, which is how OTLP/JSON encodes every int64.
-  local start_ns="${start_ms}000000" end_ns="${end_ms}000000"
+  local time_ns="${time_ms}000000"
 
   local issues=0 blocked=0
   [ "$verdict" = "ISSUES" ] && issues=1
   [ "$verdict" = "BLOCKED" ] && blocked=1
 
-  local service_name trace_id span_id
+  local service_name trace_id span_id parent_span_id span_trace_state
   service_name="$(trim "${OTEL_SERVICE_NAME:-}")"
   [ -n "$service_name" ] || service_name='github-copilot'
-  trace_id="$(random_hex 16)" || die_ok
+
+  parse_traceparent "$traceparent"
+  if [ -n "$TRACE_PARENT_TRACE_ID" ]; then
+    # Join Copilot's trace directly.
+    trace_id="$TRACE_PARENT_TRACE_ID"
+    parent_span_id="$TRACE_PARENT_SPAN_ID"
+    span_trace_state="$tracestate"
+  else
+    # No usable context, so this span is its own root and correlates by session id instead.
+    trace_id="$(random_hex 16)" || die_ok
+    parent_span_id=''
+    span_trace_state=''
+  fi
   span_id="$(random_hex 8)" || die_ok
 
   local document
@@ -257,9 +296,10 @@ main() {
     --arg service "$service_name" \
     --arg traceId "$trace_id" \
     --arg spanId "$span_id" \
+    --arg parentSpanId "$parent_span_id" \
+    --arg traceState "$span_trace_state" \
     --arg name "$span_name" \
-    --arg startNs "$start_ns" \
-    --arg endNs "$end_ns" \
+    --arg timeNs "$time_ns" \
     --arg sessionId "$session_id" \
     --arg agentName "$agent_name" \
     --arg agentId "$agent_id" \
@@ -278,28 +318,32 @@ main() {
         },
         scopeSpans: [{
           scope: { name: "autodev-plugins" },
-          spans: [{
-            traceId: $traceId,
-            spanId: $spanId,
-            name: $name,
-            kind: 1,
-            startTimeUnixNano: $startNs,
-            endTimeUnixNano: $endNs,
-            attributes: [
-              { key: "gen_ai.conversation.id",    value: { stringValue: $sessionId } },
-              { key: "github.copilot.session.id", value: { stringValue: $sessionId } },
-              { key: "github.copilot.agent.name", value: { stringValue: $agentName } },
-              { key: "github.copilot.agent.id",   value: { stringValue: $agentId } },
-              { key: "autodev.plugin",            value: { stringValue: $plugin } },
-              { key: $unitKey,                    value: { stringValue: $unitValue } },
-              { key: "autodev.verdict",           value: { stringValue: $verdict } },
-              { key: "autodev.issues",            value: { intValue: $issues } },
-              { key: "autodev.blocked",           value: { intValue: $blocked } },
-              { key: "autodev.attempt",           value: { intValue: $attempt } },
-              { key: "autodev.total_invocations", value: { intValue: $total } }
-            ],
-            status: { code: 0 }
-          }]
+          spans: [
+            ({
+              traceId: $traceId,
+              spanId: $spanId,
+              name: $name,
+              kind: 1,
+              startTimeUnixNano: $timeNs,
+              endTimeUnixNano: $timeNs,
+              attributes: [
+                { key: "gen_ai.conversation.id",    value: { stringValue: $sessionId } },
+                { key: "github.copilot.session.id", value: { stringValue: $sessionId } },
+                { key: "github.copilot.agent.name", value: { stringValue: $agentName } },
+                { key: "github.copilot.agent.id",   value: { stringValue: $agentId } },
+                { key: "autodev.plugin",            value: { stringValue: $plugin } },
+                { key: $unitKey,                    value: { stringValue: $unitValue } },
+                { key: "autodev.verdict",           value: { stringValue: $verdict } },
+                { key: "autodev.issues",            value: { intValue: $issues } },
+                { key: "autodev.blocked",           value: { intValue: $blocked } },
+                { key: "autodev.attempt",           value: { intValue: $attempt } },
+                { key: "autodev.total_invocations", value: { intValue: $total } }
+              ],
+              status: { code: 0 }
+            }
+            + (if $parentSpanId == "" then {} else { parentSpanId: $parentSpanId } end)
+            + (if $traceState == "" then {} else { traceState: $traceState } end))
+          ]
         }]
       }]
     }' 2>/dev/null)" || die_ok

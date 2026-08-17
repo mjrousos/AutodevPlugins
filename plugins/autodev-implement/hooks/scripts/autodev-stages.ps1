@@ -129,36 +129,11 @@ $script:NumericKeys = @(
     'milestoneCount', 'currentMilestone', 'completedMilestones',
     'implementAttempts', 'reviewAttempts', 'fixInvocations',
     'userReviewReached',
-    'securityAttempts', 'privacyAttempts',
-    # Outstanding starts per agent. Zero alone cannot distinguish "nothing pending" from
-    # "ambiguous", so a third overlapping start would record a fresh timestamp that a
-    # still-outstanding stop could then consume. The counter keeps the agent ambiguous until
-    # every outstanding stop has drained.
-    'taskingPending', 'implementationPending', 'codereviewPending',
-    'codefixPending', 'codesecurityreviewPending', 'codeprivacyreviewPending'
+    'securityAttempts', 'privacyAttempts'
 )
 # Verdict keys and the vocabulary each one accepts. 'pending' and 'running' are shared.
 $script:WorkerVerdictKeys = @('taskingVerdict', 'implementVerdict')
 $script:ReviewVerdictKeys = @('reviewVerdict', 'securityVerdict', 'privacyVerdict')
-# Per-agent telemetry start times, so subagentStop can give its span a real duration. One field
-# PER AGENT rather than a single global slot: a shared slot would let a second sub-agent's start
-# overwrite the first, and the first stop would then report a truncated duration and clear a
-# timestamp belonging to the other agent. Zero means "no usable start time", which yields an
-# honest zero-duration span. The agent names contain hyphens, so the field key strips them.
-$script:StartedAtKeys = @(
-    'taskingStartedAtMs', 'implementationStartedAtMs', 'codereviewStartedAtMs',
-    'codefixStartedAtMs', 'codesecurityreviewStartedAtMs', 'codeprivacyreviewStartedAtMs'
-)
-
-function Get-StartedAtKey {
-    param([string]$Agent)
-    return (($Agent -replace '[^A-Za-z0-9]', '') + 'StartedAtMs')
-}
-
-function Get-PendingKey {
-    param([string]$Agent)
-    return (($Agent -replace '[^A-Za-z0-9]', '') + 'Pending')
-}
 
 function New-DefaultState {
     param([string]$SessionId)
@@ -171,7 +146,6 @@ function New-DefaultState {
     foreach ($key in $script:NumericKeys) { $state[$key] = 0 }
     foreach ($key in $script:WorkerVerdictKeys) { $state[$key] = 'pending' }
     foreach ($key in $script:ReviewVerdictKeys) { $state[$key] = 'pending' }
-    foreach ($key in $script:StartedAtKeys) { $state[$key] = [long]0 }
     return $state
 }
 
@@ -236,29 +210,6 @@ function Read-State {
                 $prop = $parsed.PSObject.Properties[$key]
                 if ($null -ne $prop -and $null -ne $prop.Value) {
                     $state[$key] = [string]$prop.Value
-                }
-            }
-
-            # Telemetry bookkeeping. This reader copies an explicit allowlist, so a field that is
-            # written but not listed here is silently dropped before the next event can read it.
-            # An epoch-millisecond value does not fit the counter validation above, which caps at
-            # int32, so it is validated separately as a long.
-            foreach ($key in $script:StartedAtKeys) {
-                $prop = $parsed.PSObject.Properties[$key]
-                if ($null -eq $prop -or $null -eq $prop.Value) { continue }
-                $startedAt = [long]0
-                $renderedStart = [Convert]::ToString(
-                    $prop.Value,
-                    [Globalization.CultureInfo]::InvariantCulture)
-                if ($renderedStart -match '^[0-9]+$' -and
-                    [long]::TryParse($renderedStart, [ref]$startedAt) -and
-                    $startedAt -ge 0) {
-                    $state[$key] = $startedAt
-                }
-                else {
-                    # Corrupt timing is not worth failing enforcement over; drop it and let the
-                    # span fall back to zero duration.
-                    $state[$key] = [long]0
                 }
             }
             return $state
@@ -461,6 +412,20 @@ function Get-AgentKind {
     param([string]$Agent)
     if ($Agent -in @('code-review', 'code-security-review', 'code-privacy-review')) { return 'review' }
     return 'worker'
+}
+
+function Get-AttemptsKey {
+    # The state counter each agent charges its attempts against.
+    param([string]$Agent)
+    switch ($Agent) {
+        'tasking' { return 'taskingAttempts' }
+        'implementation' { return 'implementAttempts' }
+        'code-review' { return 'reviewAttempts' }
+        'code-fix' { return 'fixInvocations' }
+        'code-security-review' { return 'securityAttempts' }
+        'code-privacy-review' { return 'privacyAttempts' }
+    }
+    return ''
 }
 
 function Get-TaskAgentType {
@@ -823,9 +788,10 @@ function Write-JsonResult {
 }
 
 # Hard ceiling on how long the telemetry child process may run before the parent kills it. Sits
-# well below the hook's own 20 second timeout so a hung collector can never cost the stage its
-# tracker footer.
-$script:OtelParentTimeoutMs = 6000
+# well below the hook's own 20 second timeout so a hung collector can never cost the gate its
+# tracker footer, but high enough to absorb PowerShell process startup on a loaded machine --
+# at 6s, spans were silently dropped whenever several agents ran concurrently.
+$script:OtelParentTimeoutMs = 12000
 
 function Test-TelemetryEnabled {
     # Cheap early-out. For the overwhelming majority of users COPILOT_OTEL_ENABLED is unset, and
@@ -1036,22 +1002,6 @@ try {
             $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
             # Real progress was made, so forgive any earlier blocked stops.
             $state['blocks'] = 0
-            # Remember when this agent started, so subagentStop can report a real duration.
-            # Recorded against this agent alone, so an overlapping sub-agent cannot overwrite it.
-            # More than one start outstanding means concurrent invocations whose stops cannot be
-            # told apart -- subagentStart carries no agent id -- so the agent stays ambiguous
-            # until every outstanding stop has drained, rather than a third start handing a
-            # still-running invocation a fresh timestamp that is not its own.
-            $startedAtKey = Get-StartedAtKey -Agent $agent
-            $pendingKey = Get-PendingKey -Agent $agent
-            $pending = [int]$state[$pendingKey] + 1
-            $state[$pendingKey] = $pending
-            if ($pending -gt 1) {
-                $state[$startedAtKey] = [long]0
-            }
-            else {
-                $state[$startedAtKey] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = 0
@@ -1082,6 +1032,15 @@ try {
             $verdict = Read-Verdict -Response $response -Kind $kind
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
+
+            # An attempt counter still at zero means subagentStart never ran for this sub-agent.
+            # Each branch below recovers the attempt itself; the session total has to be
+            # recovered too, or the ceiling would undercount real work and the span would export
+            # a total of zero for an invocation that demonstrably completed.
+            $attemptsKey = Get-AttemptsKey -Agent $agent
+            if ($attemptsKey -ne '' -and [int]$state[$attemptsKey] -lt 1) {
+                $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
+            }
 
             $milestoneLabel = '-'
             $attempt = 0
@@ -1160,24 +1119,6 @@ try {
 
             $closedMilestone = [int]$state['currentMilestone']
             $advanced = Invoke-MilestoneAdvance -State $state
-            # Consume this agent's own start time and clear only that one, so a sub-agent running
-            # concurrently keeps its own. Zero means none was usable, which yields an honest
-            # zero-duration span rather than a fabricated one. The timestamp is always cleared:
-            # while any start is still outstanding the agent remains ambiguous.
-            $startedAtKey = Get-StartedAtKey -Agent $agent
-            $pendingKey = Get-PendingKey -Agent $agent
-            $startedAtMs = [long]$state[$startedAtKey]
-            $state[$startedAtKey] = [long]0
-            if ([int]$state[$pendingKey] -gt 0) {
-                $state[$pendingKey] = [int]$state[$pendingKey] - 1
-            }
-            else {
-                # A stop with no outstanding start means subagentStart never ran for this
-                # sub-agent, so the invocation was never counted. Count it now: otherwise the
-                # span would export a session total of zero for an invocation that demonstrably
-                # completed.
-                $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
-            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $agent `
@@ -1228,8 +1169,11 @@ try {
                 verdict          = $verdict
                 attempt          = $attempt
                 totalInvocations = [int]$state['totalInvocations']
-                startTimeMs      = $startedAtMs
-                endTimeMs        = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                timeMs           = [long]$payload.timestamp
+                # Absent today, but forwarded so the span parents itself under Copilot's own
+                # sub-agent span the moment the CLI starts supplying trace context.
+                traceparent      = [string]$payload.traceparent
+                tracestate       = [string]$payload.tracestate
             }
             Write-JsonResult @{ modifiedResponse = ($response + [Environment]::NewLine + $footer) }
             exit 0

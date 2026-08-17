@@ -1220,79 +1220,6 @@ Test-Case 'the exported session id is the raw one, not the filename-safe one' {
     Assert-Equal $rawSession (Get-SpanAttribute $doc 'github.copilot.session.id')
 }
 
-Test-Case 'the span duration comes from the recorded start time' {
-    $session = New-SessionId
-    $result = Invoke-TelemetryRound -SessionId $session
-    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
-    $durationMs = ([long]$span.endTimeUnixNano - [long]$span.startTimeUnixNano) / 1000000
-    # subagentStart runs a whole process before subagentStop does, so a real recorded start time
-    # always yields a positive duration. Zero would mean the timestamp never survived the state
-    # file, which is exactly the regression this guards.
-    if ($durationMs -le 0) { throw "expected a positive span duration but got ${durationMs}ms" }
-}
-
-Test-Case 'overlapping gates each keep their own start time' {
-    <#
-        Regression test for overlapping reviewers. Gates are meant to run one at a time, but if
-        two ever overlap, a single shared start slot would let the second start overwrite the
-        first, and the first stop would then report a truncated duration and clear a timestamp
-        belonging to the other reviewer. Each gate keeps its own slot.
-    #>
-    $session = New-SessionId
-    Start-Gate -SessionId $session -Gate 'architecture'
-    Start-Gate -SessionId $session -Gate 'security'
-    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
-    $archStart = [long]$state.architectureStartedAtMs
-    $secStart = [long]$state.securityStartedAtMs
-    if ($archStart -eq 0 -or $secStart -eq 0) {
-        throw "both gates must hold their own start time (architecture=$archStart security=$secStart)"
-    }
-
-    # The second gate stops first. It must use its own start time, not the first gate's.
-    $secResult = Invoke-TelemetryRound -SessionId $session -Gate 'security' -SkipStart
-    $secSpan = $secResult.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal ($secStart * 1000000) $secSpan.startTimeUnixNano 'the security span must carry the security start time'
-    # Stopping security must not disturb the architecture reviewer still running.
-    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
-    Assert-Equal $archStart ([long]$state.architectureStartedAtMs) 'a concurrent gate stopping must not clear another gate start time'
-
-    $archResult = Invoke-TelemetryRound -SessionId $session -Gate 'architecture' -SkipStart
-    $archSpan = $archResult.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal ($archStart * 1000000) $archSpan.startTimeUnixNano 'the architecture span must still carry its own start time'
-}
-
-Test-Case 'overlapping starts stay ambiguous until they drain' {
-    <#
-        Two concurrent reviewers for the SAME gate cannot be told apart: subagentStart carries no
-        agent id. Extended to three starts, because a bare zero sentinel could not tell "nothing
-        pending" from "ambiguous": the third start would see zero and record a fresh timestamp
-        that a still-outstanding stop could then consume.
-    #>
-    $session = New-SessionId
-    Start-Gate -SessionId $session -Gate 'architecture'
-    Start-Gate -SessionId $session -Gate 'architecture'
-    Start-Gate -SessionId $session -Gate 'architecture'
-    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
-    Assert-Equal 0 ([long]$state.architectureStartedAtMs) 'a third start must not record a fresh timestamp'
-    Assert-Equal 3 ([int]$state.architecturePending) 'all three starts must be counted as outstanding'
-
-    foreach ($i in 1, 2, 3) {
-        $result = Invoke-TelemetryRound -SessionId $session -Gate 'architecture' -SkipStart
-        $span = $result.Spans[-1].resourceSpans[0].scopeSpans[0].spans[0]
-        Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano `
-            "stop $i must yield a zero-duration span while starts are outstanding"
-    }
-    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
-    Assert-Equal 0 ([int]$state.architecturePending) 'the outstanding count must drain back to zero'
-
-    # Drained, so the next start is unambiguous again and records a real time.
-    Start-Gate -SessionId $session -Gate 'architecture'
-    $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
-    if ([long]$state.architectureStartedAtMs -eq 0) {
-        throw 'once drained, a fresh start must record a real timestamp again'
-    }
-}
-
 Test-Case 'a stop without its start still counts as an invocation' {
     # A stop with no matching start is already recovered as attempt 1. The session total must be
     # recovered too, or the span would export a total of zero for an invocation that
@@ -1311,6 +1238,71 @@ Test-Case 'a stop without its start still counts as an invocation' {
     $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
     Assert-Equal 1 ([int]$state.totalInvocations) `
         'the recovered invocation must also be counted against the session ceiling'
+}
+
+Test-Case 'a traceparent parents the span under Copilot''s trace' {
+    # The payload carries no trace context today, but the emitter already consumes it, so the day
+    # the CLI starts supplying one these spans join Copilot's trace with no code change.
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId   = $session; agentName = $agentName; agentId = 'a1'
+        traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+        tracestate  = 'vendor=abc'
+        response    = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal '4bf92f3577b34da6a3ce929d0e0e4736' $span.traceId 'the span must join the trace id from traceparent'
+    Assert-Equal '00f067aa0ba902b7' $span.parentSpanId 'the span must hang off the parent span id'
+    Assert-Equal 'vendor=abc' $span.traceState
+    Assert-Match '^[0-9a-f]{16}$' $span.spanId
+    if ($span.spanId -eq '00f067aa0ba902b7') { throw 'the span reused the parent id as its own' }
+}
+
+Test-Case 'no traceparent still emits a correlatable root span' {
+    # Today's behaviour: no context, so the span is its own root and correlates by session id.
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId)
+    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Match '^[0-9a-f]{32}$' $span.traceId
+    if ($null -ne $span.parentSpanId) { throw 'a span with no trace context must not claim a parent' }
+}
+
+Test-Case 'a malformed traceparent falls back to a root span' {
+    # A malformed or reserved header must not produce an invalid parent reference.
+    $session = New-SessionId
+    $bad = @(
+        'garbage',
+        'ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+        '00-00000000000000000000000000000000-00f067aa0ba902b7-01',
+        '00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01',
+        '00-4bf92f3577b34da6a3ce929d0e0e473-00f067aa0ba902b7-01'
+    )
+    foreach ($tp in $bad) {
+        $sink = Join-Path (Get-TelemetryDir $session) 'bad.jsonl'
+        Remove-Item -LiteralPath $sink -Force -ErrorAction SilentlyContinue
+        Invoke-HookWithEnv 'subagentStop' @{
+            sessionId   = $session; agentName = 'autodev-plan:autodev-architecture-review'
+            agentId     = 'a1'; traceparent = $tp
+            response    = "x`n`nAUTODEV-VERDICT: ISSUES"
+        } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+        $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+        $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+        if ($null -ne $span.parentSpanId) { throw "traceparent '$tp' must be rejected rather than used" }
+        Assert-Equal 'ISSUES' (Get-SpanAttribute $doc 'autodev.verdict') "the verdict must still be exported for '$tp'"
+    }
+}
+
+Test-Case 'the span marks the instant the verdict was recorded' {
+    # The span is deliberately zero length: it marks when the verdict was recorded, and the
+    # sub-agent's duration belongs to Copilot's own span, which measures it in-process.
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId)
+    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'the span marks an instant, not a duration'
+    Assert-Match '^[0-9]{16,}$' $span.startTimeUnixNano 'implausible span time'
 }
 
 Test-Case 'an empty agentId does not shift the other span attributes' {
@@ -1445,7 +1437,7 @@ Test-Case 'enforcement still works with telemetry enabled' {
     $state = Get-Content -LiteralPath (Get-StatePath $session) -Raw | ConvertFrom-Json
     Assert-Equal 'PASS' $state.architectureVerdict
     Assert-Equal 1 $state.architectureAttempts
-    Assert-Equal 0 $state.architectureStartedAtMs 'the start time must be cleared once the gate stops'
+    Assert-Equal 1 $state.architectureAttempts 'the attempt must still be recorded'
 }
 
 Test-Case 'the emitter ships beside the gate script' {
