@@ -191,9 +191,10 @@ producing spans, then check whether your endpoint accepts `Content-Type: applica
 
 With `COPILOT_OTEL_ENABLED` unset — the default for essentially every user — no emitter process
 is spawned, no temp file is written and no network call is made. The residual cost is a shell
-`case` on one environment variable, plus two small integer fields carried in the state file the
-tracker already writes on every event. The hooks still record when each sub-agent started, so
-enabling telemetry part way through a session produces correct durations immediately.
+`case` on one environment variable. The hooks keep no telemetry state at all: the span is built
+entirely from the `subagentStop` payload and the counters the tracker already maintains for
+enforcement, so enabling telemetry part way through a session works immediately and needs no
+warm-up.
 
 ### Correlating with Copilot's own traces
 

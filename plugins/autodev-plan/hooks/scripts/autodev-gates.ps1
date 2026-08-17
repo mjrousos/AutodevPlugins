@@ -483,8 +483,9 @@ function Write-JsonResult {
 }
 
 function Test-TelemetryEnabled {
-    # Cheap early-out. For the overwhelming majority of users COPILOT_OTEL_ENABLED is unset, and
-    # this is the entire cost of the telemetry feature for them: no temp file, no child process.
+    # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
+    # This is the entire cost of the telemetry feature for them: no state is kept for it, so
+    # nothing else in the hook does telemetry work either.
     $value = [Environment]::GetEnvironmentVariable('COPILOT_OTEL_ENABLED')
     if ([string]::IsNullOrWhiteSpace($value)) { return $false }
     return ($value.Trim().ToLowerInvariant() -in @('1', 'true', 'yes', 'on'))

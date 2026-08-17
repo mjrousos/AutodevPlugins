@@ -11,10 +11,17 @@
 # invoked with `>/dev/null 2>&1 </dev/null || :`, means neither this script's output nor its
 # exit code can reach the hook.
 #
-# Correlation: the hook payload carries no W3C trace context, so this span cannot be a child of
-# Copilot's own spans. Instead it carries the raw session id as 'gen_ai.conversation.id' and
-# 'github.copilot.session.id', which are the attributes Copilot CLI puts its session id on,
-# making a backend-side join exact.
+# Correlation: when the hook payload supplies W3C trace context, this span is emitted as a child
+# of Copilot's own sub-agent span -- it adopts that trace id and sets 'parentSpanId', so the
+# verdict lands directly on the sub-agent's trace. Copilot CLI does not send trace context to
+# command hooks yet; until it does the span is its own root and correlates by attribute instead,
+# carrying the raw session id as 'gen_ai.conversation.id' and 'github.copilot.session.id', which
+# are the attributes Copilot CLI puts its session id on. Either way nothing here has to change
+# when the CLI starts sending the header.
+#
+# The span deliberately marks an instant rather than a duration: it records WHEN a verdict was
+# reached, while how long the sub-agent ran belongs to Copilot's own span, which measures that
+# in-process instead of across two separate hook invocations.
 #
 # Configuration comes from the same environment variables Copilot CLI itself uses, so hook
 # telemetry switches on and off with Copilot's own telemetry.
