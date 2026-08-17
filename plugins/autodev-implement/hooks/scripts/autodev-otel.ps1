@@ -215,7 +215,7 @@ function Get-TraceParent {
     # Version 00 is exactly four fields. Later versions may append, and are parsed by reading the
     # first four and ignoring the rest, which is what the specification asks future parsers to do.
     if ($version -eq '00' -and $parts.Count -ne 4) { return $null }
-    return @{ TraceId = $traceId; SpanId = $spanId }
+    return @{ TraceId = $traceId; SpanId = $spanId; Flags = $flags }
 }
 
 function New-SpanDocument {
@@ -256,11 +256,17 @@ function New-SpanDocument {
     $parent = Get-TraceParent -Value (Get-Field -Object $Request -Name 'traceparent')
     $parentSpanId = ''
     $spanTraceState = ''
+    $spanFlags = 0
     if ($null -ne $parent) {
         # Join Copilot's trace directly.
         $traceId = $parent.TraceId
         $parentSpanId = $parent.SpanId
         $spanTraceState = Get-Field -Object $Request -Name 'tracestate'
+        # Carry the parent's sampling decision. OTLP puts the W3C trace flags in the low 8 bits
+        # of span.flags, and an omitted field reads as 0, so a span inheriting a sampled '01'
+        # parent would otherwise be exported as unsampled and dropped by a tail sampler. Bits 8
+        # and 9 mark is_remote as present and true, which it is: the parent belongs to the CLI.
+        $spanFlags = [Convert]::ToInt32($parent.Flags, 16) -bor 0x300
     }
     else {
         # No usable context, so this span is its own root and correlates by session id instead.
@@ -290,6 +296,7 @@ function New-SpanDocument {
     }
     if (-not [string]::IsNullOrWhiteSpace($parentSpanId)) { $span['parentSpanId'] = $parentSpanId }
     if (-not [string]::IsNullOrWhiteSpace($spanTraceState)) { $span['traceState'] = $spanTraceState }
+    if ($spanFlags -ne 0) { $span['flags'] = $spanFlags }
 
     return @{
         resourceSpans = @(

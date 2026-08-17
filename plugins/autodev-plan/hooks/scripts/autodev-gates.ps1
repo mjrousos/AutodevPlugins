@@ -631,12 +631,17 @@ try {
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             if ([int]$state["${gate}Attempts"] -lt 1) {
-                # subagentStart was missed somehow; still count this attempt. The session total
-                # must be recovered too, or the ceiling would undercount real work and the span
-                # would export a total of zero for an invocation that demonstrably completed.
+                # subagentStart was missed somehow; still count this attempt.
                 $state["${gate}Attempts"] = 1
-                $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
             }
+            # Recover the session total ONLY when nothing at all has been counted yet. A per-gate
+            # attempt counter cannot answer "was my start missed": subagentStart zeroes the later
+            # gates' counters, so a security stop arriving after an architecture re-gate would see
+            # zero and count itself a second time, prematurely exhausting the session ceiling and
+            # forcing an escalation. Keying off the session total instead can only ever under-
+            # count, which for a runaway guard is the harmless direction, while still keeping a
+            # completed invocation from exporting a total of zero.
+            if ([int]$state['totalInvocations'] -lt 1) { $state['totalInvocations'] = 1 }
             $state["${gate}Verdict"] = $verdict
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 

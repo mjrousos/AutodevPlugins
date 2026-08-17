@@ -1448,18 +1448,60 @@ run_test "a malformed traceparent falls back to a root span" t_otel_malformed_tr
 
 t_otel_span_marks_the_verdict_instant() {
   # The span is deliberately zero length: it marks when the verdict was recorded, and the
-  # sub-agent's duration belongs to Copilot's own span, which measures it in-process.
-  local sid start end
+  # sub-agent's duration belongs to Copilot's own span, which measures it in-process. A sentinel
+  # timestamp proves the value comes from the PAYLOAD -- without one, the emitter's current-clock
+  # fallback also yields plausible digits, so a regression that ignored payload timestamps
+  # entirely would go undetected.
+  local sid cwd sink
   sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/instant.jsonl"
   start_gate "$sid" architecture
-  telemetry_round_stop_only "$sid" architecture ISSUES
-  start="$(span_field "$TELEMETRY_SINK" startTimeUnixNano)"
-  end="$(span_field "$TELEMETRY_SINK" endTimeUnixNano)"
-  assert_equal "$start" "$end" 'the span marks an instant, not a duration' || return 1
-  # And it comes from the payload's own timestamp rather than a second clock read.
-  printf '%s' "$start" | grep -qE '^[0-9]{16,}$' || fail "implausible span time '$start'"
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review", agentId:"a1",
+        timestamp:1700000000123, response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal '1700000000123000000' "$(span_field "$sink" startTimeUnixNano)" \
+    'the span must use the payload timestamp, not a second clock read' || return 1
+  assert_equal '1700000000123000000' "$(span_field "$sink" endTimeUnixNano)" \
+    'the span marks an instant, not a duration'
 }
 run_test "the span marks the instant the verdict was recorded" t_otel_span_marks_the_verdict_instant
+
+t_otel_sampled_parent_is_preserved() {
+  # OTLP carries the W3C trace flags in the low 8 bits of span.flags, and an omitted field reads
+  # as 0. Without this, a child of a sampled '01' parent would export as unsampled and a tail
+  # sampler would drop exactly the spans worth keeping. Bits 8-9 (768) mark is_remote valid+true.
+  local sid cwd sink
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/flags.jsonl"
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review", agentId:"a1",
+        traceparent:"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal 769 "$(span_field "$sink" flags)" \
+    'a sampled parent must yield sampled flags (0x01 | 0x300)' || return 1
+
+  # An unsampled parent keeps its decision too, rather than being silently promoted.
+  rm -f "$sink"
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review", agentId:"a1",
+        traceparent:"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+        response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal 768 "$(span_field "$sink" flags)" 'an unsampled parent must not be promoted' || return 1
+
+  # A root span has no inherited context, so it reports no flags at all.
+  rm -f "$sink"
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review", agentId:"a1",
+        response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal null "$(span_field "$sink" flags)" 'a root span must not claim inherited flags'
+}
+run_test "a sampled parent's decision is carried onto the span" t_otel_sampled_parent_is_preserved
 
 t_otel_future_version_traceparent_is_honoured() {
   # The spec tells future-unaware parsers to read the first four fields and ignore the rest, so a

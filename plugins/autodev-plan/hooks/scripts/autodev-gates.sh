@@ -434,13 +434,15 @@ case "$EVENT_NAME" in
 
     ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
     TOTAL_INVOCATIONS="$(state_num "$STATE" 'totalInvocations')"
-    if [ "$ATTEMPTS" -lt 1 ] 2>/dev/null; then
-      # subagentStart was missed somehow; still count this attempt. The session total must be
-      # recovered too, or the ceiling would undercount real work and the span would export a
-      # total of zero for an invocation that demonstrably completed.
-      ATTEMPTS=1
-      TOTAL_INVOCATIONS=$(( TOTAL_INVOCATIONS + 1 ))
-    fi
+    # subagentStart was missed somehow; still count this attempt.
+    if [ "$ATTEMPTS" -lt 1 ] 2>/dev/null; then ATTEMPTS=1; fi
+    # Recover the session total ONLY when nothing at all has been counted yet. A per-gate attempt
+    # counter cannot answer "was my start missed": subagentStart zeroes the later gates' counters,
+    # so a security stop arriving after an architecture re-gate would see zero and count itself a
+    # second time, prematurely exhausting the session ceiling and forcing an escalation. Keying
+    # off the session total instead can only ever under-count, which for a runaway guard is the
+    # harmless direction, while still keeping a completed invocation from exporting zero.
+    if [ "$TOTAL_INVOCATIONS" -lt 1 ] 2>/dev/null; then TOTAL_INVOCATIONS=1; fi
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
       --argjson t "$TOTAL_INVOCATIONS" \
       ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .totalInvocations = \$t")"

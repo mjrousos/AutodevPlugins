@@ -1033,20 +1033,23 @@ try {
             $extraNotes = @()
 
             # Every branch below charges this stop against the agent's own attempt counter and
-            # reports that number, so both are done once here rather than six times. A counter
-            # still at zero means subagentStart never ran for this sub-agent: recover the attempt
-            # and the session total together, or the ceiling would undercount real work and the
-            # span would export a total of zero for an invocation that demonstrably completed.
+            # reports that number, so both are done once here rather than six times.
             # Get-AttemptsKey is the single place that knows which counter belongs to which agent,
             # because the names are not mechanically related (code-fix uses 'fixInvocations').
             $attemptsKey = Get-AttemptsKey -Agent $agent
             if ($attemptsKey -ne '') {
-                if ([int]$state[$attemptsKey] -lt 1) {
-                    $state[$attemptsKey] = 1
-                    $state['totalInvocations'] = [int]$state['totalInvocations'] + 1
-                }
+                # subagentStart was missed somehow; still count this attempt.
+                if ([int]$state[$attemptsKey] -lt 1) { $state[$attemptsKey] = 1 }
                 $attempt = [int]$state[$attemptsKey]
             }
+            # Recover the session total ONLY when nothing at all has been counted yet. A per-stage
+            # attempt counter cannot answer "was my start missed": an implementation start zeroes
+            # the downstream counters, so a security review stop arriving afterwards would see
+            # zero and count itself a second time, prematurely exhausting the session ceiling.
+            # Keying off the session total instead can only ever under-count, which for a runaway
+            # guard is the harmless direction, while still keeping a completed invocation from
+            # exporting a total of zero.
+            if ([int]$state['totalInvocations'] -lt 1) { $state['totalInvocations'] = 1 }
 
             switch ($agent) {
                 'tasking' {

@@ -1304,12 +1304,55 @@ Test-Case 'a malformed traceparent falls back to a root span' {
 }
 
 Test-Case 'the span marks the instant the verdict was recorded' {
-    # The span is deliberately zero length: it marks when the verdict was recorded, and the
-    # sub-agent's duration belongs to Copilot's own span, which measures it in-process.
-    $result = Invoke-TelemetryRound -SessionId (New-SessionId)
-    $span = $result.Spans[0].resourceSpans[0].scopeSpans[0].spans[0]
-    Assert-Equal $span.startTimeUnixNano $span.endTimeUnixNano 'the span marks an instant, not a duration'
-    Assert-Match '^[0-9]{16,}$' $span.startTimeUnixNano 'implausible span time'
+    <#
+        The span is deliberately zero length: it marks when the verdict was recorded, and the
+        sub-agent's duration belongs to Copilot's own span, which measures it in-process. A
+        sentinel timestamp proves the value comes from the PAYLOAD -- without one, the emitter's
+        current-clock fallback also yields plausible digits, so a regression that ignored payload
+        timestamps entirely would go undetected.
+    #>
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'instant.jsonl'
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = 'autodev-plan:autodev-architecture-review'
+        agentId   = 'a1'; timestamp = 1700000000123
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+    Assert-Equal '1700000000123000000' $span.startTimeUnixNano 'the span must use the payload timestamp'
+    Assert-Equal '1700000000123000000' $span.endTimeUnixNano 'the span marks an instant, not a duration'
+}
+
+Test-Case 'a sampled parent''s decision is carried onto the span' {
+    # OTLP carries the W3C trace flags in the low 8 bits of span.flags, and an omitted field reads
+    # as 0. Without this, a child of a sampled '01' parent would export as unsampled and a tail
+    # sampler would drop exactly the spans worth keeping. Bits 8-9 (768) mark is_remote
+    # valid + true, which it is: the parent span belongs to the CLI process.
+    $session = New-SessionId
+    $tp = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-'
+    foreach ($case in @(@{ Flags = '01'; Expect = 769 }, @{ Flags = '00'; Expect = 768 })) {
+        $sink = Join-Path (Get-TelemetryDir $session) "flags-$($case.Flags).jsonl"
+        Invoke-HookWithEnv 'subagentStop' @{
+            sessionId   = $session; agentName = 'autodev-plan:autodev-architecture-review'
+            agentId     = 'a1'; traceparent = ($tp + $case.Flags)
+            response    = "x`n`nAUTODEV-VERDICT: ISSUES"
+        } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+        $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+        $span = $doc.resourceSpans[0].scopeSpans[0].spans[0]
+        Assert-Equal $case.Expect $span.flags "traceparent flags '$($case.Flags)' must be carried through"
+    }
+
+    # A root span has no inherited context, so it reports no flags at all.
+    $sink = Join-Path (Get-TelemetryDir $session) 'flags-root.jsonl'
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = 'autodev-plan:autodev-architecture-review'
+        agentId   = 'a1'; response = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    if ($null -ne $doc.resourceSpans[0].scopeSpans[0].spans[0].flags) {
+        throw 'a root span must not claim inherited flags'
+    }
 }
 
 Test-Case 'a later traceparent version with extension fields is still honoured' {

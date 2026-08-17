@@ -167,6 +167,7 @@ hex_only() { printf '%s' "${1:-}" | tr -cd '0-9a-f'; }
 parse_traceparent() {
   TRACE_PARENT_TRACE_ID=''
   TRACE_PARENT_SPAN_ID=''
+  TRACE_PARENT_FLAGS=''
   local raw="${1:-}" version tid pid flags rest
   [ -n "$raw" ] || return 0
   # The spec requires lowercase hex, but normalise rather than reject a non-compliant producer.
@@ -191,6 +192,7 @@ EOF
   case "$pid" in *[!0]*) ;; *) return 0 ;; esac
   TRACE_PARENT_TRACE_ID="$tid"
   TRACE_PARENT_SPAN_ID="$pid"
+  TRACE_PARENT_FLAGS="$flags"
   return 0
 }
 
@@ -287,7 +289,7 @@ main() {
   [ "$verdict" = "ISSUES" ] && issues=1
   [ "$verdict" = "BLOCKED" ] && blocked=1
 
-  local service_name trace_id span_id parent_span_id span_trace_state
+  local service_name trace_id span_id parent_span_id span_trace_state span_flags
   service_name="$(trim "${OTEL_SERVICE_NAME:-}")"
   [ -n "$service_name" ] || service_name='github-copilot'
 
@@ -297,11 +299,18 @@ main() {
     trace_id="$TRACE_PARENT_TRACE_ID"
     parent_span_id="$TRACE_PARENT_SPAN_ID"
     span_trace_state="$tracestate"
+    # Carry the parent's sampling decision. OTLP puts the W3C trace flags in the low 8 bits of
+    # span.flags, and an omitted field reads as 0, so a span inheriting a sampled '01' parent
+    # would otherwise be exported as unsampled and dropped by a tail sampler. Bits 8 and 9 mark
+    # is_remote as present and true, which it is: the parent span belongs to the CLI process.
+    span_flags=$(( 16#$TRACE_PARENT_FLAGS | 768 ))
   else
     # No usable context, so this span is its own root and correlates by session id instead.
     trace_id="$(random_hex 16)" || die_ok
     parent_span_id=''
     span_trace_state=''
+    # No inherited context, so no flags to report.
+    span_flags=0
   fi
   span_id="$(random_hex 8)" || die_ok
 
@@ -312,6 +321,7 @@ main() {
     --arg spanId "$span_id" \
     --arg parentSpanId "$parent_span_id" \
     --arg traceState "$span_trace_state" \
+    --argjson spanFlags "$span_flags" \
     --arg name "$span_name" \
     --arg timeNs "$time_ns" \
     --arg sessionId "$session_id" \
@@ -356,7 +366,8 @@ main() {
               status: { code: 0 }
             }
             + (if $parentSpanId == "" then {} else { parentSpanId: $parentSpanId } end)
-            + (if $traceState == "" then {} else { traceState: $traceState } end))
+            + (if $traceState == "" then {} else { traceState: $traceState } end)
+            + (if $spanFlags == 0 then {} else { flags: $spanFlags } end))
           ]
         }]
       }]

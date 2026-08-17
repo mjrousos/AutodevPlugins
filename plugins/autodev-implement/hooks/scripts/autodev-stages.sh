@@ -858,21 +858,24 @@ case "$EVENT_NAME" in
     MILESTONE_LABEL='-'
     EXTRA_NOTES=''
     # Every branch below charges this stop against the agent's own attempt counter and reports
-    # that number, so both are done once here rather than six times. A counter still at zero means
-    # subagentStart never ran for this sub-agent: recover the attempt and the session total
-    # together, or the ceiling would undercount real work and the span would export a total of
-    # zero for an invocation that demonstrably completed. attempts_key is the single place that
-    # knows which counter belongs to which agent, because the names are not mechanically related
-    # (code-fix uses 'fixInvocations').
+    # that number, so both are done once here rather than six times. attempts_key is the single
+    # place that knows which counter belongs to which agent, because the names are not
+    # mechanically related (code-fix uses 'fixInvocations').
     ATTEMPTS_KEY="$(attempts_key "$AGENT")"
     if [ -n "$ATTEMPTS_KEY" ]; then
       ATTEMPT="$(state_num "$STATE" "$ATTEMPTS_KEY")"
-      if [ "$ATTEMPT" -lt 1 ] 2>/dev/null; then
-        ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq \
-          --argjson t "$(( $(state_num "$STATE" 'totalInvocations') + 1 ))" '.totalInvocations = $t')"
-      fi
+      # subagentStart was missed somehow; still count this attempt.
+      if [ "$ATTEMPT" -lt 1 ] 2>/dev/null; then ATTEMPT=1; fi
       STATE="$(printf '%s' "$STATE" | jq --arg ak "$ATTEMPTS_KEY" --argjson a "$ATTEMPT" '.[$ak] = $a')"
+    fi
+    # Recover the session total ONLY when nothing at all has been counted yet. A per-stage attempt
+    # counter cannot answer "was my start missed": an implementation start zeroes the downstream
+    # counters via reset_downstream_verdicts, so a security review stop arriving afterwards would
+    # see zero and count itself a second time, prematurely exhausting the session ceiling. Keying
+    # off the session total instead can only ever under-count, which for a runaway guard is the
+    # harmless direction, while still keeping a completed invocation from exporting zero.
+    if [ "$(state_num "$STATE" 'totalInvocations')" -lt 1 ] 2>/dev/null; then
+      STATE="$(printf '%s' "$STATE" | jq '.totalInvocations = 1')"
     fi
     add_note() { if [ -z "$EXTRA_NOTES" ]; then EXTRA_NOTES="$1"; else EXTRA_NOTES="$EXTRA_NOTES
 $1"; fi; }
