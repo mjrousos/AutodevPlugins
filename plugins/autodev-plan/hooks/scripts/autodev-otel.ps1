@@ -27,8 +27,13 @@
     reached, while how long the sub-agent ran belongs to Copilot's own span, which measures that
     in-process instead of across two separate hook invocations.
 
-    Configuration comes from the same environment variables Copilot CLI itself uses, so hook
-    telemetry switches on and off with Copilot's own telemetry.
+    Configuration comes from AUTODEV_OTEL_* variables rather than Copilot's own OTEL_* ones,
+    because Copilot CLI SCRUBS its telemetry configuration out of the environment it gives to
+    command hooks. Measured against CLI 1.0.81: a hook process sees no variable whose name begins
+    with 'OTEL_' or 'COPILOT_OTEL_', while every other variable -- including 'AUTODEV_OTEL_*' --
+    is inherited normally. Reading COPILOT_OTEL_ENABLED here therefore meant the emitter could
+    never run under the CLI at all, no matter how the user had configured Copilot's own exporter.
+    The OTEL_* variables are still honoured as a fallback, for hosts that do not scrub them.
 
     Written for Windows PowerShell 5.1 compatibility (no -AsHashtable, no ternaries, no
     three-argument Join-Path).
@@ -52,6 +57,12 @@ $WarningPreference = 'SilentlyContinue'
 $script:MaxTimeoutSec = 5
 $script:DefaultTimeoutSec = 2
 
+# Copilot CLI's own implicit OTLP/HTTP default. Reproduced so that a user who enabled hook
+# telemetry, pointed Copilot at a local collector the default way, and set no endpoint of their
+# own still gets spans. This is only ever reached once telemetry has been explicitly enabled, so
+# it cannot surprise anyone who has not opted in.
+$script:DefaultEndpoint = 'http://localhost:4318'
+
 function Test-Truthy {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
@@ -63,6 +74,41 @@ function Get-Env {
     $value = [Environment]::GetEnvironmentVariable($Name)
     if ($null -eq $value) { return '' }
     return $value
+}
+
+function Get-EnvFirst {
+    # First non-blank value from a precedence-ordered list of variable names. The AUTODEV_OTEL_*
+    # name always comes first: it is the only one that survives Copilot's environment scrub, so a
+    # user who sets both must get theirs rather than a stale inherited one.
+    param([string[]]$Names)
+    foreach ($name in $Names) {
+        $value = (Get-Env $name).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+    }
+    return ''
+}
+
+function Test-TelemetryEnabled {
+    <#
+        Hook telemetry is opt-in, and opting in has to be possible from inside a hook, so it keys
+        off variables Copilot CLI does not strip.
+
+        AUTODEV_OTEL_ENABLED is tri-state on purpose: set-and-falsy is an explicit OFF that
+        outranks every other signal, so a user can silence hook telemetry without disturbing
+        Copilot's own exporter or unsetting their endpoint.
+    #>
+    $explicit = (Get-Env 'AUTODEV_OTEL_ENABLED').Trim()
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) { return (Test-Truthy -Value $explicit) }
+
+    # Configuring an endpoint for this emitter is itself an opt-in; requiring a second variable
+    # alongside it would be a trap that fails silently, which is how this feature shipped broken.
+    if (-not [string]::IsNullOrWhiteSpace((Get-EnvFirst @('AUTODEV_OTEL_TRACES_ENDPOINT', 'AUTODEV_OTEL_ENDPOINT')))) {
+        return $true
+    }
+
+    # Fallback for any host that does NOT scrub Copilot's telemetry variables, where following
+    # Copilot's own switch is the least surprising behaviour.
+    return (Test-Truthy -Value (Get-Env 'COPILOT_OTEL_ENABLED'))
 }
 
 function Get-TimeoutSec {
@@ -78,24 +124,33 @@ function Get-TimeoutSec {
 function Get-Protocol {
     # An explicitly gRPC-configured exporter must not be sent HTTP/JSON: the endpoint is a gRPC
     # port and the POST would be meaningless traffic rather than a dropped span.
-    $protocol = Get-Env 'OTEL_EXPORTER_OTLP_TRACES_PROTOCOL'
-    if ([string]::IsNullOrWhiteSpace($protocol)) {
-        $protocol = Get-Env 'OTEL_EXPORTER_OTLP_PROTOCOL'
-    }
-    return $protocol.Trim().ToLowerInvariant()
+    return (Get-EnvFirst @(
+            'AUTODEV_OTEL_PROTOCOL',
+            'OTEL_EXPORTER_OTLP_TRACES_PROTOCOL',
+            'OTEL_EXPORTER_OTLP_PROTOCOL')).ToLowerInvariant()
 }
 
 function Get-TracesEndpoint {
-    # Per the OTLP exporter specification the signal-specific variable is used verbatim, while
-    # the generic one is a base that '/v1/traces' is appended to. Copilot's implicit
-    # 'http://127.0.0.1:4318' default is deliberately not reproduced: silently posting to
-    # localhost from a hook would be surprising.
-    $specific = (Get-Env 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT').Trim()
-    if (-not [string]::IsNullOrWhiteSpace($specific)) { return $specific }
+    <#
+        Resolved one namespace at a time, AUTODEV_OTEL_* first. Within a namespace the OTLP rule
+        applies -- the signal-specific variable is used verbatim, while the generic one is a base
+        that '/v1/traces' is appended to -- but a legacy OTEL_* value never outranks an
+        AUTODEV_OTEL_* one, however specific it is. Mixing the two would let an inherited
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT silently redirect spans away from the endpoint the user
+        configured for this emitter, and take the AUTODEV_OTEL_HEADERS credentials with them.
 
-    $generic = (Get-Env 'OTEL_EXPORTER_OTLP_ENDPOINT').Trim()
-    if ([string]::IsNullOrWhiteSpace($generic)) { return '' }
-    return ($generic.TrimEnd('/') + '/v1/traces')
+        Copilot's implicit 'http://localhost:4318' default is reproduced as a last resort, because
+        a hook cannot see the endpoint Copilot itself resolved and most users never set one.
+    #>
+    foreach ($pair in @(
+            @{ Specific = 'AUTODEV_OTEL_TRACES_ENDPOINT'; Generic = 'AUTODEV_OTEL_ENDPOINT' },
+            @{ Specific = 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'; Generic = 'OTEL_EXPORTER_OTLP_ENDPOINT' })) {
+        $specific = Get-EnvFirst @($pair.Specific)
+        if (-not [string]::IsNullOrWhiteSpace($specific)) { return $specific }
+        $generic = Get-EnvFirst @($pair.Generic)
+        if (-not [string]::IsNullOrWhiteSpace($generic)) { return ($generic.TrimEnd('/') + '/v1/traces') }
+    }
+    return ($script:DefaultEndpoint.TrimEnd('/') + '/v1/traces')
 }
 
 function Test-Endpoint {
@@ -108,13 +163,14 @@ function Test-Endpoint {
 }
 
 function Get-OtlpHeaders {
-    # OTEL_EXPORTER_OTLP_TRACES_HEADERS wins over the generic variable rather than merging with
-    # it, per the specification. Values are percent-encoded and split on the FIRST '=' only, so a
-    # base64 token containing '=' survives intact. Never logged.
-    $raw = Get-Env 'OTEL_EXPORTER_OTLP_TRACES_HEADERS'
-    if ([string]::IsNullOrWhiteSpace($raw)) {
-        $raw = Get-Env 'OTEL_EXPORTER_OTLP_HEADERS'
-    }
+    # AUTODEV_OTEL_HEADERS wins over the OTLP variables, and the traces-specific OTLP variable
+    # over the generic one, rather than merging with them, per the specification. Values are
+    # percent-encoded and split on the FIRST '=' only, so a base64 token containing '=' survives
+    # intact. Never logged.
+    $raw = Get-EnvFirst @(
+        'AUTODEV_OTEL_HEADERS',
+        'OTEL_EXPORTER_OTLP_TRACES_HEADERS',
+        'OTEL_EXPORTER_OTLP_HEADERS')
     $headers = @{}
     if ([string]::IsNullOrWhiteSpace($raw)) { return $headers }
     foreach ($pair in ($raw -split ',')) {
@@ -250,7 +306,7 @@ function New-SpanDocument {
         (New-IntAttribute -Key 'autodev.total_invocations' -Value (Get-LongField -Object $Request -Name 'totalInvocations'))
     )
 
-    $serviceName = (Get-Env 'OTEL_SERVICE_NAME').Trim()
+    $serviceName = Get-EnvFirst @('AUTODEV_OTEL_SERVICE_NAME', 'OTEL_SERVICE_NAME')
     if ([string]::IsNullOrWhiteSpace($serviceName)) { $serviceName = 'github-copilot' }
 
     $parent = Get-TraceParent -Value (Get-Field -Object $Request -Name 'traceparent')
@@ -346,7 +402,7 @@ function Send-SpanDocument {
 # --------------------------------------------------------------------------------------------
 
 try {
-    if (-not (Test-Truthy -Value (Get-Env 'COPILOT_OTEL_ENABLED'))) { exit 0 }
+    if (-not (Test-TelemetryEnabled)) { exit 0 }
 
     $debugFile = (Get-Env 'AUTODEV_OTEL_DEBUG_FILE').Trim()
     $useDebugFile = -not [string]::IsNullOrWhiteSpace($debugFile)

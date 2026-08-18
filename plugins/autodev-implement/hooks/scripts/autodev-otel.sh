@@ -23,8 +23,13 @@
 # reached, while how long the sub-agent ran belongs to Copilot's own span, which measures that
 # in-process instead of across two separate hook invocations.
 #
-# Configuration comes from the same environment variables Copilot CLI itself uses, so hook
-# telemetry switches on and off with Copilot's own telemetry.
+# Configuration comes from AUTODEV_OTEL_* variables rather than Copilot's own OTEL_* ones,
+# because Copilot CLI SCRUBS its telemetry configuration out of the environment it gives to
+# command hooks. Measured against CLI 1.0.81: a hook process sees no variable whose name begins
+# with 'OTEL_' or 'COPILOT_OTEL_', while every other variable -- including 'AUTODEV_OTEL_*' -- is
+# inherited normally. Reading COPILOT_OTEL_ENABLED here therefore meant the emitter could never
+# run under the CLI at all, no matter how the user had configured Copilot's own exporter. The
+# OTEL_* variables are still honoured as a fallback, for hosts that do not scrub them.
 #
 # Requires jq (already required by the hook scripts) and, for the network path, curl. Either
 # being absent degrades to "no telemetry", never to a failure.
@@ -37,6 +42,12 @@ PAYLOAD_PATH="${1:-}"
 # from ever approaching the hook's own timeout budget.
 MAX_TIMEOUT_SEC=5
 DEFAULT_TIMEOUT_SEC=2
+
+# Copilot CLI's own implicit OTLP/HTTP default. Reproduced so that a user who enabled hook
+# telemetry, pointed Copilot at a local collector the default way, and set no endpoint of their
+# own still gets spans. This is only ever reached once telemetry has been explicitly enabled, so
+# it cannot surprise anyone who has not opted in.
+DEFAULT_ENDPOINT='http://localhost:4318'
 
 # Every exit path is a success: telemetry is never worth a failed hook.
 die_ok() { exit 0; }
@@ -67,23 +78,72 @@ resolve_timeout() {
   printf '%s' "$raw"
 }
 
+env_first() {
+  # First non-blank value from a precedence-ordered list of variable names. The AUTODEV_OTEL_*
+  # name always comes first: it is the only one that survives Copilot's environment scrub, so a
+  # user who sets both must get theirs rather than a stale inherited one.
+  local name value
+  for name in "$@"; do
+    # Indirect expansion, so the caller passes names rather than values and an unset one is not
+    # an error under 'set -u'.
+    value="$(trim "${!name:-}")"
+    if [ -n "$value" ]; then printf '%s' "$value"; return 0; fi
+  done
+  return 0
+}
+
+telemetry_enabled() {
+  # Hook telemetry is opt-in, and opting in has to be possible from inside a hook, so it keys off
+  # variables Copilot CLI does not strip.
+  #
+  # AUTODEV_OTEL_ENABLED is tri-state on purpose: set-and-falsy is an explicit OFF that outranks
+  # every other signal, so a user can silence hook telemetry without disturbing Copilot's own
+  # exporter or unsetting their endpoint.
+  local explicit
+  explicit="$(trim "${AUTODEV_OTEL_ENABLED:-}")"
+  if [ -n "$explicit" ]; then
+    if is_truthy "$explicit"; then return 0; fi
+    return 1
+  fi
+
+  # Configuring an endpoint for this emitter is itself an opt-in; requiring a second variable
+  # alongside it would be a trap that fails silently, which is how this feature shipped broken.
+  # Written as if/fi rather than '&&': a false test at statement level would fire the ERR trap in
+  # any caller that installs one.
+  if [ -n "$(env_first AUTODEV_OTEL_TRACES_ENDPOINT AUTODEV_OTEL_ENDPOINT)" ]; then return 0; fi
+
+  # Fallback for any host that does NOT scrub Copilot's telemetry variables, where following
+  # Copilot's own switch is the least surprising behaviour.
+  is_truthy "${COPILOT_OTEL_ENABLED:-}"
+}
+
 resolve_protocol() {
-  local protocol="${OTEL_EXPORTER_OTLP_TRACES_PROTOCOL:-}"
-  [ -n "$protocol" ] || protocol="${OTEL_EXPORTER_OTLP_PROTOCOL:-}"
-  printf '%s' "$protocol" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
+  env_first AUTODEV_OTEL_PROTOCOL OTEL_EXPORTER_OTLP_TRACES_PROTOCOL OTEL_EXPORTER_OTLP_PROTOCOL |
+    tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
 }
 
 resolve_endpoint() {
-  # Per the OTLP exporter specification the signal-specific variable is used verbatim, while the
-  # generic one is a base that '/v1/traces' is appended to. Copilot's implicit
-  # 'http://127.0.0.1:4318' default is deliberately not reproduced: silently posting to localhost
-  # from a hook would be surprising.
+  # Resolved one namespace at a time, AUTODEV_OTEL_* first. Within a namespace the OTLP rule
+  # applies -- the signal-specific variable is used verbatim, while the generic one is a base that
+  # '/v1/traces' is appended to -- but a legacy OTEL_* value never outranks an AUTODEV_OTEL_* one,
+  # however specific it is. Mixing the two would let an inherited OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+  # silently redirect spans away from the endpoint the user configured for this emitter, and take
+  # the AUTODEV_OTEL_HEADERS credentials with them.
+  #
+  # Copilot's implicit 'http://localhost:4318' default is reproduced as a last resort, because a
+  # hook cannot see the endpoint Copilot itself resolved and most users never set one.
   local specific generic
-  specific="$(trim "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}")"
+  specific="$(env_first AUTODEV_OTEL_TRACES_ENDPOINT)"
   if [ -n "$specific" ]; then printf '%s' "$specific"; return; fi
-  generic="$(trim "${OTEL_EXPORTER_OTLP_ENDPOINT:-}")"
-  [ -n "$generic" ] || return 0
-  printf '%s/v1/traces' "${generic%/}"
+  generic="$(env_first AUTODEV_OTEL_ENDPOINT)"
+  if [ -n "$generic" ]; then printf '%s/v1/traces' "${generic%/}"; return; fi
+
+  specific="$(env_first OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)"
+  if [ -n "$specific" ]; then printf '%s' "$specific"; return; fi
+  generic="$(env_first OTEL_EXPORTER_OTLP_ENDPOINT)"
+  if [ -n "$generic" ]; then printf '%s/v1/traces' "${generic%/}"; return; fi
+
+  printf '%s/v1/traces' "${DEFAULT_ENDPOINT%/}"
 }
 
 # http/https only, so a malformed variable cannot turn into some other scheme.
@@ -102,13 +162,12 @@ percent_decode() {
 }
 
 # Emits one '-H name: value' pair per line, NUL-free, for the caller to read into an array.
-# OTEL_EXPORTER_OTLP_TRACES_HEADERS wins over the generic variable rather than merging with it,
-# per the specification. Values are split on the FIRST '=' only, so a base64 token containing '='
-# survives intact. Never logged.
+# AUTODEV_OTEL_HEADERS wins over the OTLP variables, and the traces-specific OTLP variable over
+# the generic one, rather than merging with them, per the specification. Values are split on the
+# FIRST '=' only, so a base64 token containing '=' survives intact. Never logged.
 collect_headers() {
   local raw pair name value
-  raw="${OTEL_EXPORTER_OTLP_TRACES_HEADERS:-}"
-  [ -n "$raw" ] || raw="${OTEL_EXPORTER_OTLP_HEADERS:-}"
+  raw="$(env_first AUTODEV_OTEL_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS OTEL_EXPORTER_OTLP_HEADERS)"
   [ -n "$raw" ] || return 0
   local IFS=','
   for pair in $raw; do
@@ -207,7 +266,7 @@ curl_config_escape() {
 }
 
 main() {
-  is_truthy "${COPILOT_OTEL_ENABLED:-}" || die_ok
+  telemetry_enabled || die_ok
   command -v jq >/dev/null 2>&1 || die_ok
   [ -n "$PAYLOAD_PATH" ] && [ -f "$PAYLOAD_PATH" ] || die_ok
 
@@ -290,7 +349,10 @@ main() {
   [ "$verdict" = "BLOCKED" ] && blocked=1
 
   local service_name trace_id span_id parent_span_id span_trace_state span_flags
-  service_name="$(trim "${OTEL_SERVICE_NAME:-}")"
+  # env_first, not a bare OTEL_SERVICE_NAME read: that name is scrubbed from a hook's environment
+  # by Copilot CLI, so honouring it alone silently ignored the documented
+  # AUTODEV_OTEL_SERVICE_NAME and stamped every span with the default instead.
+  service_name="$(env_first AUTODEV_OTEL_SERVICE_NAME OTEL_SERVICE_NAME)"
   [ -n "$service_name" ] || service_name='github-copilot'
 
   parse_traceparent "$traceparent"

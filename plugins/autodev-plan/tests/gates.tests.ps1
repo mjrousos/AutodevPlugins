@@ -1102,13 +1102,15 @@ function Invoke-TelemetryRound {
         [string]$Verdict = 'ISSUES',
         [hashtable]$ExtraEnv = @{},
         [string]$AgentId = 'agent-1',
+        [string]$Enabler = 'COPILOT_OTEL_ENABLED',
         [switch]$SkipStart
     )
     $dir = Get-TelemetryDir $SessionId
     $sink = Join-Path $dir 'spans.jsonl'
     # Note: PowerShell variable names are case insensitive, so this must not be called '$env'
     # or it would alias the $ExtraEnv parameter.
-    $vars = @{ COPILOT_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $vars = @{ AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $vars[$Enabler] = 'true'
     foreach ($key in $ExtraEnv.Keys) { $vars[$key] = $ExtraEnv[$key] }
 
     $agentName = "autodev-plan:autodev-$Gate-review"
@@ -1147,7 +1149,8 @@ Test-Case 'telemetry is off by default and writes nothing' {
     $session = New-SessionId
     $dir = Get-TelemetryDir $session
     $sink = Join-Path $dir 'spans.jsonl'
-    # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+    # No enabling variable at all: the overwhelmingly common case. AUTODEV_OTEL_DEBUG_FILE is the
+    # debug sink, not a switch, so on its own it must not turn telemetry on.
     Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = 'autodev-plan:autodev-architecture-review' } @{ AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
     $out = Invoke-HookWithEnv 'subagentStop' @{
         sessionId = $session
@@ -1155,6 +1158,182 @@ Test-Case 'telemetry is off by default and writes nothing' {
         response  = "x`n`nAUTODEV-VERDICT: ISSUES"
     } @{ AUTODEV_OTEL_DEBUG_FILE = $sink }
     if (Test-Path -LiteralPath $sink) { throw 'a span was emitted while telemetry was disabled' }
+    Assert-Match 'gate tracker' (Get-Footer $out) 'the footer must be unaffected'
+}
+
+Test-Case 'AUTODEV_OTEL_ENABLED alone turns telemetry on' {
+    <#
+        THE production path, and the one that shipped broken. Copilot CLI removes every variable
+        whose name begins with 'OTEL_' or 'COPILOT_OTEL_' from a command hook's environment, so a
+        hook keyed off COPILOT_OTEL_ENABLED could never fire under the CLI however the user had
+        configured Copilot's own exporter. This case pins the behaviour with Copilot's variables
+        absent, exactly as a real hook sees them.
+    #>
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId) -Enabler 'AUTODEV_OTEL_ENABLED'
+    Assert-Equal 1 $result.Spans.Count 'AUTODEV_OTEL_ENABLED must emit a span on its own'
+    Assert-Equal 'ISSUES' (Get-SpanAttribute $result.Spans[0] 'autodev.verdict')
+}
+
+Test-Case 'an AUTODEV endpoint alone turns telemetry on' {
+    # Configuring an endpoint for this emitter is itself an opt-in. Demanding a second variable
+    # alongside it would fail silently, which is the failure mode this whole area is guarding.
+    foreach ($name in @('AUTODEV_OTEL_ENDPOINT', 'AUTODEV_OTEL_TRACES_ENDPOINT')) {
+        $session = New-SessionId
+        $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+        $vars = @{ AUTODEV_OTEL_DEBUG_FILE = $sink }
+        $vars[$name] = 'http://127.0.0.1:4318/v1/traces'
+        $agentName = 'autodev-plan:autodev-architecture-review'
+        Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+        Invoke-HookWithEnv 'subagentStop' @{
+            sessionId = $session; agentName = $agentName
+            response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+        } $vars | Out-Null
+        if (-not (Test-Path -LiteralPath $sink)) { throw "$name alone must enable telemetry" }
+    }
+}
+
+Test-Case 'an AUTODEV endpoint outranks a more specific legacy one' {
+    <#
+        On a host that does NOT scrub Copilot's variables both namespaces can be set at once. The
+        AUTODEV_OTEL_* value has to win even against the more specific legacy name, or an
+        inherited OTEL_EXPORTER_OTLP_TRACES_ENDPOINT would silently redirect spans away from the
+        endpoint configured for this emitter -- and carry the AUTODEV_OTEL_HEADERS credentials
+        with it.
+
+        Observed with a loopback socket rather than a stub, because the PowerShell emitter posts
+        in-process with Invoke-RestMethod and there is no external command to intercept.
+    #>
+    $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+        $session = New-SessionId
+        $agentName = 'autodev-plan:autodev-architecture-review'
+        $vars = @{
+            AUTODEV_OTEL_ENABLED               = 'true'
+            AUTODEV_OTEL_ENDPOINT              = "http://127.0.0.1:$port"
+            # Deliberately more specific than the AUTODEV base endpoint. If precedence were wrong
+            # the request would go here instead and nothing would reach the listener.
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://127.0.0.1:9/v1/traces'
+            OTEL_EXPORTER_OTLP_ENDPOINT        = 'http://127.0.0.1:9'
+        }
+        Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+        # Nothing accepts the connection while the hook runs, and nothing needs to: the listen
+        # backlog completes the TCP handshake and buffers the request, so the emitter's POST is
+        # still readable afterwards. It sits out its own 2s timeout waiting for a reply that never
+        # comes, which it swallows -- exactly the "collector is unreachable" path.
+        $out = Invoke-HookWithEnv 'subagentStop' @{
+            sessionId = $session; agentName = $agentName; agentId = 'a1'
+            response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+        } $vars
+        Assert-Match 'gate tracker' (Get-Footer $out) 'an unanswered collector must not disturb the footer'
+
+        if (-not $listener.Pending()) {
+            throw 'nothing connected to the AUTODEV endpoint, so a legacy OTEL_* endpoint outranked it'
+        }
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $stream.ReadTimeout = 5000
+            $buffer = New-Object byte[] 4096
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            $request = [Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+            Assert-Match 'POST /v1/traces' $request 'the traces path must be appended to the base endpoint'
+        }
+        finally { $client.Close() }
+    }
+    finally { $listener.Stop() }
+}
+
+Test-Case 'a padded, mixed-case enabling value still emits' {
+    <#
+        The hook's own gate and the emitter's gate are separate implementations of one decision,
+        and they must agree on awkward values: a gate stricter than the emitter drops the span
+        without ever spawning it, while a looser one spawns a process that only exits again.
+        Whitespace and casing are where they most easily drift apart.
+    #>
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId) -Enabler 'AUTODEV_OTEL_ENABLED' `
+        -ExtraEnv @{ AUTODEV_OTEL_ENABLED = "  TrUe`t" }
+    Assert-Equal 1 $result.Spans.Count 'a padded, mixed-case value must enable telemetry'
+}
+
+Test-Case 'AUTODEV_OTEL_SERVICE_NAME sets and outranks the service name' {
+    <#
+        AUTODEV_OTEL_SERVICE_NAME is the only one of the pair a hook can actually see: Copilot CLI
+        scrubs OTEL_SERVICE_NAME along with every other OTEL_ prefixed name. Covered in both
+        suites because the bash emitter read only the scrubbed name, leaving every span stamped
+        'github-copilot' however the user configured it.
+    #>
+    $cases = @(
+        @{ Env = @{ AUTODEV_OTEL_SERVICE_NAME = 'my-service' }; Expected = 'my-service'; Why = 'AUTODEV_OTEL_SERVICE_NAME must set the resource service.name' },
+        @{ Env = @{ AUTODEV_OTEL_SERVICE_NAME = 'autodev-wins'; OTEL_SERVICE_NAME = 'legacy-loses' }; Expected = 'autodev-wins'; Why = 'AUTODEV_OTEL_SERVICE_NAME must outrank OTEL_SERVICE_NAME' },
+        @{ Env = @{ OTEL_SERVICE_NAME = 'legacy-only' }; Expected = 'legacy-only'; Why = 'OTEL_SERVICE_NAME must still work as a fallback' },
+        @{ Env = @{}; Expected = 'github-copilot'; Why = 'the default service name must survive' }
+    )
+    foreach ($case in $cases) {
+        $result = Invoke-TelemetryRound -SessionId (New-SessionId) -Enabler 'AUTODEV_OTEL_ENABLED' `
+            -ExtraEnv $case.Env
+        Assert-Equal 1 $result.Spans.Count 'the round must emit a span'
+        $resource = $result.Spans[0].resourceSpans[0].resource
+        $actual = $null
+        foreach ($attr in $resource.attributes) {
+            if ($attr.key -eq 'service.name') { $actual = [string]$attr.value.stringValue }
+        }
+        Assert-Equal $case.Expected $actual $case.Why
+    }
+}
+
+Test-Case 'a whitespace-only enabling value falls through rather than forcing off' {
+    <#
+        Pins the boundary of the tri-state. An empty or whitespace-only AUTODEV_OTEL_ENABLED counts
+        as NOT SET, so the remaining signals still decide; only a falsy value is an explicit off.
+
+        Not an arbitrary choice: Windows does not carry an empty variable across a process
+        boundary, so the hook and the emitter -- both child processes -- receive
+        AUTODEV_OTEL_ENABLED= as unset however the parent shell set it. Treating it as an off
+        switch would work in bash and quietly do nothing in PowerShell, which is the exact
+        platform divergence this emitter exists to avoid. Whitespace is treated as absent for
+        every other variable here as well, endpoints included.
+    #>
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{
+        AUTODEV_OTEL_ENABLED    = '   '
+        AUTODEV_OTEL_ENDPOINT   = 'http://127.0.0.1:4318'
+        AUTODEV_OTEL_DEBUG_FILE = $sink
+    }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    if (-not (Test-Path -LiteralPath $sink)) {
+        throw 'a whitespace-only value must fall through to the endpoint signal, not force telemetry off'
+    }
+}
+
+Test-Case 'a falsy AUTODEV_OTEL_ENABLED overrides every other signal' {
+    <#
+        Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and
+        Copilot's own switch, so hook telemetry can be silenced without disturbing Copilot's
+        exporter or unsetting an endpoint.
+    #>
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{
+        AUTODEV_OTEL_ENABLED  = 'false'
+        AUTODEV_OTEL_ENDPOINT = 'http://127.0.0.1:4318'
+        COPILOT_OTEL_ENABLED  = 'true'
+        AUTODEV_OTEL_DEBUG_FILE = $sink
+    }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    $out = Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars
+    if (Test-Path -LiteralPath $sink) { throw 'an explicit AUTODEV_OTEL_ENABLED=false must win' }
     Assert-Match 'gate tracker' (Get-Footer $out) 'the footer must be unaffected'
 }
 

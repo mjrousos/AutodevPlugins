@@ -1253,6 +1253,12 @@ span_field() { # sinkPath jq-path
   jq -r ".resourceSpans[0].scopeSpans[0].spans[0].$2" "$1" 2>/dev/null | head -1
 }
 
+resource_attr() { # sinkPath key
+  jq -r --arg k "$2" '
+    .resourceSpans[0].resource.attributes[]
+    | select(.key == $k) | (.value.stringValue // .value.intValue)' "$1" 2>/dev/null | head -1
+}
+
 # The subagentStop half of telemetry_round, for tests that need to inspect state in between.
 telemetry_round_stop_only() { # sid gate verdict [agentId]
   local sid="$1" gate="$2" verdict="$3" agent_id="${4:-agent-1}" cwd
@@ -1265,7 +1271,8 @@ telemetry_round_stop_only() { # sid gate verdict [agentId]
 }
 
 t_otel_disabled_by_default() {
-  # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+  # No enabling variable at all: the overwhelmingly common case. AUTODEV_OTEL_DEBUG_FILE is the
+  # debug sink, not a switch, so on its own it must not turn telemetry on.
   local sid sink footer
   sid="$(new_session_id)"
   sink="$(telemetry_dir "$sid")/spans.jsonl"
@@ -1277,6 +1284,158 @@ AUTODEV-VERDICT: ISSUES" | jq -r '.modifiedResponse // ""')"
   assert_match 'gate tracker' "$footer" 'the footer must be unaffected'
 }
 run_test "telemetry is off by default and writes nothing" t_otel_disabled_by_default
+
+t_otel_autodev_enabled_alone() {
+  # THE production path, and the one that shipped broken. Copilot CLI removes every variable whose
+  # name begins with 'OTEL_' or 'COPILOT_OTEL_' from a command hook's environment, so a hook keyed
+  # off COPILOT_OTEL_ENABLED could never fire under the CLI however the user had configured
+  # Copilot's own exporter. Pinned here with Copilot's variables absent, as a real hook sees them.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  [ -f "$sink" ] || fail 'AUTODEV_OTEL_ENABLED must emit a span on its own' || return 1
+  assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" 'the verdict must be recorded'
+}
+run_test "AUTODEV_OTEL_ENABLED alone turns telemetry on" t_otel_autodev_enabled_alone
+
+t_otel_autodev_endpoint_alone() {
+  # Configuring an endpoint for this emitter is itself an opt-in. Demanding a second variable
+  # alongside it would fail silently, which is the failure mode this whole area is guarding.
+  local name sid sink
+  for name in AUTODEV_OTEL_ENDPOINT AUTODEV_OTEL_TRACES_ENDPOINT; do
+    sid="$(new_session_id)"
+    sink="$(telemetry_dir "$sid")/spans.jsonl"
+    # A subshell with 'export', not an 'env NAME=v func' prefix: start_gate and stop_gate are
+    # shell functions, which 'env' cannot run, and the variable name here is dynamic so the
+    # 'NAME=value command' assignment form is not available either.
+    (
+      export "$name=http://127.0.0.1:4318/v1/traces"
+      export AUTODEV_OTEL_DEBUG_FILE="$sink"
+      start_gate "$sid" architecture
+      stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+    )
+    [ -f "$sink" ] || fail "$name alone must enable telemetry" || return 1
+  done
+}
+run_test "an AUTODEV endpoint alone turns telemetry on" t_otel_autodev_endpoint_alone
+
+t_otel_padded_mixed_case_value() {
+  # The hook's own gate and the emitter's gate are separate implementations of one decision, and
+  # they must agree on awkward values: a gate stricter than the emitter drops the span without
+  # ever spawning it, while a looser one spawns a process that only exits again. Whitespace and
+  # casing are where they most easily drift apart.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED="  TrUe	" AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED="  TrUe	" AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  [ -f "$sink" ] || fail 'a padded, mixed-case value must enable telemetry' || return 1
+  assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" 'the verdict must be recorded'
+}
+run_test "a padded, mixed-case enabling value still emits" t_otel_padded_mixed_case_value
+
+t_otel_service_name_precedence() {
+  # AUTODEV_OTEL_SERVICE_NAME is the only one of the pair a hook can actually see: Copilot CLI
+  # scrubs OTEL_SERVICE_NAME along with every other OTEL_ prefixed name. Reading the scrubbed name
+  # alone left every span stamped 'github-copilot' however the user configured it, and diverged
+  # from the PowerShell emitter, which honours both.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=my-service \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=my-service \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal my-service "$(resource_attr "$sink" 'service.name')" \
+    'AUTODEV_OTEL_SERVICE_NAME must set the resource service.name' || return 1
+
+  # And it must outrank the legacy name on a host that does not scrub it.
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=autodev-wins OTEL_SERVICE_NAME=legacy-loses \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=autodev-wins OTEL_SERVICE_NAME=legacy-loses \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal autodev-wins "$(resource_attr "$sink" 'service.name')" \
+    'AUTODEV_OTEL_SERVICE_NAME must outrank OTEL_SERVICE_NAME' || return 1
+
+  # The legacy name still works where it survives, and the default still applies otherwise.
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true OTEL_SERVICE_NAME=legacy-only \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true OTEL_SERVICE_NAME=legacy-only \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal legacy-only "$(resource_attr "$sink" 'service.name')" \
+    'OTEL_SERVICE_NAME must still work as a fallback' || return 1
+
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal github-copilot "$(resource_attr "$sink" 'service.name')" \
+    'the default service name must survive'
+}
+run_test "AUTODEV_OTEL_SERVICE_NAME sets and outranks the service name" t_otel_service_name_precedence
+
+t_otel_whitespace_value_falls_through() {
+  # Pins the boundary of the tri-state. An empty or whitespace-only AUTODEV_OTEL_ENABLED counts as
+  # NOT SET, so the remaining signals still decide; only a falsy value is an explicit off.
+  #
+  # Not an arbitrary choice: Windows does not carry an empty variable across a process boundary, so
+  # the hook and the emitter -- both child processes -- receive AUTODEV_OTEL_ENABLED= as unset
+  # however the parent shell set it. Treating it as an off switch would work here and quietly do
+  # nothing in PowerShell, which is the exact platform divergence this emitter exists to avoid.
+  # Whitespace is treated as absent for every other variable here as well, endpoints included.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED="   " AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED="   " AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  [ -f "$sink" ] ||
+    fail 'a whitespace-only value must fall through to the endpoint signal, not force telemetry off' ||
+    return 1
+}
+run_test "a whitespace-only enabling value falls through rather than forcing off" t_otel_whitespace_value_falls_through
+
+t_otel_explicit_off_wins() {
+  # Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and Copilot's
+  # own switch, so hook telemetry can be silenced without disturbing Copilot's exporter or
+  # unsetting an endpoint.
+  local sid sink footer
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=false AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 COPILOT_OTEL_ENABLED=true \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  footer="$(AUTODEV_OTEL_ENABLED=false AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 \
+    COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" | jq -r '.modifiedResponse // ""')"
+  [ ! -f "$sink" ] || fail 'an explicit AUTODEV_OTEL_ENABLED=false must win' || return 1
+  assert_match 'gate tracker' "$footer" 'the footer must be unaffected'
+}
+run_test "a falsy AUTODEV_OTEL_ENABLED overrides every other signal" t_otel_explicit_off_wins
 
 t_otel_well_formed_span() {
   local sid trace span start end
@@ -1543,6 +1702,50 @@ t_otel_malformed_timestamp_cannot_break_the_hook() {
     'the emitter must substitute a usable timestamp'
 }
 run_test "a malformed timestamp cannot break the hook" t_otel_malformed_timestamp_cannot_break_the_hook
+
+t_otel_autodev_endpoint_outranks_legacy() {
+  # On a host that does NOT scrub Copilot's variables both namespaces can be set at once. The
+  # AUTODEV_OTEL_* value has to win even against the more specific legacy name, or an inherited
+  # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT would silently redirect spans away from the endpoint
+  # configured for this emitter -- and carry the AUTODEV_OTEL_HEADERS credentials with it.
+  local sid cwd stub config_copy
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  stub="$COPILOT_HOME/urlstub-$$-$RANDOM"
+  config_copy="$COPILOT_HOME/curl-config-$$-$RANDOM.txt"
+  mkdir -p "$stub"
+  # The URL travels in curl's -K config file, not argv, so the stub copies that file out before
+  # the emitter deletes it.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'prev=""\n'
+    printf 'for a in "$@"; do\n'
+    printf '  if [ "$prev" = "-K" ]; then cp "$a" "%s" 2>/dev/null; fi\n' "$config_copy"
+    printf '  prev="$a"\n'
+    printf 'done\n'
+    printf 'cat > /dev/null\n'
+    printf 'exit 0\n'
+  } > "$stub/curl"
+  chmod +x "$stub/curl"
+
+  PATH="$stub:$PATH" AUTODEV_OTEL_ENABLED=true \
+    AUTODEV_OTEL_ENDPOINT=http://autodev.example:4318 \
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://legacy.example/v1/traces \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://legacy.example:4318 \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+
+  [ -f "$config_copy" ] ||
+    fail 'curl was never invoked, so this test proves nothing' || return 1
+  if grep -q 'legacy.example' "$config_copy"; then
+    fail "a legacy OTEL_* endpoint outranked AUTODEV_OTEL_ENDPOINT: $(cat "$config_copy")"
+    return 1
+  fi
+  grep -q 'autodev.example:4318/v1/traces' "$config_copy" ||
+    fail "the AUTODEV endpoint was not used: $(cat "$config_copy")" || return 1
+}
+run_test "an AUTODEV endpoint outranks a more specific legacy one" t_otel_autodev_endpoint_outranks_legacy
 
 t_otel_headers_stay_out_of_argv() {
   # OTLP headers routinely carry a bearer token. argv is world readable on Linux through

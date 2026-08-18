@@ -1338,7 +1338,8 @@ Test-Case 'telemetry is off by default and writes nothing' {
     $sid = New-SessionId
     Set-TodoList -SessionId $sid -Milestones 1
     $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
-    # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+    # No enabling variable at all: the overwhelmingly common case. AUTODEV_OTEL_DEBUG_FILE is the
+    # debug sink, not a switch, so on its own it must not turn telemetry on.
     Invoke-HookWithEnv 'subagentStart' @{ sessionId = $sid; agentName = 'autodev-implement:autodev-tasking' } @{ AUTODEV_OTEL_DEBUG_FILE = $sink } | Out-Null
     $out = Invoke-HookWithEnv 'subagentStop' @{
         sessionId = $sid
@@ -1347,6 +1348,30 @@ Test-Case 'telemetry is off by default and writes nothing' {
     } @{ AUTODEV_OTEL_DEBUG_FILE = $sink }
     if (Test-Path -LiteralPath $sink) { throw 'a span was emitted while telemetry was disabled' }
     Assert-Match 'stage tracker' (Get-Footer $out) 'the footer must be unaffected'
+}
+
+Test-Case 'AUTODEV_OTEL_ENABLED alone turns telemetry on' {
+    <#
+        THE production path. Copilot CLI removes every variable whose name begins with 'OTEL_' or
+        'COPILOT_OTEL_' from a command hook's environment, so a hook keyed off
+        COPILOT_OTEL_ENABLED could never fire under the CLI. Pinned here with Copilot's variables
+        absent, exactly as a real hook sees them. The full enablement matrix lives in the
+        autodev-plan suite, against the same canonical emitter.
+    #>
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+    $vars = @{ AUTODEV_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $sid; agentName = 'autodev-implement:autodev-tasking' } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $sid
+        agentName = 'autodev-implement:autodev-tasking'
+        response  = "x`n`nAUTODEV-VERDICT: DONE"
+    } $vars | Out-Null
+    if (-not (Test-Path -LiteralPath $sink)) { throw 'AUTODEV_OTEL_ENABLED must emit a span on its own' }
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal 'DONE' (Get-SpanAttribute $doc 'autodev.verdict')
+    Assert-Equal 'tasking' (Get-SpanAttribute $doc 'autodev.stage')
 }
 
 Test-Case 'an enabled round emits exactly one well-formed span document' {

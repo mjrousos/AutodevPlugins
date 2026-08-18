@@ -483,12 +483,32 @@ function Write-JsonResult {
 }
 
 function Test-TelemetryEnabled {
-    # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
-    # This is the entire cost of the telemetry feature for them: no state is kept for it, so
-    # nothing else in the hook does telemetry work either.
+    <#
+        Cheap early-out for the overwhelming majority of users, who never opt in to hook
+        telemetry. This is the entire cost of the telemetry feature for them: no state is kept for
+        it, so nothing else in the hook does telemetry work either.
+
+        Keyed off AUTODEV_OTEL_* rather than Copilot's own OTEL_* variables because Copilot CLI
+        scrubs every 'OTEL_'/'COPILOT_OTEL_' prefixed variable from a command hook's environment,
+        so the latter are never visible here. COPILOT_OTEL_ENABLED remains a fallback for hosts
+        that do not scrub. Must stay in step with Test-TelemetryEnabled in autodev-otel.ps1.
+    #>
+    $truthy = @('1', 'true', 'yes', 'on')
+
+    # Tri-state: set-and-falsy is an explicit OFF that outranks every other signal.
+    $explicit = [Environment]::GetEnvironmentVariable('AUTODEV_OTEL_ENABLED')
+    if (-not [string]::IsNullOrWhiteSpace($explicit)) {
+        return ($explicit.Trim().ToLowerInvariant() -in $truthy)
+    }
+
+    foreach ($name in @('AUTODEV_OTEL_TRACES_ENDPOINT', 'AUTODEV_OTEL_ENDPOINT')) {
+        $endpoint = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrWhiteSpace($endpoint)) { return $true }
+    }
+
     $value = [Environment]::GetEnvironmentVariable('COPILOT_OTEL_ENABLED')
     if ([string]::IsNullOrWhiteSpace($value)) { return $false }
-    return ($value.Trim().ToLowerInvariant() -in @('1', 'true', 'yes', 'on'))
+    return ($value.Trim().ToLowerInvariant() -in $truthy)
 }
 
 function Get-PowerShellPath {
