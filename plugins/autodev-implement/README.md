@@ -150,7 +150,7 @@ export AUTODEV_OTEL_ENABLED=1     # posts to http://localhost:4318/v1/traces
 
 | Variable | Purpose |
 | --- | --- |
-| `AUTODEV_OTEL_ENABLED` | Truthy (`1`, `true`, `yes`, `on`) turns hook telemetry on. Set-and-falsy is an explicit **off** that outranks every other signal. Unset falls through to the rules below. |
+| `AUTODEV_OTEL_ENABLED` | Truthy (`1`, `true`, `yes`, `on`) turns hook telemetry on. A falsy **value** (`0`, `false`, `no`, `off`) is an explicit **off** that outranks every other signal. Unset — or set to nothing but whitespace — falls through to the rules below. |
 | `AUTODEV_OTEL_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Setting it is itself an opt-in, so it enables telemetry on its own. Defaults to `http://localhost:4318`, matching Copilot's own implicit default. |
 | `AUTODEV_OTEL_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. Also enables telemetry on its own. |
 | `AUTODEV_OTEL_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON. See the caveat below. |
@@ -158,6 +158,14 @@ export AUTODEV_OTEL_ENABLED=1     # posts to http://localhost:4318/v1/traces
 | `AUTODEV_OTEL_SERVICE_NAME` | Resource `service.name`; defaults to `github-copilot` so hook spans land beside Copilot's own. |
 | `AUTODEV_OTEL_TIMEOUT_SEC` | Request timeout, default 2, clamped to a maximum of 5. |
 | `AUTODEV_OTEL_DEBUG_FILE` | Writes each span document to this file, one per line, **instead of** posting it. Use this to see exactly what would be exported. It is a sink, not a switch: on its own it does not enable telemetry. |
+
+An empty or whitespace-only value counts as *not set* rather than as an explicit off. That is
+deliberate: Windows does not carry an empty variable across a process boundary, so a hook or
+emitter -- both of which are child processes -- receives `AUTODEV_OTEL_ENABLED=` as unset no matter
+what the parent shell did. Honouring it as an off switch would work on Linux and macOS and quietly
+do nothing on Windows, which is precisely the kind of platform divergence this emitter exists to
+avoid. Whitespace-only values are treated as absent for every other variable here too, endpoints
+included. To turn hook telemetry off, give it a falsy value rather than an empty one.
 
 The equivalent `COPILOT_OTEL_ENABLED`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL`,

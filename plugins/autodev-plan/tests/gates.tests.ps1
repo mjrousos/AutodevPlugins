@@ -1283,6 +1283,36 @@ Test-Case 'AUTODEV_OTEL_SERVICE_NAME sets and outranks the service name' {
     }
 }
 
+Test-Case 'a whitespace-only enabling value falls through rather than forcing off' {
+    <#
+        Pins the boundary of the tri-state. An empty or whitespace-only AUTODEV_OTEL_ENABLED counts
+        as NOT SET, so the remaining signals still decide; only a falsy value is an explicit off.
+
+        Not an arbitrary choice: Windows does not carry an empty variable across a process
+        boundary, so the hook and the emitter -- both child processes -- receive
+        AUTODEV_OTEL_ENABLED= as unset however the parent shell set it. Treating it as an off
+        switch would work in bash and quietly do nothing in PowerShell, which is the exact
+        platform divergence this emitter exists to avoid. Whitespace is treated as absent for
+        every other variable here as well, endpoints included.
+    #>
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{
+        AUTODEV_OTEL_ENABLED    = '   '
+        AUTODEV_OTEL_ENDPOINT   = 'http://127.0.0.1:4318'
+        AUTODEV_OTEL_DEBUG_FILE = $sink
+    }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName
+        response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    if (-not (Test-Path -LiteralPath $sink)) {
+        throw 'a whitespace-only value must fall through to the endpoint signal, not force telemetry off'
+    }
+}
+
 Test-Case 'a falsy AUTODEV_OTEL_ENABLED overrides every other signal' {
     <#
         Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and

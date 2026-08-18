@@ -1394,6 +1394,30 @@ AUTODEV-VERDICT: ISSUES" >/dev/null
 }
 run_test "AUTODEV_OTEL_SERVICE_NAME sets and outranks the service name" t_otel_service_name_precedence
 
+t_otel_whitespace_value_falls_through() {
+  # Pins the boundary of the tri-state. An empty or whitespace-only AUTODEV_OTEL_ENABLED counts as
+  # NOT SET, so the remaining signals still decide; only a falsy value is an explicit off.
+  #
+  # Not an arbitrary choice: Windows does not carry an empty variable across a process boundary, so
+  # the hook and the emitter -- both child processes -- receive AUTODEV_OTEL_ENABLED= as unset
+  # however the parent shell set it. Treating it as an off switch would work here and quietly do
+  # nothing in PowerShell, which is the exact platform divergence this emitter exists to avoid.
+  # Whitespace is treated as absent for every other variable here as well, endpoints included.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED="   " AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED="   " AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  [ -f "$sink" ] ||
+    fail 'a whitespace-only value must fall through to the endpoint signal, not force telemetry off' ||
+    return 1
+}
+run_test "a whitespace-only enabling value falls through rather than forcing off" t_otel_whitespace_value_falls_through
+
 t_otel_explicit_off_wins() {
   # Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and Copilot's
   # own switch, so hook telemetry can be silenced without disturbing Copilot's exporter or
