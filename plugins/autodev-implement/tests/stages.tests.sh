@@ -1412,7 +1412,8 @@ telemetry_round_stop_only() { # sid agent verdict [agentId]
 }
 
 t_otel_disabled_by_default() {
-  # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+  # No enabling variable at all: the overwhelmingly common case. AUTODEV_OTEL_DEBUG_FILE is the
+  # debug sink, not a switch, so on its own it must not turn telemetry on.
   local sid sink footer
   sid="$(new_session_id)"
   set_todo_list "$sid" 1
@@ -1425,6 +1426,26 @@ AUTODEV-VERDICT: DONE" | jq -r '.modifiedResponse // ""')"
   assert_match 'stage tracker' "$footer" 'the footer must be unaffected'
 }
 run_test 'telemetry is off by default and writes nothing' t_otel_disabled_by_default
+
+t_otel_autodev_enabled_alone() {
+  # THE production path. Copilot CLI removes every variable whose name begins with 'OTEL_' or
+  # 'COPILOT_OTEL_' from a command hook's environment, so a hook keyed off COPILOT_OTEL_ENABLED
+  # could never fire under the CLI. Pinned here with Copilot's variables absent, exactly as a real
+  # hook sees them. The full enablement matrix lives in the autodev-plan suite, against the same
+  # canonical emitter.
+  local sid sink
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_agent "$sid" tasking
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_agent "$sid" tasking "x
+
+AUTODEV-VERDICT: DONE" >/dev/null
+  [ -f "$sink" ] || fail 'AUTODEV_OTEL_ENABLED must emit a span on its own' || return 1
+  assert_equal DONE "$(span_attr "$sink" 'autodev.verdict')" 'the verdict must be recorded' || return 1
+  assert_equal tasking "$(span_attr "$sink" 'autodev.stage')" 'the stage must be recorded'
+}
+run_test 'AUTODEV_OTEL_ENABLED alone turns telemetry on' t_otel_autodev_enabled_alone
 
 t_otel_well_formed_span() {
   local sid trace span start end

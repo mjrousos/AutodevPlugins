@@ -1265,7 +1265,8 @@ telemetry_round_stop_only() { # sid gate verdict [agentId]
 }
 
 t_otel_disabled_by_default() {
-  # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+  # No enabling variable at all: the overwhelmingly common case. AUTODEV_OTEL_DEBUG_FILE is the
+  # debug sink, not a switch, so on its own it must not turn telemetry on.
   local sid sink footer
   sid="$(new_session_id)"
   sink="$(telemetry_dir "$sid")/spans.jsonl"
@@ -1277,6 +1278,65 @@ AUTODEV-VERDICT: ISSUES" | jq -r '.modifiedResponse // ""')"
   assert_match 'gate tracker' "$footer" 'the footer must be unaffected'
 }
 run_test "telemetry is off by default and writes nothing" t_otel_disabled_by_default
+
+t_otel_autodev_enabled_alone() {
+  # THE production path, and the one that shipped broken. Copilot CLI removes every variable whose
+  # name begins with 'OTEL_' or 'COPILOT_OTEL_' from a command hook's environment, so a hook keyed
+  # off COPILOT_OTEL_ENABLED could never fire under the CLI however the user had configured
+  # Copilot's own exporter. Pinned here with Copilot's variables absent, as a real hook sees them.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  [ -f "$sink" ] || fail 'AUTODEV_OTEL_ENABLED must emit a span on its own' || return 1
+  assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" 'the verdict must be recorded'
+}
+run_test "AUTODEV_OTEL_ENABLED alone turns telemetry on" t_otel_autodev_enabled_alone
+
+t_otel_autodev_endpoint_alone() {
+  # Configuring an endpoint for this emitter is itself an opt-in. Demanding a second variable
+  # alongside it would fail silently, which is the failure mode this whole area is guarding.
+  local name sid sink
+  for name in AUTODEV_OTEL_ENDPOINT AUTODEV_OTEL_TRACES_ENDPOINT; do
+    sid="$(new_session_id)"
+    sink="$(telemetry_dir "$sid")/spans.jsonl"
+    # A subshell with 'export', not an 'env NAME=v func' prefix: start_gate and stop_gate are
+    # shell functions, which 'env' cannot run, and the variable name here is dynamic so the
+    # 'NAME=value command' assignment form is not available either.
+    (
+      export "$name=http://127.0.0.1:4318/v1/traces"
+      export AUTODEV_OTEL_DEBUG_FILE="$sink"
+      start_gate "$sid" architecture
+      stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+    )
+    [ -f "$sink" ] || fail "$name alone must enable telemetry" || return 1
+  done
+}
+run_test "an AUTODEV endpoint alone turns telemetry on" t_otel_autodev_endpoint_alone
+
+t_otel_explicit_off_wins() {
+  # Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and Copilot's
+  # own switch, so hook telemetry can be silenced without disturbing Copilot's exporter or
+  # unsetting an endpoint.
+  local sid sink footer
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=false AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 COPILOT_OTEL_ENABLED=true \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  footer="$(AUTODEV_OTEL_ENABLED=false AUTODEV_OTEL_ENDPOINT=http://127.0.0.1:4318 \
+    COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" | jq -r '.modifiedResponse // ""')"
+  [ ! -f "$sink" ] || fail 'an explicit AUTODEV_OTEL_ENABLED=false must win' || return 1
+  assert_match 'gate tracker' "$footer" 'the footer must be unaffected'
+}
+run_test "a falsy AUTODEV_OTEL_ENABLED overrides every other signal" t_otel_explicit_off_wins
 
 t_otel_well_formed_span() {
   local sid trace span start end

@@ -135,20 +135,35 @@ counted across sessions instead of only being readable in `.autodev/`.
 
 ### Enabling it
 
-The emitter reuses Copilot CLI's own telemetry variables, so hook telemetry switches on and off
-with Copilot's. It exports only when **both** `COPILOT_OTEL_ENABLED` is truthy (`1`, `true`,
-`yes`, `on`) and a traces endpoint is set.
+Hook telemetry is configured with `AUTODEV_OTEL_*` variables, **not** Copilot's own `OTEL_*`
+ones. Copilot CLI scrubs its telemetry configuration out of the environment it hands to command
+hooks: measured against CLI 1.0.81, a hook process sees no variable whose name begins with
+`OTEL_` or `COPILOT_OTEL_`, while everything else — including `AUTODEV_OTEL_*` — is inherited
+normally. Setting only Copilot's variables enables Copilot's exporter but leaves the hook blind,
+so it emits nothing.
+
+The minimum needed is one variable:
+
+```sh
+export AUTODEV_OTEL_ENABLED=1     # posts to http://localhost:4318/v1/traces
+```
 
 | Variable | Purpose |
 | --- | --- |
-| `COPILOT_OTEL_ENABLED` | Master switch. Unset means no telemetry: no emitter process, no temp file, no network call. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Copilot's implicit `http://127.0.0.1:4318` default is deliberately not assumed. |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON. See the caveat below. |
-| `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` | Comma-separated `key=value` pairs, percent-decoded. The signal-specific variable wins. Header values are never logged. |
-| `OTEL_SERVICE_NAME` | Resource `service.name`; defaults to `github-copilot` so hook spans land beside Copilot's own. |
+| `AUTODEV_OTEL_ENABLED` | Truthy (`1`, `true`, `yes`, `on`) turns hook telemetry on. Set-and-falsy is an explicit **off** that outranks every other signal. Unset falls through to the rules below. |
+| `AUTODEV_OTEL_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Setting it is itself an opt-in, so it enables telemetry on its own. Defaults to `http://localhost:4318`, matching Copilot's own implicit default. |
+| `AUTODEV_OTEL_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. Also enables telemetry on its own. |
+| `AUTODEV_OTEL_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON. See the caveat below. |
+| `AUTODEV_OTEL_HEADERS` | Comma-separated `key=value` pairs, percent-decoded. Header values are never logged. |
+| `AUTODEV_OTEL_SERVICE_NAME` | Resource `service.name`; defaults to `github-copilot` so hook spans land beside Copilot's own. |
 | `AUTODEV_OTEL_TIMEOUT_SEC` | Request timeout, default 2, clamped to a maximum of 5. |
-| `AUTODEV_OTEL_DEBUG_FILE` | Writes each span document to this file, one per line, **instead of** posting it. Use this to see exactly what would be exported. |
+| `AUTODEV_OTEL_DEBUG_FILE` | Writes each span document to this file, one per line, **instead of** posting it. Use this to see exactly what would be exported. It is a sink, not a switch: on its own it does not enable telemetry. |
+
+The equivalent `COPILOT_OTEL_ENABLED`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` and `OTEL_SERVICE_NAME` variables are still
+read, as a fallback for hosts that do not scrub them. The `AUTODEV_OTEL_*` name always wins.
+Under Copilot CLI they are invisible, so do not rely on them.
 
 ### What is emitted
 
@@ -189,7 +204,7 @@ producing spans, then check whether your endpoint accepts `Content-Type: applica
 
 ### Cost when telemetry is off
 
-With `COPILOT_OTEL_ENABLED` unset — the default for essentially every user — no emitter process
+With no `AUTODEV_OTEL_*` variable set — the default for essentially every user — no emitter process
 is spawned, no temp file is written and no network call is made. The residual cost is a shell
 `case` on one environment variable. The hooks keep no telemetry state at all: the span is built
 entirely from the `subagentStop` payload and the counters the tracker already maintains for
