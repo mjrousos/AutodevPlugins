@@ -59,6 +59,17 @@ TOTAL_INVOCATIONS_PER_MILESTONE=30
 
 json_get() { printf '%s' "$RAW_INPUT" | jq -r "$1 // \"\"" 2>/dev/null; }
 
+# Numeric payload field, defaulting to 0. Kept separate from json_get because --argjson rejects
+# an empty string, which would abort the whole span document.
+json_get_num() {
+  local v
+  v="$(printf '%s' "$RAW_INPUT" | jq -r "$1 // 0" 2>/dev/null)"
+  case "$v" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
 SESSION_ID="$(json_get '.sessionId')"
 SESSION_CWD="$(json_get '.cwd')"
 
@@ -206,6 +217,59 @@ state_num() {
 }
 state_str() { printf '%s' "$1" | jq -r ".$2 // \"pending\"" 2>/dev/null; }
 state_text() { printf '%s' "$1" | jq -r ".$2 // \"\"" 2>/dev/null; }
+
+# Directory this script lives in, so the telemetry emitter beside it can be found regardless of
+# the hook's working directory. Resolved with parameter expansion rather than 'dirname' so it
+# still works on a minimal PATH -- 'cd' and 'pwd' are builtins, 'dirname' is not. The
+# '|| SCRIPT_DIR=' keeps a failure here off the ERR trap.
+SCRIPT_SELF="${BASH_SOURCE[0]}"
+SCRIPT_SELF_DIR="${SCRIPT_SELF%/*}"
+# No slash at all means the script was invoked by bare name, so it lives in the current directory.
+# Written as if/fi rather than '&&' because a false test at top level would fire the ERR trap.
+if [ "$SCRIPT_SELF_DIR" = "$SCRIPT_SELF" ]; then SCRIPT_SELF_DIR="."; fi
+SCRIPT_DIR="$(cd "$SCRIPT_SELF_DIR" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
+
+telemetry_enabled() {
+  # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
+  # Deliberately pure parameter matching: piping through 'tr' to normalise case would spawn two
+  # child processes on every hook event just to decide not to emit anything.
+  case "${COPILOT_OTEL_ENABLED:-}" in
+    1 | true | TRUE | True | yes | YES | Yes | on | ON | On) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+send_otel_span() {
+  # Runs the OTLP emitter as an ISOLATED CHILD PROCESS with stdin closed and both output streams
+  # discarded. This is a safety requirement, not a style preference: this script installs an ERR
+  # trap that prints '{}' and exits, so a non-zero return from curl running in this process would
+  # destroy the tracker footer the stage depends on. The trailing '|| :' below is what keeps a
+  # failing child off that trap; do not remove it.
+  local request="$1" emitter tmp
+  telemetry_enabled || return 0
+  [ -n "$SCRIPT_DIR" ] || return 0
+  emitter="$SCRIPT_DIR/autodev-otel.sh"
+  [ -f "$emitter" ] || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  printf '%s' "$request" > "$tmp" 2>/dev/null || :
+  bash "$emitter" "$tmp" >/dev/null 2>&1 </dev/null || :
+  rm -f "$tmp" 2>/dev/null || :
+  return 0
+}
+
+
+# The state counter each agent charges its attempts against.
+attempts_key() { # agent
+  case "$1" in
+    tasking) printf 'taskingAttempts' ;;
+    implementation) printf 'implementAttempts' ;;
+    code-review) printf 'reviewAttempts' ;;
+    code-fix) printf 'fixInvocations' ;;
+    code-security-review) printf 'securityAttempts' ;;
+    code-privacy-review) printf 'privacyAttempts' ;;
+    *) printf '' ;;
+  esac
+}
 
 add_audit_row() {
   local stage="$1" milestone="$2" attempt="$3" action="$4" verdict="$5" session_marker
@@ -793,13 +857,31 @@ case "$EVENT_NAME" in
 
     MILESTONE_LABEL='-'
     EXTRA_NOTES=''
+    # Every branch below charges this stop against the agent's own attempt counter and reports
+    # that number, so both are done once here rather than six times. attempts_key is the single
+    # place that knows which counter belongs to which agent, because the names are not
+    # mechanically related (code-fix uses 'fixInvocations').
+    ATTEMPTS_KEY="$(attempts_key "$AGENT")"
+    if [ -n "$ATTEMPTS_KEY" ]; then
+      ATTEMPT="$(state_num "$STATE" "$ATTEMPTS_KEY")"
+      # subagentStart was missed somehow; still count this attempt.
+      if [ "$ATTEMPT" -lt 1 ] 2>/dev/null; then ATTEMPT=1; fi
+      STATE="$(printf '%s' "$STATE" | jq --arg ak "$ATTEMPTS_KEY" --argjson a "$ATTEMPT" '.[$ak] = $a')"
+    fi
+    # Recover the session total ONLY when nothing at all has been counted yet. A per-stage attempt
+    # counter cannot answer "was my start missed": an implementation start zeroes the downstream
+    # counters via reset_downstream_verdicts, so a security review stop arriving afterwards would
+    # see zero and count itself a second time, prematurely exhausting the session ceiling. Keying
+    # off the session total instead can only ever under-count, which for a runaway guard is the
+    # harmless direction, while still keeping a completed invocation from exporting zero.
+    if [ "$(state_num "$STATE" 'totalInvocations')" -lt 1 ] 2>/dev/null; then
+      STATE="$(printf '%s' "$STATE" | jq '.totalInvocations = 1')"
+    fi
     add_note() { if [ -z "$EXTRA_NOTES" ]; then EXTRA_NOTES="$1"; else EXTRA_NOTES="$EXTRA_NOTES
 $1"; fi; }
 
     case "$AGENT" in
       tasking)
-        ATTEMPT="$(state_num "$STATE" 'taskingAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
         if [ "$VERDICT" = "DONE" ]; then
           PARSED_COUNT="$(get_milestone_count)"
           if [ "$PARSED_COUNT" -gt 0 ] 2>/dev/null; then
@@ -824,14 +906,10 @@ $1"; fi; }
             add_note "WARNING: there is no workspace directory to read the todo list from, so milestone enforcement is degraded for this run."
           fi
         fi
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.taskingAttempts = $a | .taskingVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.taskingVerdict = $v')"
         ;;
       implementation)
-        ATTEMPT="$(state_num "$STATE" 'implementAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.implementAttempts = $a | .implementVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.implementVerdict = $v')"
         MILESTONE_LABEL="$(state_num "$STATE" 'currentMilestone')"
         if [ "$VERDICT" = "DONE" ]; then
           MILESTONE_STATUS="$(get_milestone_status "$MILESTONE_LABEL")"
@@ -841,16 +919,10 @@ $1"; fi; }
         fi
         ;;
       code-review)
-        ATTEMPT="$(state_num "$STATE" 'reviewAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.reviewAttempts = $a | .reviewVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.reviewVerdict = $v')"
         MILESTONE_LABEL="$(state_num "$STATE" 'currentMilestone')"
         ;;
       code-fix)
-        ATTEMPT="$(state_num "$STATE" 'fixInvocations')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" '.fixInvocations = $a')"
         if [ "$(state_num "$STATE" 'completedMilestones')" -lt "$(get_effective_milestone_count "$STATE")" ] 2>/dev/null; then
           MILESTONE_LABEL="$(state_num "$STATE" 'currentMilestone')"
         fi
@@ -859,16 +931,10 @@ $1"; fi; }
         fi
         ;;
       code-security-review)
-        ATTEMPT="$(state_num "$STATE" 'securityAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.securityAttempts = $a | .securityVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.securityVerdict = $v')"
         ;;
       code-privacy-review)
-        ATTEMPT="$(state_num "$STATE" 'privacyAttempts')"
-        [ "$ATTEMPT" -lt 1 ] 2>/dev/null && ATTEMPT=1
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" --arg v "$VERDICT" \
-          '.privacyAttempts = $a | .privacyVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.privacyVerdict = $v')"
         ;;
     esac
 
@@ -909,6 +975,27 @@ Audit trail: $AUDIT_PATH
 Feedback log: $FEEDBACK_PATH"
         ;;
     esac
+
+    # Telemetry last, after every piece of enforcement state is durable. The raw session id is
+    # used deliberately: SAFE_SESSION_ID exists only to build a safe filename, and exporting it
+    # would break the join against Copilot's own spans for any session id containing a character
+    # the sanitizer rewrites.
+    send_otel_span "$(jq -cn \
+      --arg span "autodev.stage $AGENT" \
+      --arg sid "$SESSION_ID" \
+      --arg agentName "$(json_get '.agentName')" \
+      --arg agentId "$(json_get '.agentId')" \
+      --arg unitValue "$AGENT" \
+      --arg verdict "$VERDICT" \
+      --argjson attempt "$ATTEMPT" \
+      --argjson total "$(state_num "$STATE" 'totalInvocations')" \
+      --argjson timeMs "$(json_get_num '.timestamp')" \
+      --arg traceparent "$(json_get '.traceparent')" \
+      --arg tracestate "$(json_get '.tracestate')" \
+      '{spanName: $span, sessionId: $sid, agentName: $agentName, agentId: $agentId,
+        plugin: "autodev-implement", unitKey: "autodev.stage", unitValue: $unitValue,
+        verdict: $verdict, attempt: $attempt, totalInvocations: $total,
+        timeMs: $timeMs, traceparent: $traceparent, tracestate: $tracestate}' 2>/dev/null)" || :
 
     jq -cn --arg r "$RESPONSE
 $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty

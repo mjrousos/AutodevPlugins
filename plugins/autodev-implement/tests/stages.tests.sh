@@ -1366,6 +1366,368 @@ t_no_workspace() {
 run_test 'the tracker still enforces when there is no workspace to write to' t_no_workspace
 
 # ---------------------------------------------------------------------------------------------
+section 'OpenTelemetry span emission'
+# ---------------------------------------------------------------------------------------------
+
+telemetry_dir() { # sid
+  local d="$COPILOT_HOME/otel/$1"
+  mkdir -p "$d" 2>/dev/null
+  printf '%s' "$d"
+}
+
+# Drives one full subagentStart/subagentStop round with the debug sink enabled. Sets
+# TELEMETRY_OUTPUT to the hook's stdout and TELEMETRY_SINK to the file the spans landed in.
+telemetry_round() { # sid agent verdict [agentId]
+  local sid="$1" agent="$2" verdict="$3" agent_id="${4:-agent-1}" cwd
+  cwd="$(session_cwd "$sid")"
+  TELEMETRY_SINK="$(telemetry_dir "$sid")/spans.jsonl"
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$TELEMETRY_SINK" \
+    hook subagentStart "$(jq -cn --arg s "$sid" --arg a "$agent" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:("autodev-implement:autodev-" + $a)}')" >/dev/null
+  TELEMETRY_OUTPUT="$(COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$TELEMETRY_SINK" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg a "$agent" --arg i "$agent_id" --arg c "$cwd" --arg v "$verdict" \
+      '{sessionId:$s, cwd:$c, agentName:("autodev-implement:autodev-" + $a),
+        agentId:$i, response:("Body text.\n\nAUTODEV-VERDICT: " + $v)}')")"
+}
+
+span_attr() { # sinkPath key
+  jq -r --arg k "$2" '
+    .resourceSpans[0].scopeSpans[0].spans[0].attributes[]
+    | select(.key == $k) | (.value.stringValue // .value.intValue)' "$1" 2>/dev/null | head -1
+}
+
+span_field() { # sinkPath jq-path
+  jq -r ".resourceSpans[0].scopeSpans[0].spans[0].$2" "$1" 2>/dev/null | head -1
+}
+
+# The subagentStop half of telemetry_round, for tests that need to inspect state in between.
+telemetry_round_stop_only() { # sid agent verdict [agentId]
+  local sid="$1" agent="$2" verdict="$3" agent_id="${4:-agent-1}" cwd
+  cwd="$(session_cwd "$sid")"
+  TELEMETRY_SINK="$(telemetry_dir "$sid")/spans.jsonl"
+  TELEMETRY_OUTPUT="$(COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$TELEMETRY_SINK" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg a "$agent" --arg i "$agent_id" --arg c "$cwd" --arg v "$verdict" \
+      '{sessionId:$s, cwd:$c, agentName:("autodev-implement:autodev-" + $a),
+        agentId:$i, response:("Body text.\n\nAUTODEV-VERDICT: " + $v)}')")"
+}
+
+t_otel_disabled_by_default() {
+  # COPILOT_OTEL_ENABLED deliberately absent: the overwhelmingly common case.
+  local sid sink footer
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_DEBUG_FILE="$sink" start_agent "$sid" tasking
+  footer="$(AUTODEV_OTEL_DEBUG_FILE="$sink" stop_agent "$sid" tasking "x
+
+AUTODEV-VERDICT: DONE" | jq -r '.modifiedResponse // ""')"
+  [ ! -f "$sink" ] || fail 'a span was emitted while telemetry was disabled' || return 1
+  assert_match 'stage tracker' "$footer" 'the footer must be unaffected'
+}
+run_test 'telemetry is off by default and writes nothing' t_otel_disabled_by_default
+
+t_otel_well_formed_span() {
+  local sid trace span start end
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  telemetry_round "$sid" tasking DONE
+  assert_equal 1 "$(wc -l < "$TELEMETRY_SINK" | tr -d ' ')" 'exactly one span per subagentStop' || return 1
+  jq -e . "$TELEMETRY_SINK" >/dev/null 2>&1 || fail 'the emitted document is not valid JSON' || return 1
+  trace="$(span_field "$TELEMETRY_SINK" traceId)"
+  span="$(span_field "$TELEMETRY_SINK" spanId)"
+  printf '%s' "$trace" | grep -qE '^[0-9a-f]{32}$' || fail "bad traceId '$trace'" || return 1
+  printf '%s' "$span" | grep -qE '^[0-9a-f]{16}$' || fail "bad spanId '$span'" || return 1
+  printf '%s' "$trace" | grep -qE '^0+$' && { fail 'an all-zero trace id is invalid'; return 1; }
+  printf '%s' "$span" | grep -qE '^0+$' && { fail 'an all-zero span id is invalid'; return 1; }
+  # OTLP/JSON encodes every int64 as a decimal string; a JSON number would lose precision.
+  assert_equal string "$(jq -r '.resourceSpans[0].scopeSpans[0].spans[0].startTimeUnixNano | type' "$TELEMETRY_SINK")" \
+    'startTimeUnixNano must be a JSON string' || return 1
+  assert_equal string "$(jq -r '.resourceSpans[0].scopeSpans[0].spans[0].endTimeUnixNano | type' "$TELEMETRY_SINK")" \
+    'endTimeUnixNano must be a JSON string' || return 1
+  start="$(span_field "$TELEMETRY_SINK" startTimeUnixNano)"
+  end="$(span_field "$TELEMETRY_SINK" endTimeUnixNano)"
+  [ "$start" -le "$end" ] 2>/dev/null || fail "span starts after it ends ($start > $end)" || return 1
+  assert_equal 'autodev.stage tasking' "$(span_field "$TELEMETRY_SINK" name)" || return 1
+  assert_equal autodev-implement "$(span_attr "$TELEMETRY_SINK" 'autodev.plugin')" || return 1
+  assert_equal tasking "$(span_attr "$TELEMETRY_SINK" 'autodev.stage')"
+}
+run_test 'an enabled round emits exactly one well-formed span document' t_otel_well_formed_span
+
+t_otel_review_issues() {
+  local sid
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  telemetry_round "$sid" code-review ISSUES
+  assert_equal ISSUES "$(span_attr "$TELEMETRY_SINK" 'autodev.verdict')" || return 1
+  assert_equal 1 "$(span_attr "$TELEMETRY_SINK" 'autodev.issues')" || return 1
+  assert_equal 0 "$(span_attr "$TELEMETRY_SINK" 'autodev.blocked')"
+}
+run_test 'a review ISSUES verdict is counted as an issue' t_otel_review_issues
+
+t_otel_review_pass() {
+  local sid
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  telemetry_round "$sid" code-security-review PASS
+  assert_equal PASS "$(span_attr "$TELEMETRY_SINK" 'autodev.verdict')" || return 1
+  assert_equal 0 "$(span_attr "$TELEMETRY_SINK" 'autodev.issues')" || return 1
+  assert_equal 0 "$(span_attr "$TELEMETRY_SINK" 'autodev.blocked')"
+}
+run_test 'a review PASS verdict is not counted as an issue' t_otel_review_pass
+
+t_otel_worker_blocked() {
+  # The two vocabularies must stay separate. A blocked implementation worker is an operational
+  # stall, not a review finding, so folding it into autodev.issues would inflate the ISSUES
+  # count the whole feature exists to report.
+  local sid
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  telemetry_round "$sid" implementation BLOCKED
+  assert_equal BLOCKED "$(span_attr "$TELEMETRY_SINK" 'autodev.verdict')" || return 1
+  assert_equal 0 "$(span_attr "$TELEMETRY_SINK" 'autodev.issues')" || return 1
+  assert_equal 1 "$(span_attr "$TELEMETRY_SINK" 'autodev.blocked')"
+}
+run_test 'a BLOCKED worker counts as blocked, not as a review issue' t_otel_worker_blocked
+
+t_otel_worker_done() {
+  local sid
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  telemetry_round "$sid" implementation DONE
+  assert_equal DONE "$(span_attr "$TELEMETRY_SINK" 'autodev.verdict')" || return 1
+  assert_equal 0 "$(span_attr "$TELEMETRY_SINK" 'autodev.issues')" || return 1
+  assert_equal 0 "$(span_attr "$TELEMETRY_SINK" 'autodev.blocked')"
+}
+run_test 'a DONE worker counts as neither' t_otel_worker_done
+
+t_otel_raw_session_id() {
+  # Copilot puts the session id on its own spans as gen_ai.conversation.id. Exporting the
+  # sanitized form used for filenames would silently break that join.
+  local raw='sess:with/unsafe chars' dir sink
+  dir="$(telemetry_dir "raw-$$-$RANDOM")"
+  sink="$dir/spans.jsonl"
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStart "$(jq -cn --arg s "$raw" --arg c "$dir" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review"}')" >/dev/null
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$raw" --arg c "$dir" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal "$raw" "$(span_attr "$sink" 'gen_ai.conversation.id')" || return 1
+  assert_equal "$raw" "$(span_attr "$sink" 'github.copilot.session.id')"
+}
+run_test 'the exported session id is the raw one, not the filename-safe one' t_otel_raw_session_id
+
+t_otel_missed_start_still_counts_the_invocation() {
+  # A stop with no matching start (state deleted mid-run, or the hooks installed part way
+  # through) is already recovered as attempt 1. The session total must be recovered too, or the
+  # span would export a total of zero for an invocation that demonstrably completed.
+  local sid cwd sink
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  # Deliberately no start_agent.
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal 1 "$(span_attr "$sink" 'autodev.total_invocations')" \
+    'a completed invocation must never export a session total of zero' || return 1
+  assert_equal 1 "$(jq -r '.totalInvocations // 0' "$(state_path "$sid")" 2>/dev/null)" \
+    'the recovered invocation must also be counted against the session ceiling'
+}
+run_test 'a stop without its start still counts as an invocation' t_otel_missed_start_still_counts_the_invocation
+
+t_otel_parents_under_copilot_trace() {
+  # The payload carries no trace context today, but the emitter already consumes it, so the day
+  # the CLI starts supplying one these spans join Copilot's trace with no code change.
+  local sid cwd sink tp
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  tp='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+  start_agent "$sid" code-review
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" --arg tp "$tp" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", traceparent:$tp, response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal '4bf92f3577b34da6a3ce929d0e0e4736' "$(span_field "$sink" traceId)" \
+    'the span must join the trace id from traceparent' || return 1
+  assert_equal '00f067aa0ba902b7' "$(span_field "$sink" parentSpanId)" \
+    'the span must hang off the parent span id from traceparent'
+}
+run_test "a traceparent parents the span under Copilot's trace" t_otel_parents_under_copilot_trace
+
+t_otel_without_traceparent_is_a_root_span() {
+  local sid trace
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  start_agent "$sid" tasking
+  telemetry_round_stop_only "$sid" tasking DONE
+  trace="$(span_field "$TELEMETRY_SINK" traceId)"
+  printf '%s' "$trace" | grep -qE '^[0-9a-f]{32}$' || fail "bad traceId '$trace'" || return 1
+  assert_equal null "$(span_field "$TELEMETRY_SINK" parentSpanId)" \
+    'a span with no trace context must not claim a parent' || return 1
+  assert_equal "$(span_field "$TELEMETRY_SINK" startTimeUnixNano)" \
+    "$(span_field "$TELEMETRY_SINK" endTimeUnixNano)" \
+    'the span marks an instant, not a duration'
+}
+run_test 'no traceparent still emits a correlatable root span' t_otel_without_traceparent_is_a_root_span
+
+t_otel_headers_stay_out_of_argv() {
+  # OTLP headers routinely carry a bearer token. argv is world readable on Linux through
+  # /proc/<pid>/cmdline, so a header passed as -H would expose the credential to any local
+  # process for the lifetime of the request.
+  local sid cwd stub argv_file
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  stub="$COPILOT_HOME/argvstub-$$-$RANDOM"
+  argv_file="$COPILOT_HOME/curl-argv-$$-$RANDOM.txt"
+  mkdir -p "$stub"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'printf "%%s\\n" "$@" > "%s"\n' "$argv_file"
+    printf 'cat > /dev/null\n'
+    printf 'exit 0\n'
+  } > "$stub/curl"
+  chmod +x "$stub/curl"
+
+  PATH="$stub:$PATH" COPILOT_OTEL_ENABLED=true \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+    OTEL_EXPORTER_OTLP_HEADERS='Authorization=Bearer%20SUPERSECRETTOKEN' \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+
+  [ -f "$argv_file" ] || fail 'curl was never invoked, so this test proves nothing' || return 1
+  if grep -q 'SUPERSECRETTOKEN' "$argv_file"; then
+    fail "the bearer token appears in curl argv: $(cat "$argv_file")"
+    return 1
+  fi
+  return 0
+}
+run_test 'header credentials never reach curl argv' t_otel_headers_stay_out_of_argv
+
+t_otel_empty_agent_id_does_not_shift_fields() {
+  # The emitter reads all its fields from one jq call. Splitting that on newline as IFS would
+  # collapse an empty field, shifting every later value left: an absent agentId put the attempt
+  # count in autodev.verdict and reported autodev.issues=0 for an ISSUES verdict, silently
+  # corrupting the one number this feature exists to produce.
+  local sid cwd sink
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  start_agent "$sid" code-review
+  COPILOT_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+  assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" 'verdict must survive an empty agentId' || return 1
+  assert_equal 1 "$(span_attr "$sink" 'autodev.issues')" 'the issue count must survive an empty agentId' || return 1
+  assert_equal autodev-implement "$(span_attr "$sink" 'autodev.plugin')" || return 1
+  assert_equal code-review "$(span_attr "$sink" 'autodev.stage')"
+}
+run_test 'an empty agentId does not shift the other span attributes' t_otel_empty_agent_id_does_not_shift_fields
+
+t_otel_grpc_suppressed() {
+  # We cannot speak gRPC from a script, and posting JSON at a gRPC port would be meaningless
+  # traffic rather than a dropped span.
+  local sid cwd sink footer
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  footer="$(COPILOT_OTEL_ENABLED=true OTEL_EXPORTER_OTLP_PROTOCOL=grpc AUTODEV_OTEL_DEBUG_FILE="$sink" \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" | jq -r '.modifiedResponse // ""')"
+  [ ! -f "$sink" ] || fail 'grpc must suppress export entirely' || return 1
+  assert_match 'stage tracker' "$footer" 'the footer must be unaffected'
+}
+run_test 'a grpc-configured exporter emits nothing' t_otel_grpc_suppressed
+
+t_otel_hostile_child_cannot_break_the_hook() {
+  # The safety property the whole design exists for. This script installs an ERR trap that
+  # prints '{}' and exits, so a telemetry child that exits non-zero -- or whose output leaked
+  # into this process -- would destroy the tracker footer.
+  local sid cwd sandbox out code
+  sandbox="$COPILOT_HOME/otel-hostile-$$-$RANDOM"
+  mkdir -p "$sandbox"
+  cp "$STAGE_SCRIPT" "$sandbox/autodev-stages.sh"
+  cat > "$sandbox/autodev-otel.sh" <<'HOSTILE'
+#!/usr/bin/env bash
+echo '{"permissionDecision":"deny"}'
+echo 'stray text that would break JSON parsing'
+echo 'exploding' >&2
+exit 3
+HOSTILE
+  chmod +x "$sandbox/autodev-otel.sh"
+
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  out="$(printf '%s\n' "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+    '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+      agentId:"a1", response:"Body text.\n\nAUTODEV-VERDICT: ISSUES"}')" |
+    COPILOT_OTEL_ENABLED=true bash "$sandbox/autodev-stages.sh" subagentStop)"
+  code=$?
+  assert_equal 0 "$code" 'a failing telemetry child must not change the exit code' || return 1
+  printf '%s' "$out" | jq -e . >/dev/null 2>&1 || fail "hook stdout is not valid JSON: $out" || return 1
+  [ "$(printf '%s' "$out" | jq -r '.permissionDecision // ""')" = "" ] ||
+    fail 'the telemetry child leaked a decision into hook output' || return 1
+  assert_match 'stage tracker' "$(printf '%s' "$out" | jq -r '.modifiedResponse // ""')" \
+    'the footer must survive'
+}
+run_test 'telemetry never alters the hook output or exit code' t_otel_hostile_child_cannot_break_the_hook
+
+t_otel_unreachable_collector() {
+  # No debug sink, so the emitter takes the real network path against a closed port.
+  local sid cwd footer
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  cwd="$(session_cwd "$sid")"
+  footer="$(COPILOT_OTEL_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:9 \
+    AUTODEV_OTEL_TIMEOUT_SEC=1 \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-implement:autodev-code-review",
+        agentId:"a1", response:"Body text.\n\nAUTODEV-VERDICT: ISSUES"}')" |
+    jq -r '.modifiedResponse // ""')"
+  assert_match 'stage tracker' "$footer" 'the footer must survive a failed export' || return 1
+  assert_match 'Recorded verdict: ISSUES' "$footer"
+}
+run_test 'an unreachable collector leaves the hook output intact' t_otel_unreachable_collector
+
+t_otel_enforcement_unchanged() {
+  # Proves the emitter is strictly additive.
+  local sid footer state
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 2
+  telemetry_round "$sid" tasking DONE
+  footer="$(printf '%s' "$TELEMETRY_OUTPUT" | jq -r '.modifiedResponse // ""')"
+  assert_match 'Recorded verdict: DONE' "$footer" || return 1
+  state="$(cat "$(state_path "$sid")")"
+  assert_equal DONE "$(printf '%s' "$state" | jq -r '.taskingVerdict')" || return 1
+  assert_equal 2 "$(printf '%s' "$state" | jq -r '.milestoneCount')" 'the todo list must still be parsed' || return 1
+  assert_equal DONE "$(printf '%s' "$state" | jq -r '.taskingVerdict')" \
+    'the verdict must still be recorded'
+}
+run_test 'enforcement still works with telemetry enabled' t_otel_enforcement_unchanged
+
+t_otel_emitter_ships_with_the_plugin() {
+  # hooks.json invokes the stage script by path and the stage script finds the emitter next to
+  # itself, so a missing copy would silently disable telemetry for the whole plugin.
+  local dir
+  dir="$(dirname "$STAGE_SCRIPT")"
+  [ -f "$dir/autodev-otel.sh" ] || fail "missing $dir/autodev-otel.sh" || return 1
+  [ -f "$dir/autodev-otel.ps1" ] || fail "missing $dir/autodev-otel.ps1"
+}
+run_test 'the emitter ships beside the stage script' t_otel_emitter_ships_with_the_plugin
+
+# ---------------------------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------------------------
 

@@ -53,6 +53,11 @@ $script:MaxBlocks = 5
 # GateOrder.Count * MaxAttempts, or it would fire before a single pass could spend the per-gate
 # budget and would silently become the real limit.
 $script:MaxTotalInvocations = 40
+# Hard ceiling on how long the telemetry child process may run before the parent kills it. Sits
+# well below the hook's own 20 second timeout so a hung collector can never cost the gate its
+# tracker footer, but high enough to absorb PowerShell process startup on a loaded machine --
+# at 6s, spans were silently dropped whenever several agents ran concurrently.
+$script:OtelParentTimeoutMs = 12000
 
 function Get-StateDirectory {
     # Enforcement state stays outside the workspace, keyed by session id. Two sessions running
@@ -477,6 +482,82 @@ function Write-JsonResult {
     Write-Output ($Result | ConvertTo-Json -Depth 5 -Compress)
 }
 
+function Test-TelemetryEnabled {
+    # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
+    # This is the entire cost of the telemetry feature for them: no state is kept for it, so
+    # nothing else in the hook does telemetry work either.
+    $value = [Environment]::GetEnvironmentVariable('COPILOT_OTEL_ENABLED')
+    if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+    return ($value.Trim().ToLowerInvariant() -in @('1', 'true', 'yes', 'on'))
+}
+
+function Get-PowerShellPath {
+    foreach ($candidate in @('powershell.exe', 'pwsh.exe')) {
+        $path = Join-Path $PSHOME $candidate
+        if (Test-Path -LiteralPath $path) { return $path }
+    }
+    return 'powershell.exe'
+}
+
+function Send-OtelSpan {
+    <#
+        Runs the OTLP emitter as an ISOLATED CHILD PROCESS with both output streams redirected
+        and discarded. This is a safety requirement, not a style preference: this script's stdout
+        is parsed as a single JSON document and it runs under $ErrorActionPreference = 'Stop', so
+        an in-process Invoke-RestMethod could put a response body on the success stream or turn a
+        transport warning into a terminating error. Neither can happen across a process boundary.
+
+        The parent also enforces a hard wall-clock bound by killing the child, because
+        Invoke-RestMethod's -TimeoutSec does not bound DNS resolution on Windows PowerShell 5.1
+        and this hook shares a 20 second budget.
+
+        Telemetry failure is never worth a failed hook, so every path returns quietly.
+    #>
+    param([hashtable]$Request)
+    try {
+        if (-not (Test-TelemetryEnabled)) { return }
+        $emitter = Join-Path $PSScriptRoot 'autodev-otel.ps1'
+        if (-not (Test-Path -LiteralPath $emitter)) { return }
+
+        $payloadPath = Join-Path ([IO.Path]::GetTempPath()) ("autodev-otel-$PID-$([guid]::NewGuid().ToString('N')).json")
+        Set-Content -LiteralPath $payloadPath -Encoding UTF8 `
+            -Value ($Request | ConvertTo-Json -Depth 5 -Compress)
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = Get-PowerShellPath
+            $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $emitter +
+            '" -PayloadPath "' + $payloadPath + '"'
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.RedirectStandardInput = $true
+
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            if ($null -eq $proc) { return }
+            try {
+                $proc.StandardInput.Close()
+                # Drain both pipes so a child that unexpectedly wrote a lot could not block on a
+                # full buffer and burn the whole timeout.
+                $null = $proc.StandardOutput.ReadToEndAsync()
+                $null = $proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($script:OtelParentTimeoutMs)) {
+                    try { $proc.Kill() } catch { }
+                }
+            }
+            finally {
+                $proc.Dispose()
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        # No telemetry, unchanged hook.
+    }
+}
+
 # --------------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------------
@@ -553,6 +634,14 @@ try {
                 # subagentStart was missed somehow; still count this attempt.
                 $state["${gate}Attempts"] = 1
             }
+            # Recover the session total ONLY when nothing at all has been counted yet. A per-gate
+            # attempt counter cannot answer "was my start missed": subagentStart zeroes the later
+            # gates' counters, so a security stop arriving after an architecture re-gate would see
+            # zero and count itself a second time, prematurely exhausting the session ceiling and
+            # forcing an escalation. Keying off the session total instead can only ever under-
+            # count, which for a runaway guard is the harmless direction, while still keeping a
+            # completed invocation from exporting a total of zero.
+            if ([int]$state['totalInvocations'] -lt 1) { $state['totalInvocations'] = 1 }
             $state["${gate}Verdict"] = $verdict
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
@@ -604,6 +693,32 @@ try {
             }
 
             $footer = $footerLines -join [Environment]::NewLine
+            # Telemetry last, after every piece of enforcement state is durable. The raw session
+            # id is used deliberately: the sanitized form exists only to build a safe filename,
+            # and exporting it would break the join against Copilot's own spans for any session
+            # id containing a character the sanitizer rewrites.
+            Send-OtelSpan -Request @{
+                spanName         = "autodev.gate $gate"
+                sessionId        = [string]$payload.sessionId
+                agentName        = [string]$payload.agentName
+                agentId          = [string]$payload.agentId
+                plugin           = 'autodev-plan'
+                unitKey          = 'autodev.gate'
+                unitValue        = $gate
+                verdict          = $verdict
+                attempt          = $attempt
+                totalInvocations = [int]$state['totalInvocations']
+                # Passed through raw, NOT cast to [long] here. This hashtable is built before
+                # Send-OtelSpan is entered, so it is outside its protective try/catch: a
+                # non-numeric timestamp would throw under $ErrorActionPreference = 'Stop' and the
+                # outer catch would emit '{}' instead of the tracker footer -- even with
+                # telemetry disabled. The emitter validates it safely with Get-LongField.
+                timeMs           = $payload.timestamp
+                # Absent today, but forwarded so the span parents itself under Copilot's own
+                # sub-agent span the moment the CLI starts supplying trace context.
+                traceparent      = [string]$payload.traceparent
+                tracestate       = [string]$payload.tracestate
+            }
             Write-JsonResult @{ modifiedResponse = ($response + [Environment]::NewLine + $footer) }
             exit 0
         }

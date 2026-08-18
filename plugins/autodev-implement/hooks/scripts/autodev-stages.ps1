@@ -414,6 +414,20 @@ function Get-AgentKind {
     return 'worker'
 }
 
+function Get-AttemptsKey {
+    # The state counter each agent charges its attempts against.
+    param([string]$Agent)
+    switch ($Agent) {
+        'tasking' { return 'taskingAttempts' }
+        'implementation' { return 'implementAttempts' }
+        'code-review' { return 'reviewAttempts' }
+        'code-fix' { return 'fixInvocations' }
+        'code-security-review' { return 'securityAttempts' }
+        'code-privacy-review' { return 'privacyAttempts' }
+    }
+    return ''
+}
+
 function Get-TaskAgentType {
     param($ToolArgs)
     # toolArgs arrives as a JSON *string* rather than an object, so it needs a second parse.
@@ -773,6 +787,88 @@ function Write-JsonResult {
     Write-Output ($Result | ConvertTo-Json -Depth 5 -Compress)
 }
 
+# Hard ceiling on how long the telemetry child process may run before the parent kills it. Sits
+# well below the hook's own 20 second timeout so a hung collector can never cost the gate its
+# tracker footer, but high enough to absorb PowerShell process startup on a loaded machine --
+# at 6s, spans were silently dropped whenever several agents ran concurrently.
+$script:OtelParentTimeoutMs = 12000
+
+function Test-TelemetryEnabled {
+    # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
+    # This is the entire cost of the telemetry feature for them: no state is kept for it, so
+    # nothing else in the hook does telemetry work either.
+    $value = [Environment]::GetEnvironmentVariable('COPILOT_OTEL_ENABLED')
+    if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+    return ($value.Trim().ToLowerInvariant() -in @('1', 'true', 'yes', 'on'))
+}
+
+function Get-PowerShellPath {
+    foreach ($candidate in @('powershell.exe', 'pwsh.exe')) {
+        $path = Join-Path $PSHOME $candidate
+        if (Test-Path -LiteralPath $path) { return $path }
+    }
+    return 'powershell.exe'
+}
+
+function Send-OtelSpan {
+    <#
+        Runs the OTLP emitter as an ISOLATED CHILD PROCESS with both output streams redirected
+        and discarded. This is a safety requirement, not a style preference: this script's stdout
+        is parsed as a single JSON document and it runs under $ErrorActionPreference = 'Stop', so
+        an in-process Invoke-RestMethod could put a response body on the success stream or turn a
+        transport warning into a terminating error. Neither can happen across a process boundary.
+
+        The parent also enforces a hard wall-clock bound by killing the child, because
+        Invoke-RestMethod's -TimeoutSec does not bound DNS resolution on Windows PowerShell 5.1
+        and this hook shares a 20 second budget.
+
+        Telemetry failure is never worth a failed hook, so every path returns quietly.
+    #>
+    param([hashtable]$Request)
+    try {
+        if (-not (Test-TelemetryEnabled)) { return }
+        $emitter = Join-Path $PSScriptRoot 'autodev-otel.ps1'
+        if (-not (Test-Path -LiteralPath $emitter)) { return }
+
+        $payloadPath = Join-Path ([IO.Path]::GetTempPath()) ("autodev-otel-$PID-$([guid]::NewGuid().ToString('N')).json")
+        Set-Content -LiteralPath $payloadPath -Encoding UTF8 `
+            -Value ($Request | ConvertTo-Json -Depth 5 -Compress)
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = Get-PowerShellPath
+            $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $emitter +
+            '" -PayloadPath "' + $payloadPath + '"'
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.RedirectStandardInput = $true
+
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            if ($null -eq $proc) { return }
+            try {
+                $proc.StandardInput.Close()
+                # Drain both pipes so a child that unexpectedly wrote a lot could not block on a
+                # full buffer and burn the whole timeout.
+                $null = $proc.StandardOutput.ReadToEndAsync()
+                $null = $proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($script:OtelParentTimeoutMs)) {
+                    try { $proc.Kill() } catch { }
+                }
+            }
+            finally {
+                $proc.Dispose()
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        # No telemetry, unchanged hook.
+    }
+}
+
 # --------------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------------
@@ -910,14 +1006,8 @@ try {
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = 0
-            switch ($agent) {
-                'tasking' { $attempt = [int]$state['taskingAttempts'] }
-                'implementation' { $attempt = [int]$state['implementAttempts'] }
-                'code-review' { $attempt = [int]$state['reviewAttempts'] }
-                'code-fix' { $attempt = [int]$state['fixInvocations'] }
-                'code-security-review' { $attempt = [int]$state['securityAttempts'] }
-                'code-privacy-review' { $attempt = [int]$state['privacyAttempts'] }
-            }
+            $attemptsKey = Get-AttemptsKey -Agent $agent
+            if ($attemptsKey -ne '') { $attempt = [int]$state[$attemptsKey] }
             Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $agent `
                 -Milestone $milestoneLabel -Attempt $attempt -Action 'invoked' -Verdict '-'
 
@@ -942,10 +1032,27 @@ try {
             $attempt = 0
             $extraNotes = @()
 
+            # Every branch below charges this stop against the agent's own attempt counter and
+            # reports that number, so both are done once here rather than six times.
+            # Get-AttemptsKey is the single place that knows which counter belongs to which agent,
+            # because the names are not mechanically related (code-fix uses 'fixInvocations').
+            $attemptsKey = Get-AttemptsKey -Agent $agent
+            if ($attemptsKey -ne '') {
+                # subagentStart was missed somehow; still count this attempt.
+                if ([int]$state[$attemptsKey] -lt 1) { $state[$attemptsKey] = 1 }
+                $attempt = [int]$state[$attemptsKey]
+            }
+            # Recover the session total ONLY when nothing at all has been counted yet. A per-stage
+            # attempt counter cannot answer "was my start missed": an implementation start zeroes
+            # the downstream counters, so a security review stop arriving afterwards would see
+            # zero and count itself a second time, prematurely exhausting the session ceiling.
+            # Keying off the session total instead can only ever under-count, which for a runaway
+            # guard is the harmless direction, while still keeping a completed invocation from
+            # exporting a total of zero.
+            if ([int]$state['totalInvocations'] -lt 1) { $state['totalInvocations'] = 1 }
+
             switch ($agent) {
                 'tasking' {
-                    if ([int]$state['taskingAttempts'] -lt 1) { $state['taskingAttempts'] = 1 }
-                    $attempt = [int]$state['taskingAttempts']
                     if ($verdict -eq 'DONE') {
                         $parsedCount = Get-MilestoneCount -TodoPath $todoPath
                         if ($parsedCount -gt 0) {
@@ -974,9 +1081,7 @@ try {
                     $state['taskingVerdict'] = $verdict
                 }
                 'implementation' {
-                    if ([int]$state['implementAttempts'] -lt 1) { $state['implementAttempts'] = 1 }
                     $state['implementVerdict'] = $verdict
-                    $attempt = [int]$state['implementAttempts']
                     $milestoneLabel = [string][int]$state['currentMilestone']
                     if ($verdict -eq 'DONE') {
                         $status = Get-MilestoneStatus -TodoPath $todoPath -Milestone ([int]$state['currentMilestone'])
@@ -986,14 +1091,10 @@ try {
                     }
                 }
                 'code-review' {
-                    if ([int]$state['reviewAttempts'] -lt 1) { $state['reviewAttempts'] = 1 }
                     $state['reviewVerdict'] = $verdict
-                    $attempt = [int]$state['reviewAttempts']
                     $milestoneLabel = [string][int]$state['currentMilestone']
                 }
                 'code-fix' {
-                    if ([int]$state['fixInvocations'] -lt 1) { $state['fixInvocations'] = 1 }
-                    $attempt = [int]$state['fixInvocations']
                     if ([int]$state['completedMilestones'] -lt (Get-EffectiveMilestoneCount -State $state)) {
                         $milestoneLabel = [string][int]$state['currentMilestone']
                     }
@@ -1002,14 +1103,10 @@ try {
                     }
                 }
                 'code-security-review' {
-                    if ([int]$state['securityAttempts'] -lt 1) { $state['securityAttempts'] = 1 }
                     $state['securityVerdict'] = $verdict
-                    $attempt = [int]$state['securityAttempts']
                 }
                 'code-privacy-review' {
-                    if ([int]$state['privacyAttempts'] -lt 1) { $state['privacyAttempts'] = 1 }
                     $state['privacyVerdict'] = $verdict
-                    $attempt = [int]$state['privacyAttempts']
                 }
             }
 
@@ -1050,6 +1147,32 @@ try {
             }
 
             $footer = $footerLines -join [Environment]::NewLine
+            # Telemetry last, after every piece of enforcement state is durable. The raw session
+            # id is used deliberately: the sanitized form exists only to build a safe filename,
+            # and exporting it would break the join against Copilot's own spans for any session
+            # id containing a character the sanitizer rewrites.
+            Send-OtelSpan -Request @{
+                spanName         = "autodev.stage $agent"
+                sessionId        = [string]$payload.sessionId
+                agentName        = [string]$payload.agentName
+                agentId          = [string]$payload.agentId
+                plugin           = 'autodev-implement'
+                unitKey          = 'autodev.stage'
+                unitValue        = $agent
+                verdict          = $verdict
+                attempt          = $attempt
+                totalInvocations = [int]$state['totalInvocations']
+                # Passed through raw, NOT cast to [long] here. This hashtable is built before
+                # Send-OtelSpan is entered, so it is outside its protective try/catch: a
+                # non-numeric timestamp would throw under $ErrorActionPreference = 'Stop' and the
+                # outer catch would emit '{}' instead of the tracker footer -- even with
+                # telemetry disabled. The emitter validates it safely with Get-LongField.
+                timeMs           = $payload.timestamp
+                # Absent today, but forwarded so the span parents itself under Copilot's own
+                # sub-agent span the moment the CLI starts supplying trace context.
+                traceparent      = [string]$payload.traceparent
+                tracestate       = [string]$payload.tracestate
+            }
             Write-JsonResult @{ modifiedResponse = ($response + [Environment]::NewLine + $footer) }
             exit 0
         }

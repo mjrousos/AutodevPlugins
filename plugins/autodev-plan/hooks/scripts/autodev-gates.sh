@@ -47,6 +47,17 @@ MAX_TOTAL_INVOCATIONS=40
 
 json_get() { printf '%s' "$RAW_INPUT" | jq -r "$1 // \"\"" 2>/dev/null; }
 
+# Numeric payload field, defaulting to 0. Kept separate from json_get because --argjson rejects
+# an empty string, which would abort the whole span document.
+json_get_num() {
+  local v
+  v="$(printf '%s' "$RAW_INPUT" | jq -r "$1 // 0" 2>/dev/null)"
+  case "$v" in
+    '' | *[!0-9]*) printf '0' ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
 SESSION_ID="$(json_get '.sessionId')"
 SESSION_CWD="$(json_get '.cwd')"
 
@@ -175,6 +186,45 @@ write_state() {
 
 state_num() { printf '%s' "$1" | jq -r ".$2 // 0" 2>/dev/null; }
 state_str() { printf '%s' "$1" | jq -r ".$2 // \"pending\"" 2>/dev/null; }
+
+# Directory this script lives in, so the telemetry emitter beside it can be found regardless of
+# the hook's working directory. Resolved with parameter expansion rather than 'dirname' so it
+# still works on a minimal PATH -- 'cd' and 'pwd' are builtins, 'dirname' is not. The
+# '|| SCRIPT_DIR=' keeps a failure here off the ERR trap.
+SCRIPT_SELF="${BASH_SOURCE[0]}"
+SCRIPT_SELF_DIR="${SCRIPT_SELF%/*}"
+# No slash at all means the script was invoked by bare name, so it lives in the current directory.
+# Written as if/fi rather than '&&' because a false test at top level would fire the ERR trap.
+if [ "$SCRIPT_SELF_DIR" = "$SCRIPT_SELF" ]; then SCRIPT_SELF_DIR="."; fi
+SCRIPT_DIR="$(cd "$SCRIPT_SELF_DIR" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
+
+telemetry_enabled() {
+  # Cheap early-out for the overwhelming majority of users, who never set COPILOT_OTEL_ENABLED.
+  # Deliberately pure parameter matching: piping through 'tr' to normalise case would spawn two
+  # child processes on every hook event just to decide not to emit anything.
+  case "${COPILOT_OTEL_ENABLED:-}" in
+    1 | true | TRUE | True | yes | YES | Yes | on | ON | On) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+send_otel_span() {
+  # Runs the OTLP emitter as an ISOLATED CHILD PROCESS with stdin closed and both output streams
+  # discarded. This is a safety requirement, not a style preference: this script installs an ERR
+  # trap that prints '{}' and exits, so a non-zero return from curl running in this process would
+  # destroy the tracker footer the gate depends on. The trailing '|| :' below is what keeps a
+  # failing child off that trap; do not remove it.
+  local request="$1" emitter tmp
+  telemetry_enabled || return 0
+  [ -n "$SCRIPT_DIR" ] || return 0
+  emitter="$SCRIPT_DIR/autodev-otel.sh"
+  [ -f "$emitter" ] || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  printf '%s' "$request" > "$tmp" 2>/dev/null || :
+  bash "$emitter" "$tmp" >/dev/null 2>&1 </dev/null || :
+  rm -f "$tmp" 2>/dev/null || :
+  return 0
+}
 
 add_audit_row() {
   local gate="$1" attempt="$2" action="$3" verdict="$4" session_marker
@@ -383,10 +433,19 @@ case "$EVENT_NAME" in
     VERDICT="$(read_verdict "$RESPONSE")"
 
     ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
+    TOTAL_INVOCATIONS="$(state_num "$STATE" 'totalInvocations')"
     # subagentStart was missed somehow; still count this attempt.
-    [ "$ATTEMPTS" -lt 1 ] 2>/dev/null && ATTEMPTS=1
+    if [ "$ATTEMPTS" -lt 1 ] 2>/dev/null; then ATTEMPTS=1; fi
+    # Recover the session total ONLY when nothing at all has been counted yet. A per-gate attempt
+    # counter cannot answer "was my start missed": subagentStart zeroes the later gates' counters,
+    # so a security stop arriving after an architecture re-gate would see zero and count itself a
+    # second time, prematurely exhausting the session ceiling and forcing an escalation. Keying
+    # off the session total instead can only ever under-count, which for a runaway guard is the
+    # harmless direction, while still keeping a completed invocation from exporting zero.
+    if [ "$TOTAL_INVOCATIONS" -lt 1 ] 2>/dev/null; then TOTAL_INVOCATIONS=1; fi
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v")"
+      --argjson t "$TOTAL_INVOCATIONS" \
+      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .totalInvocations = \$t")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
     # Capture the review itself, not just that it happened, so the findings survive the session
@@ -424,6 +483,27 @@ Reviewer feedback log: $FEEDBACK_PATH"
 Gate: $GATE | Attempt $ATTEMPTS of $MAX_ATTEMPTS | Recorded verdict: $VERDICT
 Gate status: $STATUS_LINE
 $NEXT_ACTION"
+
+    # Telemetry last, after every piece of enforcement state is durable. The raw session id is
+    # used deliberately: SAFE_SESSION_ID exists only to build a safe filename, and exporting it
+    # would break the join against Copilot's own spans for any session id containing a character
+    # the sanitizer rewrites.
+    send_otel_span "$(jq -cn \
+      --arg span "autodev.gate $GATE" \
+      --arg sid "$SESSION_ID" \
+      --arg agentName "$(json_get '.agentName')" \
+      --arg agentId "$(json_get '.agentId')" \
+      --arg unitValue "$GATE" \
+      --arg verdict "$VERDICT" \
+      --argjson attempt "$ATTEMPTS" \
+      --argjson total "$(state_num "$STATE" 'totalInvocations')" \
+      --argjson timeMs "$(json_get_num '.timestamp')" \
+      --arg traceparent "$(json_get '.traceparent')" \
+      --arg tracestate "$(json_get '.tracestate')" \
+      '{spanName: $span, sessionId: $sid, agentName: $agentName, agentId: $agentId,
+        plugin: "autodev-plan", unitKey: "autodev.gate", unitValue: $unitValue,
+        verdict: $verdict, attempt: $attempt, totalInvocations: $total,
+        timeMs: $timeMs, traceparent: $traceparent, tracestate: $tracestate}' 2>/dev/null)" || :
 
     jq -cn --arg r "$RESPONSE
 $FOOTER" '{modifiedResponse: $r}'
