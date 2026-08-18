@@ -162,7 +162,7 @@ export AUTODEV_OTEL_ENABLED=1     # posts to http://localhost:4318/v1/traces
 The equivalent `COPILOT_OTEL_ENABLED`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL`,
 `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` and `OTEL_SERVICE_NAME` variables are still
-read, as a fallback for hosts that do not scrub them. The `AUTODEV_OTEL_*` name always wins.
+read, as a fallback for hosts that do not scrub them. Endpoints are resolved one namespace at a time: if any `AUTODEV_OTEL_*` endpoint is set, the legacy pair is not consulted at all, so an inherited `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` can never outrank `AUTODEV_OTEL_ENDPOINT` despite being the more specific name.
 Under Copilot CLI they are invisible, so do not rely on them.
 
 ### What is emitted

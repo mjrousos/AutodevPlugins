@@ -123,16 +123,27 @@ resolve_protocol() {
 }
 
 resolve_endpoint() {
-  # Per the OTLP exporter specification the signal-specific variable is used verbatim, while the
-  # generic one is a base that '/v1/traces' is appended to. Copilot's implicit
-  # 'http://localhost:4318' default is reproduced as a last resort, because a hook cannot see the
-  # endpoint Copilot itself resolved and most users never set one explicitly.
+  # Resolved one namespace at a time, AUTODEV_OTEL_* first. Within a namespace the OTLP rule
+  # applies -- the signal-specific variable is used verbatim, while the generic one is a base that
+  # '/v1/traces' is appended to -- but a legacy OTEL_* value never outranks an AUTODEV_OTEL_* one,
+  # however specific it is. Mixing the two would let an inherited OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+  # silently redirect spans away from the endpoint the user configured for this emitter, and take
+  # the AUTODEV_OTEL_HEADERS credentials with them.
+  #
+  # Copilot's implicit 'http://localhost:4318' default is reproduced as a last resort, because a
+  # hook cannot see the endpoint Copilot itself resolved and most users never set one.
   local specific generic
-  specific="$(env_first AUTODEV_OTEL_TRACES_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)"
+  specific="$(env_first AUTODEV_OTEL_TRACES_ENDPOINT)"
   if [ -n "$specific" ]; then printf '%s' "$specific"; return; fi
-  generic="$(env_first AUTODEV_OTEL_ENDPOINT OTEL_EXPORTER_OTLP_ENDPOINT)"
-  [ -n "$generic" ] || generic="$DEFAULT_ENDPOINT"
-  printf '%s/v1/traces' "${generic%/}"
+  generic="$(env_first AUTODEV_OTEL_ENDPOINT)"
+  if [ -n "$generic" ]; then printf '%s/v1/traces' "${generic%/}"; return; fi
+
+  specific="$(env_first OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)"
+  if [ -n "$specific" ]; then printf '%s' "$specific"; return; fi
+  generic="$(env_first OTEL_EXPORTER_OTLP_ENDPOINT)"
+  if [ -n "$generic" ]; then printf '%s/v1/traces' "${generic%/}"; return; fi
+
+  printf '%s/v1/traces' "${DEFAULT_ENDPOINT%/}"
 }
 
 # http/https only, so a malformed variable cannot turn into some other scheme.

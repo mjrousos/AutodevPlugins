@@ -231,27 +231,41 @@ SCRIPT_DIR="$(cd "$SCRIPT_SELF_DIR" >/dev/null 2>&1 && pwd)" || SCRIPT_DIR=""
 
 telemetry_enabled() {
   # Cheap early-out for the overwhelming majority of users, who never opt in to hook telemetry.
-  # Deliberately pure parameter matching: piping through 'tr' to normalise case would spawn two
-  # child processes on every hook event just to decide not to emit anything.
+  # Deliberately free of subprocesses: trimming is pure parameter expansion and the truthy match
+  # uses bracket classes, so no 'tr' is spawned on every hook event just to decide not to emit.
+  # Bracket classes rather than '${v,,}', which needs bash 4 and would break the macOS bash 3.2
+  # this also has to run on.
   #
   # Keyed off AUTODEV_OTEL_* rather than Copilot's own OTEL_* variables because Copilot CLI
   # scrubs every 'OTEL_'/'COPILOT_OTEL_' prefixed variable from a command hook's environment, so
   # the latter are never visible here. COPILOT_OTEL_ENABLED remains a fallback for hosts that do
-  # not scrub. Must stay in step with telemetry_enabled() in autodev-otel.sh.
+  # not scrub. Trimming and case handling must stay identical to telemetry_enabled() in
+  # autodev-otel.sh: a gate stricter than the emitter silently drops spans, and one that is looser
+  # spawns an emitter process that only exits again.
+  local value
 
-  # Tri-state: set-and-falsy is an explicit OFF that outranks every other signal.
-  case "${AUTODEV_OTEL_ENABLED:-}" in
+  # Tri-state: set-and-falsy is an explicit OFF that outranks every other signal. Whitespace is
+  # stripped wholesale rather than trimmed, exactly as is_truthy() in autodev-otel.sh does with
+  # 'tr -d', so the gate and the emitter can never disagree about a value.
+  value="${AUTODEV_OTEL_ENABLED:-}"
+  value="${value//[[:space:]]/}"
+  case "$value" in
     '') ;;
-    1 | true | TRUE | True | yes | YES | Yes | on | ON | On) return 0 ;;
+    1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
     *) return 1 ;;
   esac
 
   # Written as if/fi rather than '&&': a false test at statement level would fire the ERR trap.
-  if [ -n "${AUTODEV_OTEL_TRACES_ENDPOINT:-}" ]; then return 0; fi
-  if [ -n "${AUTODEV_OTEL_ENDPOINT:-}" ]; then return 0; fi
+  for value in "${AUTODEV_OTEL_TRACES_ENDPOINT:-}" "${AUTODEV_OTEL_ENDPOINT:-}"; do
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [ -n "$value" ]; then return 0; fi
+  done
 
-  case "${COPILOT_OTEL_ENABLED:-}" in
-    1 | true | TRUE | True | yes | YES | Yes | on | ON | On) return 0 ;;
+  value="${COPILOT_OTEL_ENABLED:-}"
+  value="${value//[[:space:]]/}"
+  case "$value" in
+    1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) return 0 ;;
     *) return 1 ;;
   esac
 }

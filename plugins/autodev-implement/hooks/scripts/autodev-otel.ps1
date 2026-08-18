@@ -131,16 +131,26 @@ function Get-Protocol {
 }
 
 function Get-TracesEndpoint {
-    # Per the OTLP exporter specification the signal-specific variable is used verbatim, while
-    # the generic one is a base that '/v1/traces' is appended to. Copilot's implicit
-    # 'http://localhost:4318' default is reproduced as a last resort, because a hook cannot see
-    # the endpoint Copilot itself resolved and most users never set one explicitly.
-    $specific = Get-EnvFirst @('AUTODEV_OTEL_TRACES_ENDPOINT', 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT')
-    if (-not [string]::IsNullOrWhiteSpace($specific)) { return $specific }
+    <#
+        Resolved one namespace at a time, AUTODEV_OTEL_* first. Within a namespace the OTLP rule
+        applies -- the signal-specific variable is used verbatim, while the generic one is a base
+        that '/v1/traces' is appended to -- but a legacy OTEL_* value never outranks an
+        AUTODEV_OTEL_* one, however specific it is. Mixing the two would let an inherited
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT silently redirect spans away from the endpoint the user
+        configured for this emitter, and take the AUTODEV_OTEL_HEADERS credentials with them.
 
-    $generic = Get-EnvFirst @('AUTODEV_OTEL_ENDPOINT', 'OTEL_EXPORTER_OTLP_ENDPOINT')
-    if ([string]::IsNullOrWhiteSpace($generic)) { $generic = $script:DefaultEndpoint }
-    return ($generic.TrimEnd('/') + '/v1/traces')
+        Copilot's implicit 'http://localhost:4318' default is reproduced as a last resort, because
+        a hook cannot see the endpoint Copilot itself resolved and most users never set one.
+    #>
+    foreach ($pair in @(
+            @{ Specific = 'AUTODEV_OTEL_TRACES_ENDPOINT'; Generic = 'AUTODEV_OTEL_ENDPOINT' },
+            @{ Specific = 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'; Generic = 'OTEL_EXPORTER_OTLP_ENDPOINT' })) {
+        $specific = Get-EnvFirst @($pair.Specific)
+        if (-not [string]::IsNullOrWhiteSpace($specific)) { return $specific }
+        $generic = Get-EnvFirst @($pair.Generic)
+        if (-not [string]::IsNullOrWhiteSpace($generic)) { return ($generic.TrimEnd('/') + '/v1/traces') }
+    }
+    return ($script:DefaultEndpoint.TrimEnd('/') + '/v1/traces')
 }
 
 function Test-Endpoint {

@@ -1319,6 +1319,23 @@ AUTODEV-VERDICT: ISSUES" >/dev/null
 }
 run_test "an AUTODEV endpoint alone turns telemetry on" t_otel_autodev_endpoint_alone
 
+t_otel_padded_mixed_case_value() {
+  # The hook's own gate and the emitter's gate are separate implementations of one decision, and
+  # they must agree on awkward values: a gate stricter than the emitter drops the span without
+  # ever spawning it, while a looser one spawns a process that only exits again. Whitespace and
+  # casing are where they most easily drift apart.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED="  TrUe	" AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED="  TrUe	" AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  [ -f "$sink" ] || fail 'a padded, mixed-case value must enable telemetry' || return 1
+  assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" 'the verdict must be recorded'
+}
+run_test "a padded, mixed-case enabling value still emits" t_otel_padded_mixed_case_value
+
 t_otel_explicit_off_wins() {
   # Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and Copilot's
   # own switch, so hook telemetry can be silenced without disturbing Copilot's exporter or
@@ -1603,6 +1620,50 @@ t_otel_malformed_timestamp_cannot_break_the_hook() {
     'the emitter must substitute a usable timestamp'
 }
 run_test "a malformed timestamp cannot break the hook" t_otel_malformed_timestamp_cannot_break_the_hook
+
+t_otel_autodev_endpoint_outranks_legacy() {
+  # On a host that does NOT scrub Copilot's variables both namespaces can be set at once. The
+  # AUTODEV_OTEL_* value has to win even against the more specific legacy name, or an inherited
+  # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT would silently redirect spans away from the endpoint
+  # configured for this emitter -- and carry the AUTODEV_OTEL_HEADERS credentials with it.
+  local sid cwd stub config_copy
+  sid="$(new_session_id)"
+  cwd="$(session_cwd "$sid")"
+  stub="$COPILOT_HOME/urlstub-$$-$RANDOM"
+  config_copy="$COPILOT_HOME/curl-config-$$-$RANDOM.txt"
+  mkdir -p "$stub"
+  # The URL travels in curl's -K config file, not argv, so the stub copies that file out before
+  # the emitter deletes it.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'prev=""\n'
+    printf 'for a in "$@"; do\n'
+    printf '  if [ "$prev" = "-K" ]; then cp "$a" "%s" 2>/dev/null; fi\n' "$config_copy"
+    printf '  prev="$a"\n'
+    printf 'done\n'
+    printf 'cat > /dev/null\n'
+    printf 'exit 0\n'
+  } > "$stub/curl"
+  chmod +x "$stub/curl"
+
+  PATH="$stub:$PATH" AUTODEV_OTEL_ENABLED=true \
+    AUTODEV_OTEL_ENDPOINT=http://autodev.example:4318 \
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://legacy.example/v1/traces \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://legacy.example:4318 \
+    hook subagentStop "$(jq -cn --arg s "$sid" --arg c "$cwd" \
+      '{sessionId:$s, cwd:$c, agentName:"autodev-plan:autodev-architecture-review",
+        agentId:"a1", response:"x\n\nAUTODEV-VERDICT: ISSUES"}')" >/dev/null
+
+  [ -f "$config_copy" ] ||
+    fail 'curl was never invoked, so this test proves nothing' || return 1
+  if grep -q 'legacy.example' "$config_copy"; then
+    fail "a legacy OTEL_* endpoint outranked AUTODEV_OTEL_ENDPOINT: $(cat "$config_copy")"
+    return 1
+  fi
+  grep -q 'autodev.example:4318/v1/traces' "$config_copy" ||
+    fail "the AUTODEV endpoint was not used: $(cat "$config_copy")" || return 1
+}
+run_test "an AUTODEV endpoint outranks a more specific legacy one" t_otel_autodev_endpoint_outranks_legacy
 
 t_otel_headers_stay_out_of_argv() {
   # OTLP headers routinely carry a bearer token. argv is world readable on Linux through

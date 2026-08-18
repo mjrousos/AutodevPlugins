@@ -1192,6 +1192,71 @@ Test-Case 'an AUTODEV endpoint alone turns telemetry on' {
     }
 }
 
+Test-Case 'an AUTODEV endpoint outranks a more specific legacy one' {
+    <#
+        On a host that does NOT scrub Copilot's variables both namespaces can be set at once. The
+        AUTODEV_OTEL_* value has to win even against the more specific legacy name, or an
+        inherited OTEL_EXPORTER_OTLP_TRACES_ENDPOINT would silently redirect spans away from the
+        endpoint configured for this emitter -- and carry the AUTODEV_OTEL_HEADERS credentials
+        with it.
+
+        Observed with a loopback socket rather than a stub, because the PowerShell emitter posts
+        in-process with Invoke-RestMethod and there is no external command to intercept.
+    #>
+    $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+        $session = New-SessionId
+        $agentName = 'autodev-plan:autodev-architecture-review'
+        $vars = @{
+            AUTODEV_OTEL_ENABLED               = 'true'
+            AUTODEV_OTEL_ENDPOINT              = "http://127.0.0.1:$port"
+            # Deliberately more specific than the AUTODEV base endpoint. If precedence were wrong
+            # the request would go here instead and nothing would reach the listener.
+            OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = 'http://127.0.0.1:9/v1/traces'
+            OTEL_EXPORTER_OTLP_ENDPOINT        = 'http://127.0.0.1:9'
+        }
+        Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+        # Nothing accepts the connection while the hook runs, and nothing needs to: the listen
+        # backlog completes the TCP handshake and buffers the request, so the emitter's POST is
+        # still readable afterwards. It sits out its own 2s timeout waiting for a reply that never
+        # comes, which it swallows -- exactly the "collector is unreachable" path.
+        $out = Invoke-HookWithEnv 'subagentStop' @{
+            sessionId = $session; agentName = $agentName; agentId = 'a1'
+            response  = "x`n`nAUTODEV-VERDICT: ISSUES"
+        } $vars
+        Assert-Match 'gate tracker' (Get-Footer $out) 'an unanswered collector must not disturb the footer'
+
+        if (-not $listener.Pending()) {
+            throw 'nothing connected to the AUTODEV endpoint, so a legacy OTEL_* endpoint outranked it'
+        }
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $stream.ReadTimeout = 5000
+            $buffer = New-Object byte[] 4096
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            $request = [Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+            Assert-Match 'POST /v1/traces' $request 'the traces path must be appended to the base endpoint'
+        }
+        finally { $client.Close() }
+    }
+    finally { $listener.Stop() }
+}
+
+Test-Case 'a padded, mixed-case enabling value still emits' {
+    <#
+        The hook's own gate and the emitter's gate are separate implementations of one decision,
+        and they must agree on awkward values: a gate stricter than the emitter drops the span
+        without ever spawning it, while a looser one spawns a process that only exits again.
+        Whitespace and casing are where they most easily drift apart.
+    #>
+    $result = Invoke-TelemetryRound -SessionId (New-SessionId) -Enabler 'AUTODEV_OTEL_ENABLED' `
+        -ExtraEnv @{ AUTODEV_OTEL_ENABLED = "  TrUe`t" }
+    Assert-Equal 1 $result.Spans.Count 'a padded, mixed-case value must enable telemetry'
+}
+
 Test-Case 'a falsy AUTODEV_OTEL_ENABLED overrides every other signal' {
     <#
         Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and
