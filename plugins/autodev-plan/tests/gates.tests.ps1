@@ -1313,6 +1313,102 @@ Test-Case 'a whitespace-only enabling value falls through rather than forcing of
     }
 }
 
+Test-Case 'autodev.issues counts the reported findings' {
+    <#
+        The attribute is a COUNT of findings, not a flag: "did this gate come back dirty" is
+        already answered by autodev.verdict = ISSUES, so a flag here would be redundant and the
+        name would be actively misleading. Counted from the '### [severity] title' heading every
+        reviewer agent is required to emit.
+    #>
+    $response = @(
+        '## Findings',
+        '',
+        '### [major] First problem',
+        '**Problem:** one',
+        '',
+        '### [major] Second problem',
+        '**Problem:** two',
+        '',
+        '### [minor] Third problem',
+        '**Problem:** three',
+        '',
+        'AUTODEV-VERDICT: ISSUES'
+    ) -join "`n"
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{ AUTODEV_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName; agentId = 'a1'; response = $response
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal '3' (Get-SpanAttribute $doc 'autodev.issues') 'every reported finding must be counted'
+    Assert-Equal 'ISSUES' (Get-SpanAttribute $doc 'autodev.verdict')
+}
+
+Test-Case 'an ISSUES verdict never reports zero findings' {
+    <#
+        The count is parsed from a format the reviewer is instructed to use but could deviate from.
+        If it does, the gate must not look clean in a dashboard: a formatting slip would otherwise
+        become a silently missing finding, which is the failure mode this attribute exists to
+        surface. Clamped to 1 instead.
+    #>
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{ AUTODEV_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName; agentId = 'a1'
+        response  = "I found problems but did not use the heading format.`n`nAUTODEV-VERDICT: ISSUES"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.issues') 'an unparseable ISSUES verdict must still count 1'
+}
+
+Test-Case 'a clean PASS reports zero findings' {
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{ AUTODEV_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName; agentId = 'a1'
+        response  = "No problems found.`n`nAUTODEV-VERDICT: PASS"
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal '0' (Get-SpanAttribute $doc 'autodev.issues') 'a clean pass must count no findings'
+    Assert-Equal 'PASS' (Get-SpanAttribute $doc 'autodev.verdict')
+}
+
+Test-Case 'prose and template echoes do not inflate the finding count' {
+    <#
+        Two ways a naive count would over-report: a reviewer discussing "[minor]" in a sentence,
+        and one echoing the literal '### [blocker|major|minor|nit]' template line from its own
+        instructions. A deeper '####' heading is not a finding either.
+    #>
+    $response = @(
+        'This is a [minor] concern worth mentioning inline.',
+        '### [blocker|major|minor|nit] <short finding title>',
+        '#### [major] a sub-heading, not a finding',
+        '',
+        '### [nit] The only real finding',
+        '',
+        'AUTODEV-VERDICT: ISSUES'
+    ) -join "`n"
+    $session = New-SessionId
+    $sink = Join-Path (Get-TelemetryDir $session) 'spans.jsonl'
+    $vars = @{ AUTODEV_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-plan:autodev-architecture-review'
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $session; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $session; agentName = $agentName; agentId = 'a1'; response = $response
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal '1' (Get-SpanAttribute $doc 'autodev.issues') 'only the real heading counts'
+}
+
 Test-Case 'a falsy AUTODEV_OTEL_ENABLED overrides every other signal' {
     <#
         Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and
@@ -1355,7 +1451,12 @@ Test-Case 'an enabled round emits exactly one well-formed span document' {
     Assert-Equal 'github-copilot' $result.Spans[0].resourceSpans[0].resource.attributes[0].value.stringValue
 }
 
-Test-Case 'autodev.issues counts an ISSUES verdict and nothing else' {
+Test-Case 'autodev.blocked is present and zero for a gate' {
+    <#
+        The response used here carries no finding headings, so autodev.issues exercises the clamp
+        that keeps an ISSUES verdict from ever reporting zero. The finding COUNT itself is covered
+        by the dedicated cases above.
+    #>
     $issues = Invoke-TelemetryRound -SessionId (New-SessionId) -Verdict 'ISSUES'
     Assert-Equal '1' (Get-SpanAttribute $issues.Spans[0] 'autodev.issues')
     Assert-Equal 'ISSUES' (Get-SpanAttribute $issues.Spans[0] 'autodev.verdict')

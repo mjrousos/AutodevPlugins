@@ -302,11 +302,15 @@ sub-agent span, which measures it in-process.
 | `autodev.plugin` | `autodev-plan` |
 | `autodev.gate` | `architecture`, `security` or `privacy` |
 | `autodev.verdict` | `PASS` or `ISSUES` |
-| `autodev.issues` | `1` for an `ISSUES` verdict, else `0` |
+| `autodev.issues` | The **number of findings** the reviewer reported, counted from its `### [severity] title` headings. Clamped to at least `1` for an `ISSUES` verdict |
 | `autodev.blocked` | Always `0` here; present so a query spanning both plugins needs no special case |
 | `autodev.attempt`, `autodev.total_invocations` | Attempt counters for this gate and session |
 
-To count issues, sum `autodev.issues`, or count spans where `autodev.verdict = "ISSUES"`.
+Sum `autodev.issues` to count problems found; count spans where `autodev.verdict = "ISSUES"` to
+count gates that came back dirty. Findings are counted for a `PASS` too — a pass that still raised
+nits genuinely found them. Because the count is parsed from the reviewer's own formatting, an
+`ISSUES` verdict whose headings could not be parsed reports `1` rather than `0`, so a formatting
+slip can never make a dirty gate look clean.
 
 **No reviewer content is ever exported** — not the response body, not the plan, not the prompt,
 and not `transcriptPath`. Only verdicts and identifiers leave the machine.

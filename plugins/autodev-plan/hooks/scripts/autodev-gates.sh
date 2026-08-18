@@ -44,6 +44,32 @@ MAX_BLOCKS=5
 # (number of gates * MAX_ATTEMPTS), or it would fire before a single pass could spend the
 # per-gate budget and would silently become the real limit.
 MAX_TOTAL_INVOCATIONS=40
+# Defensive ceiling on the finding count exported as autodev.issues. A pathological or malicious
+# reviewer response must not turn into an absurd metric value.
+MAX_FINDINGS=500
+
+count_findings() {
+  # Counts the findings a reviewer reported, from the '### [severity] title' heading every reviewer
+  # agent is required to emit. This is what autodev.issues carries, so a dashboard can answer "how
+  # many problems were found" rather than only "how many gates came back dirty" -- the latter is
+  # already answered by counting autodev.verdict = ISSUES.
+  #
+  # Counted for every verdict, not just ISSUES: a PASS that still raised nits genuinely found them.
+  #
+  # The heading is matched rather than the severity word alone, so prose mentioning "[minor]"
+  # mid-sentence cannot inflate the count. A deeper '####' heading is excluded naturally: the
+  # character after '###' must be whitespace or '['. The literal template line
+  # '### [blocker|major|minor|nit] <title>' does not match either, so echoing the template is not
+  # counted.
+  local n
+  # grep exits 1 when nothing matches, which under the ERR trap must not surface: '|| n=0'.
+  n="$(printf '%s\n' "${1:-}" | tr -d '\r' \
+    | grep -ciE '^ {0,3}###[[:space:]]*\[(blocker|major|minor|nit)\]' 2>/dev/null)" || n=0
+  n="$(printf '%s' "$n" | tr -cd '0-9')"
+  [ -n "$n" ] || n=0
+  if [ "$n" -gt "$MAX_FINDINGS" ] 2>/dev/null; then n="$MAX_FINDINGS"; fi
+  printf '%s' "$n"
+}
 
 json_get() { printf '%s' "$RAW_INPUT" | jq -r "$1 // \"\"" 2>/dev/null; }
 
@@ -529,12 +555,14 @@ $NEXT_ACTION"
       --argjson attempt "$ATTEMPTS" \
       --argjson total "$(state_num "$STATE" 'totalInvocations')" \
       --argjson timeMs "$(json_get_num '.timestamp')" \
+      --argjson issues "$(count_findings "$RESPONSE")" \
       --arg traceparent "$(json_get '.traceparent')" \
       --arg tracestate "$(json_get '.tracestate')" \
       '{spanName: $span, sessionId: $sid, agentName: $agentName, agentId: $agentId,
         plugin: "autodev-plan", unitKey: "autodev.gate", unitValue: $unitValue,
         verdict: $verdict, attempt: $attempt, totalInvocations: $total,
-        timeMs: $timeMs, traceparent: $traceparent, tracestate: $tracestate}' 2>/dev/null)" || :
+        timeMs: $timeMs, issues: $issues,
+        traceparent: $traceparent, tracestate: $tracestate}' 2>/dev/null)" || :
 
     jq -cn --arg r "$RESPONSE
 $FOOTER" '{modifiedResponse: $r}'

@@ -1393,7 +1393,67 @@ Test-Case 'an enabled round emits exactly one well-formed span document' {
     Assert-Equal 'tasking' (Get-SpanAttribute $result.Spans[0] 'autodev.stage')
 }
 
+Test-Case 'autodev.issues counts the reported findings' {
+    <#
+        The attribute is a COUNT of findings, not a flag: "did this stage come back dirty" is
+        already answered by autodev.verdict = ISSUES. Counted from the '### [severity] title'
+        heading every reviewer agent is required to emit.
+    #>
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+    $vars = @{ AUTODEV_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+    $agentName = 'autodev-implement:autodev-code-review'
+    $response = @(
+        '### [major] First problem',
+        '### [minor] Second problem',
+        '',
+        'AUTODEV-VERDICT: ISSUES'
+    ) -join "`n"
+    Invoke-HookWithEnv 'subagentStart' @{ sessionId = $sid; agentName = $agentName } $vars | Out-Null
+    Invoke-HookWithEnv 'subagentStop' @{
+        sessionId = $sid; agentName = $agentName; agentId = 'a1'; response = $response
+    } $vars | Out-Null
+    $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+    Assert-Equal '2' (Get-SpanAttribute $doc 'autodev.issues') 'every reported finding must be counted'
+}
+
+Test-Case 'a worker never reports review findings' {
+    <#
+        Only reviewers report findings. code-fix in particular routinely restates the findings it
+        just addressed, so counting its headings would export them as if it had found them --
+        double-counting problems the reviewer's own span already reported, and contradicting the
+        documented 0 for workers. Covered for a worker that quotes findings verbatim.
+    #>
+    $response = @(
+        'I fixed the following findings from the review:',
+        '',
+        '### [major] First problem',
+        'Fixed by rewriting the handler.',
+        '',
+        '### [minor] Second problem',
+        'Fixed by renaming the variable.',
+        '',
+        'AUTODEV-VERDICT: DONE'
+    ) -join "`n"
+    foreach ($agent in @('code-fix', 'implementation', 'tasking')) {
+        $sid = New-SessionId
+        Set-TodoList -SessionId $sid -Milestones 1
+        $sink = Join-Path (Get-TelemetryDir $sid) 'spans.jsonl'
+        $vars = @{ AUTODEV_OTEL_ENABLED = 'true'; AUTODEV_OTEL_DEBUG_FILE = $sink }
+        $agentName = "autodev-implement:autodev-$agent"
+        Invoke-HookWithEnv 'subagentStart' @{ sessionId = $sid; agentName = $agentName } $vars | Out-Null
+        Invoke-HookWithEnv 'subagentStop' @{
+            sessionId = $sid; agentName = $agentName; agentId = 'w1'; response = $response
+        } $vars | Out-Null
+        $doc = (Get-Content -LiteralPath $sink | Select-Object -First 1) | ConvertFrom-Json
+        Assert-Equal '0' (Get-SpanAttribute $doc 'autodev.issues') "the $agent worker must report no findings"
+    }
+}
+
 Test-Case 'a review ISSUES verdict is counted as an issue' {
+    # No finding headings in this response, so this exercises the clamp that stops an ISSUES
+    # verdict ever reporting zero.
     $sid = New-SessionId
     Set-TodoList -SessionId $sid -Milestones 1
     $result = Invoke-TelemetryRound -SessionId $sid -Agent 'code-review' -Verdict 'ISSUES'
