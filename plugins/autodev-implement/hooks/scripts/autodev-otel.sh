@@ -162,9 +162,9 @@ percent_decode() {
 }
 
 # Emits one '-H name: value' pair per line, NUL-free, for the caller to read into an array.
-# OTEL_EXPORTER_OTLP_TRACES_HEADERS wins over the generic variable rather than merging with it,
-# per the specification. Values are split on the FIRST '=' only, so a base64 token containing '='
-# survives intact. Never logged.
+# AUTODEV_OTEL_HEADERS wins over the OTLP variables, and the traces-specific OTLP variable over
+# the generic one, rather than merging with them, per the specification. Values are split on the
+# FIRST '=' only, so a base64 token containing '=' survives intact. Never logged.
 collect_headers() {
   local raw pair name value
   raw="$(env_first AUTODEV_OTEL_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS OTEL_EXPORTER_OTLP_HEADERS)"
@@ -349,7 +349,10 @@ main() {
   [ "$verdict" = "BLOCKED" ] && blocked=1
 
   local service_name trace_id span_id parent_span_id span_trace_state span_flags
-  service_name="$(trim "${OTEL_SERVICE_NAME:-}")"
+  # env_first, not a bare OTEL_SERVICE_NAME read: that name is scrubbed from a hook's environment
+  # by Copilot CLI, so honouring it alone silently ignored the documented
+  # AUTODEV_OTEL_SERVICE_NAME and stamped every span with the default instead.
+  service_name="$(env_first AUTODEV_OTEL_SERVICE_NAME OTEL_SERVICE_NAME)"
   [ -n "$service_name" ] || service_name='github-copilot'
 
   parse_traceparent "$traceparent"

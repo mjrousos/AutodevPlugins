@@ -1257,6 +1257,32 @@ Test-Case 'a padded, mixed-case enabling value still emits' {
     Assert-Equal 1 $result.Spans.Count 'a padded, mixed-case value must enable telemetry'
 }
 
+Test-Case 'AUTODEV_OTEL_SERVICE_NAME sets and outranks the service name' {
+    <#
+        AUTODEV_OTEL_SERVICE_NAME is the only one of the pair a hook can actually see: Copilot CLI
+        scrubs OTEL_SERVICE_NAME along with every other OTEL_ prefixed name. Covered in both
+        suites because the bash emitter read only the scrubbed name, leaving every span stamped
+        'github-copilot' however the user configured it.
+    #>
+    $cases = @(
+        @{ Env = @{ AUTODEV_OTEL_SERVICE_NAME = 'my-service' }; Expected = 'my-service'; Why = 'AUTODEV_OTEL_SERVICE_NAME must set the resource service.name' },
+        @{ Env = @{ AUTODEV_OTEL_SERVICE_NAME = 'autodev-wins'; OTEL_SERVICE_NAME = 'legacy-loses' }; Expected = 'autodev-wins'; Why = 'AUTODEV_OTEL_SERVICE_NAME must outrank OTEL_SERVICE_NAME' },
+        @{ Env = @{ OTEL_SERVICE_NAME = 'legacy-only' }; Expected = 'legacy-only'; Why = 'OTEL_SERVICE_NAME must still work as a fallback' },
+        @{ Env = @{}; Expected = 'github-copilot'; Why = 'the default service name must survive' }
+    )
+    foreach ($case in $cases) {
+        $result = Invoke-TelemetryRound -SessionId (New-SessionId) -Enabler 'AUTODEV_OTEL_ENABLED' `
+            -ExtraEnv $case.Env
+        Assert-Equal 1 $result.Spans.Count 'the round must emit a span'
+        $resource = $result.Spans[0].resourceSpans[0].resource
+        $actual = $null
+        foreach ($attr in $resource.attributes) {
+            if ($attr.key -eq 'service.name') { $actual = [string]$attr.value.stringValue }
+        }
+        Assert-Equal $case.Expected $actual $case.Why
+    }
+}
+
 Test-Case 'a falsy AUTODEV_OTEL_ENABLED overrides every other signal' {
     <#
         Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and

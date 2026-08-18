@@ -1253,6 +1253,12 @@ span_field() { # sinkPath jq-path
   jq -r ".resourceSpans[0].scopeSpans[0].spans[0].$2" "$1" 2>/dev/null | head -1
 }
 
+resource_attr() { # sinkPath key
+  jq -r --arg k "$2" '
+    .resourceSpans[0].resource.attributes[]
+    | select(.key == $k) | (.value.stringValue // .value.intValue)' "$1" 2>/dev/null | head -1
+}
+
 # The subagentStop half of telemetry_round, for tests that need to inspect state in between.
 telemetry_round_stop_only() { # sid gate verdict [agentId]
   local sid="$1" gate="$2" verdict="$3" agent_id="${4:-agent-1}" cwd
@@ -1335,6 +1341,58 @@ AUTODEV-VERDICT: ISSUES" >/dev/null
   assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')" 'the verdict must be recorded'
 }
 run_test "a padded, mixed-case enabling value still emits" t_otel_padded_mixed_case_value
+
+t_otel_service_name_precedence() {
+  # AUTODEV_OTEL_SERVICE_NAME is the only one of the pair a hook can actually see: Copilot CLI
+  # scrubs OTEL_SERVICE_NAME along with every other OTEL_ prefixed name. Reading the scrubbed name
+  # alone left every span stamped 'github-copilot' however the user configured it, and diverged
+  # from the PowerShell emitter, which honours both.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=my-service \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=my-service \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal my-service "$(resource_attr "$sink" 'service.name')" \
+    'AUTODEV_OTEL_SERVICE_NAME must set the resource service.name' || return 1
+
+  # And it must outrank the legacy name on a host that does not scrub it.
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=autodev-wins OTEL_SERVICE_NAME=legacy-loses \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_SERVICE_NAME=autodev-wins OTEL_SERVICE_NAME=legacy-loses \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal autodev-wins "$(resource_attr "$sink" 'service.name')" \
+    'AUTODEV_OTEL_SERVICE_NAME must outrank OTEL_SERVICE_NAME' || return 1
+
+  # The legacy name still works where it survives, and the default still applies otherwise.
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true OTEL_SERVICE_NAME=legacy-only \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true OTEL_SERVICE_NAME=legacy-only \
+    AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal legacy-only "$(resource_attr "$sink" 'service.name')" \
+    'OTEL_SERVICE_NAME must still work as a fallback' || return 1
+
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture "x
+
+AUTODEV-VERDICT: ISSUES" >/dev/null
+  assert_equal github-copilot "$(resource_attr "$sink" 'service.name')" \
+    'the default service name must survive'
+}
+run_test "AUTODEV_OTEL_SERVICE_NAME sets and outranks the service name" t_otel_service_name_precedence
 
 t_otel_explicit_off_wins() {
   # Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and Copilot's
