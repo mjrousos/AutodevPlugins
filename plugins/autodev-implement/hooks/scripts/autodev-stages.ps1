@@ -736,14 +736,18 @@ function Get-NextAction {
 
 function Measure-ReviewFindings {
     <#
-        Counts the findings a reviewer reported, from the '### [severity] title' heading every
-        reviewer agent is required to emit. This is what autodev.issues carries, so a dashboard can
-        answer "how many problems were found" rather than only "how many stages came back dirty" --
-        the latter is already answered by counting autodev.verdict = ISSUES.
+        Counts the findings a REVIEWER reported, from the '### [severity] title' heading every
+        reviewer agent is required to emit. Callers must gate this on the agent kind: only
+        reviewers report findings, and a worker -- notably code-fix, which routinely restates the
+        findings it just addressed -- would otherwise export those headings as if it had found
+        them, double-counting problems the reviewer's own span already reported.
 
-        Counted for every verdict, not just ISSUES: a PASS that still raised nits genuinely found
-        those, and reporting them is more honest than discarding them. A worker response simply
-        contains no such headings and counts zero.
+        This is what autodev.issues carries, so a dashboard can answer "how many problems were
+        found" rather than only "how many stages came back dirty" -- the latter is already answered
+        by counting autodev.verdict = ISSUES.
+
+        Counted for every reviewer verdict, not just ISSUES: a PASS that still raised nits
+        genuinely found those, and reporting them is more honest than discarding them.
 
         The heading is matched rather than the severity word alone so that prose mentioning
         "[minor]" mid-sentence cannot inflate the count. Three '#' exactly: a deeper heading is not
@@ -1217,9 +1221,11 @@ try {
                 # outer catch would emit '{}' instead of the tracker footer -- even with
                 # telemetry disabled. The emitter validates it safely with Get-LongField.
                 timeMs           = $payload.timestamp
-                # The reviewer's own finding count, so autodev.issues measures problems found
-                # rather than merely that this stage came back dirty.
-                issues           = (Measure-ReviewFindings -Response $response)
+                # Only reviewers report findings. A worker -- notably code-fix, which routinely
+                # restates the findings it just addressed -- would otherwise export those headings
+                # as if it had found them, double-counting problems the reviewer's own span already
+                # reported and contradicting the documented 0 for workers.
+                issues           = $(if ($kind -eq 'review') { Measure-ReviewFindings -Response $response } else { 0 })
                 # Absent today, but forwarded so the span parents itself under Copilot's own
                 # sub-agent span the moment the CLI starts supplying trace context.
                 traceparent      = [string]$payload.traceparent

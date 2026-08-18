@@ -61,13 +61,18 @@ TOTAL_INVOCATIONS_PER_MILESTONE=30
 MAX_FINDINGS=500
 
 count_findings() {
-  # Counts the findings a reviewer reported, from the '### [severity] title' heading every reviewer
-  # agent is required to emit. This is what autodev.issues carries, so a dashboard can answer "how
-  # many problems were found" rather than only "how many stages came back dirty" -- the latter is
-  # already answered by counting autodev.verdict = ISSUES.
+  # Counts the findings a REVIEWER reported, from the '### [severity] title' heading every reviewer
+  # agent is required to emit. Callers must gate this on the agent kind: only reviewers report
+  # findings, and a worker -- notably code-fix, which routinely restates the findings it just
+  # addressed -- would otherwise export those headings as if it had found them, double-counting
+  # problems the reviewer's own span already reported.
   #
-  # Counted for every verdict, not just ISSUES: a PASS that still raised nits genuinely found them.
-  # A worker response simply contains no such headings and counts zero.
+  # This is what autodev.issues carries, so a dashboard can answer "how many problems were found"
+  # rather than only "how many stages came back dirty" -- the latter is already answered by
+  # counting autodev.verdict = ISSUES.
+  #
+  # Counted for every reviewer verdict, not just ISSUES: a PASS that still raised nits genuinely
+  # found them.
   #
   # The heading is matched rather than the severity word alone, so prose mentioning "[minor]"
   # mid-sentence cannot inflate the count. A deeper '####' heading is excluded naturally: the
@@ -1048,7 +1053,7 @@ Feedback log: $FEEDBACK_PATH"
       --argjson attempt "$ATTEMPT" \
       --argjson total "$(state_num "$STATE" 'totalInvocations')" \
       --argjson timeMs "$(json_get_num '.timestamp')" \
-      --argjson issues "$(count_findings "$RESPONSE")" \
+      --argjson issues "$(if [ "$KIND" = "review" ]; then count_findings "$RESPONSE"; else printf '0'; fi)" \
       --arg traceparent "$(json_get '.traceparent')" \
       --arg tracestate "$(json_get '.tracestate')" \
       '{spanName: $span, sessionId: $sid, agentName: $agentName, agentId: $agentId,
