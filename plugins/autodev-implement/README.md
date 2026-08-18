@@ -186,13 +186,17 @@ sub-agent span, which measures it in-process.
 | `autodev.plugin` | `autodev-implement` |
 | `autodev.stage` | `tasking`, `implementation`, `code-review`, `code-fix`, `code-security-review` or `code-privacy-review` |
 | `autodev.verdict` | `PASS`/`ISSUES` for review agents, `DONE`/`BLOCKED` for workers |
-| `autodev.issues` | `1` only for a literal `ISSUES` verdict, else `0` |
+| `autodev.issues` | The **number of findings** the reviewer reported, counted from its `### [severity] title` headings. Clamped to at least `1` for an `ISSUES` verdict; `0` for workers, which report no findings |
 | `autodev.blocked` | `1` only for a literal `BLOCKED` verdict, else `0` |
 | `autodev.attempt`, `autodev.total_invocations` | Attempt counters for this stage and session |
 
 The two counters are deliberately separate: a blocked worker is an operational stall, not a review
 finding, so folding it into `autodev.issues` would inflate the issue count. Sum `autodev.issues`
-for review findings and `autodev.blocked` for stalls.
+for review findings and `autodev.blocked` for stalls; count spans where `autodev.verdict = "ISSUES"`
+for stages that came back dirty. Findings are counted for a `PASS` too — a pass that still raised
+nits genuinely found them. Because the count is parsed from the reviewer's own formatting, an
+`ISSUES` verdict whose headings could not be parsed reports `1` rather than `0`, so a formatting
+slip can never make a dirty stage look clean.
 
 **No sub-agent content is ever exported** — not the response body, not the todo list, not the
 prompt, and not `transcriptPath`. Only verdicts and identifiers leave the machine.

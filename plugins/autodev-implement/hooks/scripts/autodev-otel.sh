@@ -303,12 +303,12 @@ main() {
     fields[${#fields[@]}]="$line"
   done < <(printf '%s' "$request" | jq -r '
       [ .spanName, .sessionId, .agentName, .agentId, .plugin, .unitKey, .unitValue, .verdict,
-        .attempt, .totalInvocations, .timeMs, .traceparent, .tracestate ]
+        .attempt, .totalInvocations, .timeMs, .traceparent, .tracestate, .issues ]
       | map(if . == null then "" else (. | tostring) end)
       | .[]' 2>/dev/null | tr -d '\r')
 
   local span_name session_id agent_name agent_id plugin unit_key unit_value verdict
-  local attempt total time_ms traceparent tracestate
+  local attempt total time_ms traceparent tracestate issue_count
   span_name="${fields[0]:-}"
   session_id="${fields[1]:-}"
   agent_name="${fields[2]:-}"
@@ -322,6 +322,7 @@ main() {
   time_ms="${fields[10]:-}"
   traceparent="${fields[11]:-}"
   tracestate="${fields[12]:-}"
+  issue_count="${fields[13]:-}"
 
   # A key must never be empty or the attribute would be unusable, and never attacker-chosen.
   case "$unit_key" in
@@ -344,8 +345,14 @@ main() {
   # and keeps the value a decimal string, which is how OTLP/JSON encodes every int64.
   local time_ns="${time_ms}000000"
 
+  # autodev.issues is the number of findings the reviewer actually reported, counted by the hook
+  # from the mandated '### [severity] title' headings. An ISSUES verdict must never report zero:
+  # a reviewer that deviates from the heading format would otherwise look clean in a dashboard,
+  # turning a formatting slip into a silently missing finding. "Did this gate come back dirty" is
+  # answered by autodev.verdict, so no separate flag is needed.
   local issues=0 blocked=0
-  [ "$verdict" = "ISSUES" ] && issues=1
+  issues="$(digits_or_zero "$issue_count")"
+  if [ "$verdict" = "ISSUES" ] && [ "$issues" -lt 1 ] 2>/dev/null; then issues=1; fi
   [ "$verdict" = "BLOCKED" ] && blocked=1
 
   local service_name trace_id span_id parent_span_id span_trace_state span_flags

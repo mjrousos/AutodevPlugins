@@ -1418,6 +1418,77 @@ AUTODEV-VERDICT: ISSUES" >/dev/null
 }
 run_test "a whitespace-only enabling value falls through rather than forcing off" t_otel_whitespace_value_falls_through
 
+t_otel_issue_count() {
+  # The attribute is a COUNT of findings, not a flag: "did this gate come back dirty" is already
+  # answered by autodev.verdict = ISSUES, so a flag here would be redundant and the name would be
+  # actively misleading. Counted from the '### [severity] title' heading reviewers must emit.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture '## Findings
+
+### [major] First problem
+**Problem:** one
+
+### [major] Second problem
+**Problem:** two
+
+### [minor] Third problem
+**Problem:** three
+
+AUTODEV-VERDICT: ISSUES' >/dev/null
+  assert_equal 3 "$(span_attr "$sink" 'autodev.issues')" 'every reported finding must be counted' || return 1
+  assert_equal ISSUES "$(span_attr "$sink" 'autodev.verdict')"
+}
+run_test "autodev.issues counts the reported findings" t_otel_issue_count
+
+t_otel_issue_count_never_zero_on_issues() {
+  # The count is parsed from a format the reviewer is instructed to use but could deviate from. If
+  # it does, the gate must not look clean in a dashboard: a formatting slip would otherwise become
+  # a silently missing finding, which is the failure mode this attribute exists to surface.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture 'I found problems but did not use the heading format.
+
+AUTODEV-VERDICT: ISSUES' >/dev/null
+  assert_equal 1 "$(span_attr "$sink" 'autodev.issues')" 'an unparseable ISSUES verdict must still count 1'
+}
+run_test "an ISSUES verdict never reports zero findings" t_otel_issue_count_never_zero_on_issues
+
+t_otel_issue_count_zero_on_pass() {
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture 'No problems found.
+
+AUTODEV-VERDICT: PASS' >/dev/null
+  assert_equal 0 "$(span_attr "$sink" 'autodev.issues')" 'a clean pass must count no findings' || return 1
+  assert_equal PASS "$(span_attr "$sink" 'autodev.verdict')"
+}
+run_test "a clean PASS reports zero findings" t_otel_issue_count_zero_on_pass
+
+t_otel_issue_count_not_inflated() {
+  # Two ways a naive count would over-report: a reviewer discussing "[minor]" in a sentence, and
+  # one echoing the literal template line from its own instructions. '####' is not a finding.
+  local sid sink
+  sid="$(new_session_id)"
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_gate "$sid" architecture
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_gate "$sid" architecture 'This is a [minor] concern worth mentioning inline.
+### [blocker|major|minor|nit] <short finding title>
+#### [major] a sub-heading, not a finding
+
+### [nit] The only real finding
+
+AUTODEV-VERDICT: ISSUES' >/dev/null
+  assert_equal 1 "$(span_attr "$sink" 'autodev.issues')" 'only the real heading counts'
+}
+run_test "prose and template echoes do not inflate the finding count" t_otel_issue_count_not_inflated
+
 t_otel_explicit_off_wins() {
   # Tri-state on purpose: an explicit OFF has to outrank both a configured endpoint and Copilot's
   # own switch, so hook telemetry can be silenced without disturbing Copilot's exporter or
@@ -1464,6 +1535,9 @@ t_otel_well_formed_span() {
 run_test "an enabled round emits exactly one well-formed span document" t_otel_well_formed_span
 
 t_otel_issue_count() {
+  # The response used here carries no finding headings, so autodev.issues exercises the clamp that
+  # keeps an ISSUES verdict from ever reporting zero. The finding COUNT itself is covered by the
+  # dedicated cases above.
   local sid
   sid="$(new_session_id)"
   telemetry_round "$sid" architecture ISSUES
@@ -1478,7 +1552,7 @@ t_otel_issue_count() {
   assert_equal 0 "$(span_attr "$TELEMETRY_SINK" 'autodev.issues')" || return 1
   assert_equal PASS "$(span_attr "$TELEMETRY_SINK" 'autodev.verdict')"
 }
-run_test "autodev.issues counts an ISSUES verdict and nothing else" t_otel_issue_count
+run_test "autodev.blocked is present and zero for a gate" t_otel_issue_count
 
 t_otel_correlation_attributes() {
   local sid

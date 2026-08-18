@@ -66,6 +66,9 @@ $script:MaxBlocks = 5
 # the fixed overhead is tasking plus the security and privacy loops = 41.
 $script:TotalInvocationsBase = 120
 $script:TotalInvocationsPerMilestone = 30
+# Defensive ceiling on the finding count exported as autodev.issues. A pathological or malicious
+# reviewer response must not turn into an absurd metric value.
+$script:MaxFindings = 500
 
 # Stages that run without human input. ask_user is denied and premature stops are blocked in
 # these; every other stage is either interactive, finished, or escalated.
@@ -731,6 +734,32 @@ function Get-NextAction {
     return 'Continue the workflow.'
 }
 
+function Measure-ReviewFindings {
+    <#
+        Counts the findings a reviewer reported, from the '### [severity] title' heading every
+        reviewer agent is required to emit. This is what autodev.issues carries, so a dashboard can
+        answer "how many problems were found" rather than only "how many stages came back dirty" --
+        the latter is already answered by counting autodev.verdict = ISSUES.
+
+        Counted for every verdict, not just ISSUES: a PASS that still raised nits genuinely found
+        those, and reporting them is more honest than discarding them. A worker response simply
+        contains no such headings and counts zero.
+
+        The heading is matched rather than the severity word alone so that prose mentioning
+        "[minor]" mid-sentence cannot inflate the count. Three '#' exactly: a deeper heading is not
+        a finding, and is excluded naturally because the character after '###' must be whitespace
+        or '['. The literal template line '### [blocker|major|minor|nit] <title>' does not match
+        either, so a reviewer that echoes the template is not counted.
+    #>
+    param([string]$Response)
+    if ([string]::IsNullOrWhiteSpace($Response)) { return 0 }
+    $pattern = '(?im)^[ ]{0,3}#{3}[ \t]*\[(?:blocker|major|minor|nit)\]'
+    $count = ([regex]::Matches($Response, $pattern)).Count
+    # Defensive ceiling: a pathological response must not turn into an absurd metric value.
+    if ($count -gt $script:MaxFindings) { return $script:MaxFindings }
+    return $count
+}
+
 function Read-Verdict {
     param([string]$Response, [string]$Kind)
     # 'review' agents return PASS/ISSUES; 'worker' agents return DONE/BLOCKED. A missing or
@@ -1188,6 +1217,9 @@ try {
                 # outer catch would emit '{}' instead of the tracker footer -- even with
                 # telemetry disabled. The emitter validates it safely with Get-LongField.
                 timeMs           = $payload.timestamp
+                # The reviewer's own finding count, so autodev.issues measures problems found
+                # rather than merely that this stage came back dirty.
+                issues           = (Measure-ReviewFindings -Response $response)
                 # Absent today, but forwarded so the span parents itself under Copilot's own
                 # sub-agent span the moment the CLI starts supplying trace context.
                 traceparent      = [string]$payload.traceparent

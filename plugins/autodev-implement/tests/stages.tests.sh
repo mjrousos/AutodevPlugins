@@ -1474,7 +1474,26 @@ t_otel_well_formed_span() {
 }
 run_test 'an enabled round emits exactly one well-formed span document' t_otel_well_formed_span
 
+t_otel_issue_count_findings() {
+  # The attribute is a COUNT of findings, not a flag: "did this stage come back dirty" is already
+  # answered by autodev.verdict = ISSUES. Counted from the '### [severity] title' heading every
+  # reviewer agent is required to emit.
+  local sid sink
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  sink="$(telemetry_dir "$sid")/spans.jsonl"
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" start_agent "$sid" code-review
+  AUTODEV_OTEL_ENABLED=true AUTODEV_OTEL_DEBUG_FILE="$sink" stop_agent "$sid" code-review '### [major] First problem
+### [minor] Second problem
+
+AUTODEV-VERDICT: ISSUES' >/dev/null
+  assert_equal 2 "$(span_attr "$sink" 'autodev.issues')" 'every reported finding must be counted'
+}
+run_test 'autodev.issues counts the reported findings' t_otel_issue_count_findings
+
 t_otel_review_issues() {
+  # No finding headings in this response, so this exercises the clamp that stops an ISSUES verdict
+  # ever reporting zero.
   local sid
   sid="$(new_session_id)"
   set_todo_list "$sid" 1

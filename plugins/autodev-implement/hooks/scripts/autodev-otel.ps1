@@ -290,6 +290,12 @@ function New-SpanDocument {
     # The hook payload carries its own timestamp; this is only for a malformed one.
     if ($timeMs -le 0) { $timeMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 
+    # An ISSUES verdict must never report zero findings: a reviewer that deviates from the
+    # mandated heading format would otherwise look clean in a dashboard, turning a formatting slip
+    # into a silently missing finding.
+    $issueCount = Get-LongField -Object $Request -Name 'issues'
+    if ($verdict -eq 'ISSUES' -and $issueCount -lt 1) { $issueCount = 1 }
+
     $attributes = @(
         (New-StringAttribute -Key 'gen_ai.conversation.id' -Value $sessionId),
         (New-StringAttribute -Key 'github.copilot.session.id' -Value $sessionId),
@@ -298,9 +304,12 @@ function New-SpanDocument {
         (New-StringAttribute -Key 'autodev.plugin' -Value $plugin),
         (New-StringAttribute -Key $unitKey -Value $unitValue),
         (New-StringAttribute -Key 'autodev.verdict' -Value $verdict),
+        # The number of findings the reviewer actually reported, counted by the hook from the
+        # mandated '### [severity] title' headings. "Did this gate come back dirty" is answered by
+        # autodev.verdict, so no separate flag is carried here.
+        (New-IntAttribute -Key 'autodev.issues' -Value $issueCount),
         # Counted separately on purpose: a BLOCKED worker is an operational stall, not a review
         # finding, and folding it into the issue count would inflate it.
-        (New-IntAttribute -Key 'autodev.issues' -Value $(if ($verdict -eq 'ISSUES') { 1 } else { 0 })),
         (New-IntAttribute -Key 'autodev.blocked' -Value $(if ($verdict -eq 'BLOCKED') { 1 } else { 0 })),
         (New-IntAttribute -Key 'autodev.attempt' -Value (Get-LongField -Object $Request -Name 'attempt')),
         (New-IntAttribute -Key 'autodev.total_invocations' -Value (Get-LongField -Object $Request -Name 'totalInvocations'))

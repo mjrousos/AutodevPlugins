@@ -1,6 +1,6 @@
 {
   "name": "autodev-implement",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Implements a plan from Autodev-Plan milestone by milestone, hardened by isolated code, security, and privacy review loops.",
   "author": {
     "name": "Mike Rousos",
