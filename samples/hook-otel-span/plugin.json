@@ -1,0 +1,13 @@
+{
+  "name": "hook-otel-span",
+  "version": "0.1.0",
+  "description": "Sample plugin: emit one OpenTelemetry span from a Copilot CLI subagentStop hook.",
+  "author": {
+    "name": "Mike Rousos",
+    "email": "mjrousos@github.com",
+    "url": "https://github.com/mjrousos"
+  },
+  "license": "MIT",
+  "keywords": ["sample", "opentelemetry", "hooks", "telemetry"],
+  "hooks": "hooks.json"
+}
