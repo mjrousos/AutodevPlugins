@@ -86,19 +86,26 @@ function Test-TelemetryEnabled {
 }
 
 function Get-TracesEndpoint {
+    # Returns the traces URL together with the namespace it came from ('hook', 'standard' or
+    # 'default'). The two travel together because headers are resolved from the SAME namespace.
+    #
     # Namespace by namespace, NOT "most specific name from either namespace". Otherwise an
     # inherited OTEL_EXPORTER_OTLP_TRACES_ENDPOINT would outrank an explicitly set
     # HOOK_OTEL_ENDPOINT and silently send spans -- and any auth headers -- elsewhere.
     foreach ($pair in @(
-            @{ Specific = 'HOOK_OTEL_TRACES_ENDPOINT'; Generic = 'HOOK_OTEL_ENDPOINT' },
-            @{ Specific = 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'; Generic = 'OTEL_EXPORTER_OTLP_ENDPOINT' })) {
+            @{ Namespace = 'hook'; Specific = 'HOOK_OTEL_TRACES_ENDPOINT'; Generic = 'HOOK_OTEL_ENDPOINT' },
+            @{ Namespace = 'standard'; Specific = 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT'; Generic = 'OTEL_EXPORTER_OTLP_ENDPOINT' })) {
         # The signal-specific variable is used verbatim; the generic one is a base to append to.
         $specific = Get-Env $pair.Specific
-        if (-not [string]::IsNullOrWhiteSpace($specific)) { return $specific }
+        if (-not [string]::IsNullOrWhiteSpace($specific)) {
+            return @{ Endpoint = $specific; Namespace = $pair.Namespace }
+        }
         $generic = Get-Env $pair.Generic
-        if (-not [string]::IsNullOrWhiteSpace($generic)) { return ($generic.TrimEnd('/') + '/v1/traces') }
+        if (-not [string]::IsNullOrWhiteSpace($generic)) {
+            return @{ Endpoint = ($generic.TrimEnd('/') + '/v1/traces'); Namespace = $pair.Namespace }
+        }
     }
-    return ($script:DefaultEndpoint.TrimEnd('/') + '/v1/traces')
+    return @{ Endpoint = ($script:DefaultEndpoint.TrimEnd('/') + '/v1/traces'); Namespace = 'default' }
 }
 
 function Test-Endpoint {
@@ -112,10 +119,26 @@ function Test-Endpoint {
 function Get-OtlpHeaders {
     # Comma-separated key=value, percent-decoded, split on the FIRST '=' so a base64 token
     # containing '=' survives. Never logged: these routinely carry bearer tokens.
-    $raw = Get-EnvFirst @(
-        'HOOK_OTEL_HEADERS',
-        'OTEL_EXPORTER_OTLP_TRACES_HEADERS',
-        'OTEL_EXPORTER_OTLP_HEADERS')
+    #
+    # Headers come from the SAME namespace the endpoint was resolved from. Falling back across
+    # namespaces would hand an inherited collector's credentials to a different collector the
+    # moment someone set HOOK_OTEL_ENDPOINT alone -- and setting HOOK_OTEL_HEADERS to a blank
+    # value could not prevent it, because Get-EnvFirst skips blanks. Only when nothing
+    # configured an endpoint at all ('default') do both namespaces describe the same implicit
+    # localhost collector, so there the full chain is safe.
+    param([string]$Namespace)
+    if ($Namespace -eq 'hook') {
+        $raw = Get-EnvFirst @('HOOK_OTEL_HEADERS')
+    }
+    elseif ($Namespace -eq 'standard') {
+        $raw = Get-EnvFirst @('OTEL_EXPORTER_OTLP_TRACES_HEADERS', 'OTEL_EXPORTER_OTLP_HEADERS')
+    }
+    else {
+        $raw = Get-EnvFirst @(
+            'HOOK_OTEL_HEADERS',
+            'OTEL_EXPORTER_OTLP_TRACES_HEADERS',
+            'OTEL_EXPORTER_OTLP_HEADERS')
+    }
     $headers = @{}
     if ([string]::IsNullOrWhiteSpace($raw)) { return $headers }
     foreach ($pair in ($raw -split ',')) {
@@ -341,9 +364,10 @@ function Publish-HookSpan {
         return
     }
 
-    $endpoint = Get-TracesEndpoint
-    if (-not (Test-Endpoint $endpoint)) { return }
-    Send-SpanDocument -Json $json -Endpoint $endpoint -Headers (Get-OtlpHeaders) -TimeoutSec (Get-TimeoutSec)
+    $resolved = Get-TracesEndpoint
+    if (-not (Test-Endpoint $resolved.Endpoint)) { return }
+    Send-SpanDocument -Json $json -Endpoint $resolved.Endpoint `
+        -Headers (Get-OtlpHeaders -Namespace $resolved.Namespace) -TimeoutSec (Get-TimeoutSec)
 }
 
 # --------------------------------------------------------------------------------------------

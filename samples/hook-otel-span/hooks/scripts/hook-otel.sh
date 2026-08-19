@@ -36,6 +36,12 @@ MAX_TIMEOUT_SEC=5
 # cleanup trap in send_document can still see it after that function's frame is gone.
 CURL_CONFIG=''
 
+# Outputs of resolve_endpoint: the traces URL, and which namespace it came from ('hook',
+# 'standard' or 'default'). Globals rather than stdout because the two values have to travel
+# together -- headers are resolved from the SAME namespace as the endpoint.
+RESOLVED_ENDPOINT=''
+ENDPOINT_NS=''
+
 # ----------------------------------------------------------------------------------------------
 # Configuration
 #
@@ -89,6 +95,8 @@ telemetry_enabled() {
 }
 
 resolve_endpoint() {
+  # Sets RESOLVED_ENDPOINT and ENDPOINT_NS.
+  #
   # Namespace by namespace, NOT "most specific name from either namespace". Otherwise an
   # inherited OTEL_EXPORTER_OTLP_TRACES_ENDPOINT would outrank an explicitly set
   # HOOK_OTEL_ENDPOINT and silently send spans -- and any auth headers -- elsewhere.
@@ -96,17 +104,21 @@ resolve_endpoint() {
   # Within a namespace the OTLP rule applies: the signal-specific variable is used verbatim,
   # the generic one is a base that '/v1/traces' is appended to.
   local value
+  RESOLVED_ENDPOINT=''
+  ENDPOINT_NS=''
+
   value="$(env_first HOOK_OTEL_TRACES_ENDPOINT)"
-  if [ -n "$value" ]; then printf '%s' "$value"; return; fi
+  if [ -n "$value" ]; then RESOLVED_ENDPOINT="$value"; ENDPOINT_NS='hook'; return; fi
   value="$(env_first HOOK_OTEL_ENDPOINT)"
-  if [ -n "$value" ]; then printf '%s/v1/traces' "${value%/}"; return; fi
+  if [ -n "$value" ]; then RESOLVED_ENDPOINT="${value%/}/v1/traces"; ENDPOINT_NS='hook'; return; fi
 
   value="$(env_first OTEL_EXPORTER_OTLP_TRACES_ENDPOINT)"
-  if [ -n "$value" ]; then printf '%s' "$value"; return; fi
+  if [ -n "$value" ]; then RESOLVED_ENDPOINT="$value"; ENDPOINT_NS='standard'; return; fi
   value="$(env_first OTEL_EXPORTER_OTLP_ENDPOINT)"
-  if [ -n "$value" ]; then printf '%s/v1/traces' "${value%/}"; return; fi
+  if [ -n "$value" ]; then RESOLVED_ENDPOINT="${value%/}/v1/traces"; ENDPOINT_NS='standard'; return; fi
 
-  printf '%s/v1/traces' "${DEFAULT_ENDPOINT%/}"
+  RESOLVED_ENDPOINT="${DEFAULT_ENDPOINT%/}/v1/traces"
+  ENDPOINT_NS='default'
 }
 
 # http/https only, so a malformed variable cannot turn into some other scheme. The value is
@@ -147,8 +159,19 @@ collect_headers() {
   # Emits one 'name: value' pair per line. Comma-separated key=value, percent-decoded, split on
   # the FIRST '=' so a base64 token containing '=' survives. Never logged: OTLP headers
   # routinely carry bearer tokens.
-  local raw pair name value
-  raw="$(env_first HOOK_OTEL_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS OTEL_EXPORTER_OTLP_HEADERS)"
+  #
+  # Headers come from the SAME namespace the endpoint was resolved from. Falling back across
+  # namespaces would hand an inherited collector's credentials to a different collector the
+  # moment someone set HOOK_OTEL_ENDPOINT alone -- and setting HOOK_OTEL_HEADERS to a blank
+  # value could not prevent it, because env_first skips blanks. Only when nothing configured an
+  # endpoint at all ('default') do both namespaces describe the same implicit localhost
+  # collector, so there the full chain is safe.
+  local ns="${1:-default}" raw pair name value
+  case "$ns" in
+    hook) raw="$(env_first HOOK_OTEL_HEADERS)" ;;
+    standard) raw="$(env_first OTEL_EXPORTER_OTLP_TRACES_HEADERS OTEL_EXPORTER_OTLP_HEADERS)" ;;
+    *) raw="$(env_first HOOK_OTEL_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS OTEL_EXPORTER_OTLP_HEADERS)" ;;
+  esac
   [ -n "$raw" ] || return 0
   local IFS=','
   for pair in $raw; do
@@ -357,7 +380,7 @@ build_document() {
 # ----------------------------------------------------------------------------------------------
 
 send_document() {
-  local document="$1" endpoint="$2" timeout_sec header_line
+  local document="$1" endpoint="$2" endpoint_ns="$3" timeout_sec header_line
   timeout_sec="$(resolve_timeout)"
 
   # The endpoint and headers go in a curl config file rather than on the command line. OTLP
@@ -377,7 +400,7 @@ send_document() {
       [ -n "$header_line" ] || continue
       printf 'header = "%s"\n' "$(curl_config_escape "$header_line")"
     done <<EOF
-$(collect_headers)
+$(collect_headers "$endpoint_ns")
 EOF
   } > "$CURL_CONFIG" 2>/dev/null
 
@@ -396,7 +419,7 @@ EOF
 }
 
 emit_span() {
-  local payload="$1" document debug_file endpoint
+  local payload="$1" document debug_file
 
   telemetry_enabled || return 0
   command -v jq >/dev/null 2>&1 || return 0
@@ -419,10 +442,10 @@ emit_span() {
     return 0
   fi
 
-  endpoint="$(resolve_endpoint)"
-  endpoint_ok "$endpoint" || return 0
+  resolve_endpoint
+  endpoint_ok "$RESOLVED_ENDPOINT" || return 0
   command -v curl >/dev/null 2>&1 || return 0
-  send_document "$document" "$endpoint"
+  send_document "$document" "$RESOLVED_ENDPOINT" "$ENDPOINT_NS"
   return 0
 }
 

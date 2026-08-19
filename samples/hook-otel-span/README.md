@@ -111,7 +111,7 @@ below the table.
 |---|---|---|
 | Enable | `HOOK_OTEL_ENABLED` → `HOOK_OTEL_ENDPOINT` being set → `COPILOT_OTEL_ENABLED` | off |
 | Endpoint | `HOOK_OTEL_TRACES_ENDPOINT` → `HOOK_OTEL_ENDPOINT` → `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` → `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318/v1/traces` |
-| Headers | `HOOK_OTEL_HEADERS` → `OTEL_EXPORTER_OTLP_TRACES_HEADERS` → `OTEL_EXPORTER_OTLP_HEADERS` | none |
+| Headers | Same namespace as the resolved endpoint: `HOOK_OTEL_HEADERS`, or `OTEL_EXPORTER_OTLP_TRACES_HEADERS` → `OTEL_EXPORTER_OTLP_HEADERS` | none |
 | Protocol | `HOOK_OTEL_PROTOCOL` → `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` → `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` |
 | Service name | `HOOK_OTEL_SERVICE_NAME` → `OTEL_SERVICE_NAME` | `github-copilot` |
 | Timeout (s) | `HOOK_OTEL_TIMEOUT_SEC` | `2`, clamped to 1–5 |
@@ -130,6 +130,13 @@ Notes:
   them — to the wrong collector.
 - **The signal-specific variable is used verbatim; the generic one is a base.** `/v1/traces` is
   appended only to `*_ENDPOINT`, per the OTLP specification.
+- **Headers follow the endpoint's namespace.** Whichever namespace supplied the endpoint supplies
+  the headers: a `HOOK_OTEL_*` endpoint takes only `HOOK_OTEL_HEADERS`, and a standard endpoint
+  takes only `OTEL_EXPORTER_OTLP_TRACES_HEADERS` → `OTEL_EXPORTER_OTLP_HEADERS`. Falling back
+  across namespaces would forward one collector's credentials to another the moment you set
+  `HOOK_OTEL_ENDPOINT` on its own — and a blank `HOOK_OTEL_HEADERS` could not stop it, because
+  blank values are skipped. Only when *no* endpoint variable is set do both namespaces describe
+  the same implicit `http://localhost:4318` collector, so there any of the three is used.
 - **`HOOK_OTEL_HEADERS`** is comma-separated `key=value`, percent-decoded, split on the **first**
   `=` so base64 tokens survive. Headers are passed to `curl` through a `mktemp` config file, never
   on the command line, because argv is world-readable through `/proc/<pid>/cmdline`. Neither
