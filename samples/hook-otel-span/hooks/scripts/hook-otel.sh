@@ -181,10 +181,13 @@ collect_headers() {
       *=*) ;;
       *) continue ;;
     esac
-    name="$(trim "${pair%%=*}")"
-    value="$(trim "${pair#*=}")"
+    name="$(percent_decode "$(trim "${pair%%=*}")")"
+    value="$(percent_decode "$(trim "${pair#*=}")")"
     [ -n "$name" ] || continue
-    printf '%s: %s\n' "$(percent_decode "$name")" "$(percent_decode "$value")"
+    case "$name$value" in
+      *$'\r'* | *$'\n'*) continue ;;
+    esac
+    printf '%s: %s\n' "$name" "$value"
   done
 }
 
