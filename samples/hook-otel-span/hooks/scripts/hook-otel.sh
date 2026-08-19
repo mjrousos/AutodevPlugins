@@ -385,7 +385,7 @@ EOF
   # a hard bound on the whole exchange. Everything is redirected: nothing may reach stdout.
   # Note the absence of -L: these headers can carry a bearer token, and following a redirect
   # would replay them at whatever origin the collector named.
-  printf '%s' "$document" | curl -sS -o /dev/null \
+  printf '%s' "$document" | curl -q -sS -o /dev/null \
     --max-time "$timeout_sec" --connect-timeout "$timeout_sec" \
     -X POST --data-binary @- -K "$CURL_CONFIG" >/dev/null 2>&1
 
