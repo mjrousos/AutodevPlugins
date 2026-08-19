@@ -139,6 +139,15 @@ Notes:
   port would be a gRPC port, so posting JSON at it would be meaningless traffic rather than a
   dropped span. This guard matters *more* here than in a plugin with its own variables, precisely
   because this sample honours your standard `OTEL_*` settings.
+- **`protocol=http/protobuf` is *not* refused — these scripts always send JSON.** Building
+  protobuf from a shell script is not practical, and the OTLP specification makes JSON support
+  optional for a receiver, so a strictly protobuf-only backend is entitled to reject the body.
+  In practice the OpenTelemetry Collector accepts both on the same port, so refusing to export
+  would break the common case to guard against the rare one. The cost of that choice is that
+  against a protobuf-only receiver the spans are dropped at the far end and the scripts cannot
+  tell, because they discard transport errors by design. If you see no spans, set
+  `HOOK_OTEL_DEBUG_FILE` to confirm they are being produced, then check whether your endpoint
+  accepts `Content-Type: application/json`.
 - **`HOOK_OTEL_DEBUG_FILE` is a sink, not a switch.** It appends the document that *would* have
   been posted, one per line, and on its own it does not enable telemetry.
 
@@ -197,7 +206,11 @@ functions so you can see exactly where the process boundary would go.
 ## Privacy
 
 **Exported:** the session id, the sub-agent's id, name and type, the stop reason, the event name,
-and the **character count** of the sub-agent's response.
+and the **character count** of the sub-agent's response. Plus, *if* the payload ever carries W3C
+trace context (it does not today — see [Adapting it](#adapting-it)), the `traceparent`'s trace id,
+parent span id and trace flags, and the `tracestate` verbatim. `tracestate` is vendor-supplied
+key–value data, so if you adopt it in an environment where that string could carry something
+sensitive, drop it — it is one line in each script and nothing else depends on it.
 
 **Never exported:** the `response` text itself, the `cwd`, and the `transcriptPath`. Model output,
 file paths and repository names are the things a customer is most likely to be unable to send to a

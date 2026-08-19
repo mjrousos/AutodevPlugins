@@ -32,6 +32,10 @@ SCOPE_NAME='copilot-hook-otel-sample'
 DEFAULT_TIMEOUT_SEC=2
 MAX_TIMEOUT_SEC=5
 
+# Path of the temporary curl config file, if one is currently on disk. Global so that the
+# cleanup trap in send_document can still see it after that function's frame is gone.
+CURL_CONFIG=''
+
 # ----------------------------------------------------------------------------------------------
 # Configuration
 #
@@ -105,9 +109,12 @@ resolve_endpoint() {
   printf '%s/v1/traces' "${DEFAULT_ENDPOINT%/}"
 }
 
-# http/https only, so a malformed variable cannot turn into some other scheme.
+# http/https only, so a malformed variable cannot turn into some other scheme. The value is
+# lowercased for the TEST ONLY -- URI schemes are case-insensitive (RFC 3986), so 'HTTPS://...'
+# is valid and PowerShell's [Uri] parser accepts it; rejecting it here would make the two
+# implementations disagree. The endpoint itself is used exactly as the user wrote it.
 endpoint_ok() {
-  case "${1:-}" in
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
     http://?* | https://?*) return 0 ;;
     *) return 1 ;;
   esac
@@ -350,14 +357,19 @@ build_document() {
 # ----------------------------------------------------------------------------------------------
 
 send_document() {
-  local document="$1" endpoint="$2" timeout_sec config header_line
+  local document="$1" endpoint="$2" timeout_sec header_line
   timeout_sec="$(resolve_timeout)"
 
   # The endpoint and headers go in a curl config file rather than on the command line. OTLP
   # headers routinely carry a bearer token, and argv is world readable on Linux through
   # /proc/<pid>/cmdline, so any local process could read the credential while the request is in
-  # flight. mktemp creates the file 0600, and it is removed immediately after the request.
-  config="$(mktemp 2>/dev/null)" || return 0
+  # flight. mktemp creates the file 0600.
+  CURL_CONFIG="$(mktemp 2>/dev/null)" || return 0
+  # Armed before the file has any content in it, so a credential cannot outlive the hook: the
+  # CLI kills a hook that overruns its timeoutSec, which would otherwise leave the file behind
+  # in the temp directory. A global, not a local, because the trap runs after this frame is
+  # gone. Cleared again below so a later signal cannot rm an unrelated path.
+  trap 'rm -f "$CURL_CONFIG" 2>/dev/null' EXIT HUP INT TERM
   {
     printf 'url = "%s"\n' "$(curl_config_escape "$endpoint")"
     printf 'header = "Content-Type: application/json"\n'
@@ -367,7 +379,7 @@ send_document() {
     done <<EOF
 $(collect_headers)
 EOF
-  } > "$config" 2>/dev/null
+  } > "$CURL_CONFIG" 2>/dev/null
 
   # -sS silences the progress meter, -o /dev/null discards the response body, and --max-time is
   # a hard bound on the whole exchange. Everything is redirected: nothing may reach stdout.
@@ -375,9 +387,11 @@ EOF
   # would replay them at whatever origin the collector named.
   printf '%s' "$document" | curl -sS -o /dev/null \
     --max-time "$timeout_sec" --connect-timeout "$timeout_sec" \
-    -X POST --data-binary @- -K "$config" >/dev/null 2>&1
+    -X POST --data-binary @- -K "$CURL_CONFIG" >/dev/null 2>&1
 
-  rm -f "$config" 2>/dev/null
+  rm -f "$CURL_CONFIG" 2>/dev/null
+  trap - EXIT HUP INT TERM
+  CURL_CONFIG=''
   return 0
 }
 
