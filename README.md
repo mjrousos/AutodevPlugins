@@ -11,6 +11,14 @@ Plugins:
 > **Status:** `autodev-plan` and `autodev-implement` are implemented. `autodev-docs` is still a
 > scaffolded placeholder.
 
+## Samples
+
+- [hook-otel-span](./samples/hook-otel-span/README.md): a minimal, installable plugin showing how
+  to emit an OpenTelemetry span from a Copilot CLI hook. Samples are not part of the marketplace;
+  install one by path with
+  `copilot plugin install mjrousos/AutodevPlugins:samples/hook-otel-span`.
+
+
 ## Installation
 
 This repository is a plugin marketplace. Add it and then install the plugins you want:
@@ -34,6 +42,7 @@ plugins/<plugin-name>/
 ├── agents/                       # Agent definitions (*.agent.md)
 ├── skills/                       # Skills (<skill-name>/SKILL.md)
 └── hooks/scripts/                # Scripts invoked by hooks
+samples/<sample-name>/            # Standalone teaching samples, installed by path
 ```
 
 Each plugin's `plugin.json` references its `hooks.json` and `.mcp.json`. In the unimplemented
