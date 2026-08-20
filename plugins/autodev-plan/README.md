@@ -109,6 +109,21 @@ Gating is **inferred, never declared**: it begins the first time a reviewer sub-
 ends when all three hold a pass. Sessions that never invoke the orchestrator are completely
 unaffected.
 
+### Cost when the workflow is not running
+
+Copilot CLI has no way to scope a hook to an agent: `subagentStart` can be filtered by agent name,
+but `agentStop` and `preToolUse` cannot, so once the plugin is installed they fire in **every**
+session — `agentStop` at the end of every turn — and each one costs a process. Both are no-ops
+until `subagentStart` has created state, so both answer that case on a fast path that touches
+nothing but the filesystem: no `ConvertFrom-Json`, `Join-Path` or `Test-Path` on Windows, and no
+`jq` on Linux and macOS. First use of those cmdlets in a fresh PowerShell process costs more than
+the entire check.
+
+The fast path only ever decides *"there is nothing to enforce"*. Anything it cannot settle with
+certainty — a session id that is not a plain JSON string, a `cwd` carrying an escape it does not
+decode — falls through to the fully parsed path, which remains the only implementation of the
+enforcement rules.
+
 ### Verdict contract
 
 Every reviewer ends its response with:

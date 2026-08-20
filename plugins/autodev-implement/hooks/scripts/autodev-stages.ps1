@@ -820,6 +820,126 @@ function Write-JsonResult {
     Write-Output ($Result | ConvertTo-Json -Depth 5 -Compress)
 }
 
+function Read-JsonStringField {
+    <#
+        Reads one top-level string field out of the raw payload without ConvertFrom-Json, for the
+        fast path only. Returns $null when the field is missing, is not a plain JSON string, or
+        uses an escape this deliberately minimal decoder does not implement -- every one of those
+        answers sends the caller to the real parser rather than letting it guess.
+    #>
+    param([string]$Raw, [string]$Name)
+    $match = [regex]::Match($Raw, '"' + [regex]::Escape($Name) + '"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    if (-not $match.Success) { return $null }
+    $value = $match.Groups[1].Value
+    if ($value.IndexOf([char]0x5C) -lt 0) { return $value }
+
+    # Windows paths arrive as '\\', so escapes cannot simply be rejected. This validates and
+    # decodes in one left-to-right pass, which is also what makes it correct: a scan for
+    # "backslash not followed by an allowed character" would misread the second half of every
+    # '\\' pair and reject real paths. Deliberately a hand-rolled loop rather than a regex
+    # MatchEvaluator -- compiling a script block into a delegate costs more on this path than
+    # everything it was added to save.
+    $decoded = New-Object System.Text.StringBuilder
+    $i = 0
+    while ($i -lt $value.Length) {
+        $ch = $value[$i]
+        if ($ch -ne [char]0x5C) {
+            $null = $decoded.Append($ch)
+            $i++
+            continue
+        }
+        $i++
+        if ($i -ge $value.Length) { return $null }
+        $escaped = $value[$i]
+        # Only the escapes a path or a session id realistically carries. Anything else, \n and
+        # \uXXXX included, is left to the real parser.
+        if ($escaped -ne [char]0x5C -and $escaped -ne '/' -and $escaped -ne '"') { return $null }
+        $null = $decoded.Append($escaped)
+        $i++
+    }
+    return $decoded.ToString()
+}
+
+function Test-EnforcementStateAbsent {
+    <#
+        True only when neither the authoritative state file nor its workspace mirror exists,
+        which is the whole question agentStop and preToolUse ask before concluding they have
+        nothing to enforce. False whenever that cannot be established cheaply and with
+        certainty, which sends the caller down the fully parsed path.
+
+        This is an optimization, never a second copy of the enforcement rules: every branch it
+        can take ends in the same '{}' the parsed path would have produced.
+    #>
+    param([string]$RawInput)
+    try {
+        # A payload that is absent or unparseable already ends in '{}' below.
+        if ([string]::IsNullOrWhiteSpace($RawInput)) { return $true }
+
+        # Only the top-level object is scanned. A nested value could carry its own "sessionId"
+        # or "cwd" key -- toolArgs is an arbitrary object -- and trusting one would name the
+        # wrong state file, which on this path means wrongly concluding there is nothing to
+        # enforce. Everything the CLI puts here comes before any nested value, so stopping at
+        # the first one costs nothing real and removes the ambiguity entirely.
+        $open = $RawInput.IndexOf('{')
+        if ($open -lt 0) { return $false }
+        $nested = $RawInput.IndexOfAny([char[]]@('{', '['), $open + 1)
+        if ($nested -ge 0) { $scope = $RawInput.Substring($open, $nested - $open) }
+        else { $scope = $RawInput.Substring($open) }
+
+        $sessionId = Read-JsonStringField -Raw $scope -Name 'sessionId'
+        if ($null -eq $sessionId) {
+            # Not a plain string in the top-level scope. That covers a genuinely absent key, a
+            # non-string value that ConvertFrom-Json would still stringify, and a key that was
+            # cut off with the nested values -- so only treat it as absent when the key appears
+            # nowhere in the payload at all. Anything else is left to the real parser, because
+            # checking the wrong file here means walking past a live review.
+            if ($RawInput -match '"sessionId"') { return $false }
+            $sessionId = ''
+        }
+        if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = 'unknown-session' }
+        else { $sessionId = $sessionId -replace '[^A-Za-z0-9._-]', '_' }
+
+        # Mirrors Get-StateDirectory, using [IO.Path] because Join-Path's first call costs more
+        # in provider warm-up than everything else on this path put together.
+        $copilotHome = $env:COPILOT_HOME
+        if ([string]::IsNullOrWhiteSpace($copilotHome)) {
+            $profileDir = $env:USERPROFILE
+            if ([string]::IsNullOrWhiteSpace($profileDir)) { $profileDir = $HOME }
+            if ([string]::IsNullOrWhiteSpace($profileDir)) { return $false }
+            $copilotHome = [IO.Path]::Combine($profileDir, '.copilot')
+        }
+        $stateDir = [IO.Path]::Combine([IO.Path]::Combine($copilotHome, 'autodev-implement'), 'stages')
+        if ([IO.File]::Exists([IO.Path]::Combine($stateDir, "$sessionId.json"))) { return $false }
+
+        # The mirror is an exact-session recovery checkpoint, so its absence has to be
+        # established too -- in the one location Get-ViewDirectory would have chosen. Testing
+        # both candidates instead looks safer and is not: the state-directory fallback is shared
+        # by every session, so a single leftover mirror there would switch this fast path off
+        # permanently for the whole machine.
+        $cwd = Read-JsonStringField -Raw $scope -Name 'cwd'
+        if ($null -eq $cwd) {
+            if ($RawInput -match '"cwd"') { return $false }
+            $cwd = ''
+        }
+        if ([string]::IsNullOrWhiteSpace($cwd)) {
+            $viewDir = $stateDir
+        }
+        elseif ([IO.Directory]::Exists($cwd)) {
+            $viewDir = [IO.Path]::Combine($cwd, '.autodev')
+        }
+        else {
+            # Get-ViewDirectory decides this with Test-Path, which does not agree with
+            # [IO.Directory]::Exists on every exotic path. Too rare to be worth a guess.
+            return $false
+        }
+        return (-not [IO.File]::Exists([IO.Path]::Combine($viewDir, 'implement-status.json')))
+    }
+    catch {
+        # Including any malformed path that made [IO.Path] throw.
+        return $false
+    }
+}
+
 # Hard ceiling on how long the telemetry child process may run before the parent kills it. Sits
 # well below the hook's own 20 second timeout so a hung collector can never cost the gate its
 # tracker footer, but high enough to absorb PowerShell process startup on a loaded machine --
@@ -936,6 +1056,25 @@ try {
     }
 
     $rawInput = Read-StandardInput
+
+    # Fast path. agentStop fires at the end of every turn, in every session in every repository
+    # the plugin is installed in, and the CLI pays a fresh PowerShell process for each one. It
+    # cannot enforce anything until subagentStart has created state, so the "no run in progress"
+    # answer is settled here using only .NET calls: ConvertFrom-Json, Join-Path and Test-Path
+    # below each cost more in first-use warm-up than this entire branch. Anything it cannot
+    # settle with certainty falls through and is answered by the code that follows, which stays
+    # the only implementation of the enforcement rules.
+    #
+    # preToolUse is deliberately excluded. Unlike the autodev-plan gate tracker, its no-state
+    # branch is not a no-op: it still refuses a 'task' call that would open the run with
+    # anything other than the tasking agent.
+    if ($EventName -eq 'agentStop') {
+        if (Test-EnforcementStateAbsent -RawInput $rawInput) {
+            [Console]::Out.WriteLine('{}')
+            exit 0
+        }
+    }
+
     $payload = $null
     if (-not [string]::IsNullOrWhiteSpace($rawInput)) {
         $payload = $rawInput | ConvertFrom-Json

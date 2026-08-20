@@ -84,6 +84,25 @@ every sub-agent lifecycle event and:
 Sub-agents are matched by their exact `autodev-implement:` namespace, so another installed plugin
 exposing an identically named agent cannot be captured by this tracker or mutate its counters.
 
+### Cost when the workflow is not running
+
+Copilot CLI has no way to scope a hook to an agent: `subagentStart` can be filtered by agent name,
+but `agentStop` and `preToolUse` cannot, so once the plugin is installed they fire in **every**
+session — `agentStop` at the end of every turn — and each one costs a process. `agentStop` is a
+no-op until `subagentStart` has created state, so it answers that case on a fast path that touches
+nothing but the filesystem: no `ConvertFrom-Json`, `Join-Path` or `Test-Path` on Windows, and no
+`jq` on Linux and macOS. First use of those cmdlets in a fresh PowerShell process costs more than
+the entire check.
+
+`preToolUse` has no such shortcut, and deliberately so: unlike the autodev-plan gate tracker, its
+no-state branch is not a no-op — it still refuses a `task` call that would open a run with
+anything other than the tasking agent.
+
+The fast path only ever decides *"there is nothing to enforce"*. Anything it cannot settle with
+certainty — a session id that is not a plain JSON string, a `cwd` carrying an escape it does not
+decode — falls through to the fully parsed path, which remains the only implementation of the
+enforcement rules.
+
 Milestone *structure* is read from `.autodev/todos.md` — it is the only place that information
 exists, and the headings must be numbered consecutively from 1. A tasking agent that reports
 success but leaves a todo list the tracker cannot walk is recorded as `BLOCKED` rather than

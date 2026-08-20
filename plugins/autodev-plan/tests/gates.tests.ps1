@@ -786,6 +786,101 @@ Test-Case 'a mirror from another session is never used for recovery' {
     Assert-Equal 1 $state.totalInvocations 'a new session must not inherit the old invocation count'
 }
 
+# ------------------------------------------------------------------------------------------
+Write-Section 'Fast path (the cheap "nothing to enforce" answer must match the parsed one)'
+# ------------------------------------------------------------------------------------------
+#
+# agentStop fires at the end of every turn and preToolUse on every ask_user or task call, in
+# every session in every repository the plugin is installed in, so both answer "no workflow is
+# running" without paying for ConvertFrom-Json, Join-Path or Test-Path. These cases pin that
+# shortcut to the behaviour of the fully parsed path it stands in for.
+
+Test-Case 'a stray mirror in the shared state directory does not mask a live session' {
+    # The state-directory mirror is the fallback for sessions with no usable cwd, so it is NOT
+    # keyed by session: one left behind by any earlier run is visible to every later one. The
+    # fast path must therefore consult the same single location Get-ViewDirectory would choose.
+    # An earlier revision tested both candidates "to be safe" and this file switched enforcement
+    # onto the slow path for the whole machine, permanently.
+    $stray = Join-Path (Join-Path $script:Root 'autodev-plan\gates') 'gate-status.json'
+    New-Item -ItemType Directory -Path (Split-Path $stray -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $stray -Value '{"sessionId":"someone-else","architectureVerdict":"PASS"}'
+    try {
+        $sid = New-SessionId
+        Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+        $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json
+        Assert-Equal 'block' $stop.decision 'a stray mirror must not weaken a real session'
+        Assert-Match 'autodev-plan:autodev-security-review' $stop.reason
+    }
+    finally { Remove-Item -LiteralPath $stray -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'a stray mirror in the state directory still lets an unrelated session stop' {
+    # Same file, seen by a session that never started a gate and sends no cwd, so the state
+    # directory IS its view directory. The shortcut declines to answer and the parsed path must
+    # reject the stray mirror on its session id, as it always has.
+    $stray = Join-Path (Join-Path $script:Root 'autodev-plan\gates') 'gate-status.json'
+    New-Item -ItemType Directory -Path (Split-Path $stray -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $stray -Value '{"sessionId":"someone-else","architectureVerdict":"PASS"}'
+    try {
+        $json = @{ sessionId = New-SessionId; stopReason = 'end_turn' } | ConvertTo-Json -Compress
+        $out = $json | powershell -NoProfile -ExecutionPolicy Bypass -File $script:GateScript agentStop
+        Assert-Equal '{}' (($out | Out-String).Trim())
+    }
+    finally { Remove-Item -LiteralPath $stray -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'a workspace path needing JSON unescaping still resolves to the same answer' {
+    # cwd reaches the hook as JSON, so every Windows separator arrives as '\\'. Decoding that
+    # by hand is the price of skipping ConvertFrom-Json; getting it wrong would look at the
+    # wrong directory for the mirror.
+    $sid = New-SessionId
+    $cwd = Join-Path $script:Root "fast path $sid"
+    New-Item -ItemType Directory -Path $cwd -Force | Out-Null
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd; stopReason = 'end_turn' })
+
+    Invoke-Hook 'subagentStart' @{ sessionId = $sid; cwd = $cwd; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+    $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd; stopReason = 'end_turn' } | ConvertFrom-Json
+    Assert-Equal 'block' $stop.decision 'the mirror under an escaped path must still be found'
+}
+
+Test-Case 'a session id that is not a plain JSON string still reaches the parsed path' {
+    # ConvertFrom-Json stringifies a number; the shortcut deliberately refuses to guess how,
+    # because checking the wrong file would walk straight past a live gate.
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    $cwd = Get-SessionCwd $sid
+    $json = '{"sessionId":' + $sid + ',"cwd":' + ($cwd | ConvertTo-Json) + ',"stopReason":"end_turn"}'
+    $out = ($json | powershell -NoProfile -ExecutionPolicy Bypass -File $script:GateScript agentStop | Out-String).Trim()
+    # A numeric id names no state file, so the answer is '{}' either way. What is under test is
+    # that it is reached without crashing and without the shortcut inventing a file name.
+    Assert-Equal '{}' $out
+}
+
+Test-Case 'a nested sessionId cannot be mistaken for the real one' {
+    # toolArgs is an arbitrary object, so a tool call can carry its own "sessionId" key. Reading
+    # that one would name a state file belonging to nobody, find it missing, and conclude there
+    # was nothing to enforce -- while a real gate was outstanding.
+    $sid = New-SessionId
+    Start-Gate -SessionId $sid -Gate 'architecture'
+    $cwd = Get-SessionCwd $sid
+    $json = '{"toolArgs":{"sessionId":"not-a-real-session","prompt":"x"},"sessionId":' +
+    ($sid | ConvertTo-Json) + ',"cwd":' + ($cwd | ConvertTo-Json) + ',"toolName":"ask_user"}'
+    $out = ($json | powershell -NoProfile -ExecutionPolicy Bypass -File $script:GateScript preToolUse | Out-String).Trim()
+    Assert-Match '"permissionDecision":"deny"' $out 'a nested key must not disable enforcement'
+}
+
+Test-Case 'the fast path never creates anything in the workspace' {
+    # Confirm-Directory is only supposed to run once a real gate has been identified. The
+    # shortcut runs before that and must not litter '.autodev' into an unrelated repository.
+    $sid = New-SessionId
+    $cwd = Get-SessionCwd $sid
+    Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd; stopReason = 'end_turn' } | Out-Null
+    Invoke-Hook 'preToolUse' @{ sessionId = $sid; cwd = $cwd; toolName = 'ask_user' } | Out-Null
+    if (Test-Path -LiteralPath (Join-Path $cwd '.autodev')) {
+        throw 'the fast path created .autodev in a workspace with no run in progress'
+    }
+}
+
 Test-Case 'two sessions in one directory keep independent attempt counters' {
     # This is what makes the caps real. If sessions shared one state file they would reset each
     # other and no gate would ever reach its limit. Every round here goes through the hook,
