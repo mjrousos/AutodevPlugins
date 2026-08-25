@@ -444,6 +444,17 @@ get_stuck_gates() {
   printf '%s' "$out"
 }
 
+# Fast path. agentStop fires at the end of every turn and preToolUse on every ask_user or task
+# call, in every session in every repository the plugin is installed in. Neither event can
+# enforce anything until subagentStart has created state, and read_state below costs several jq
+# invocations even when there is nothing to read. The condition is exactly the one both of those
+# branches apply again further down, so this only settles the case earlier and more cheaply.
+case "$EVENT_NAME" in
+  agentStop | preToolUse)
+    [ -f "$STATE_PATH" ] || [ -f "$MIRROR_PATH" ] || emit_empty
+    ;;
+esac
+
 STATE="$(read_state)"
 
 case "$EVENT_NAME" in

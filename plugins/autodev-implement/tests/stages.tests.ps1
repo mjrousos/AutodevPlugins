@@ -461,6 +461,88 @@ Test-Case 'a foreign agent is still permitted when no state exists' {
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = New-SessionId; toolName = 'task'; toolArgs = $taskArgs })
 }
 
+# ------------------------------------------------------------------------------------------
+Write-Section 'Fast path (the cheap "nothing to enforce" answer must match the parsed one)'
+# ------------------------------------------------------------------------------------------
+#
+# agentStop fires at the end of every turn, in every session in every repository the plugin is
+# installed in, so it answers "no run is in progress" without paying for ConvertFrom-Json,
+# Join-Path or Test-Path. These cases pin that shortcut to the behaviour of the fully parsed
+# path it stands in for. preToolUse deliberately has no such shortcut, because its no-state
+# branch still refuses an out-of-order 'task'; the cases above cover that.
+
+Test-Case 'a stray mirror in the shared state directory does not mask a live run' {
+    # The state-directory mirror is the fallback for sessions with no usable cwd, so it is NOT
+    # keyed by session: one left behind by any earlier run is visible to every later one. The
+    # fast path must therefore consult the same single location Get-ViewDirectory would choose.
+    $stray = Join-Path (Join-Path $script:Root 'autodev-implement\stages') 'implement-status.json'
+    New-Item -ItemType Directory -Path (Split-Path $stray -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $stray -Value '{"sessionId":"someone-else"}'
+    try {
+        $sid = New-SessionId
+        Set-StageState -SessionId $sid -Stage 'milestones'
+        Assert-Match '"decision":"block"' (Invoke-Hook 'agentStop' @{ sessionId = $sid })
+    }
+    finally { Remove-Item -LiteralPath $stray -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'a stray mirror in the state directory still lets an unrelated session stop' {
+    # Same file, seen by a session that never started a run and sends no cwd, so the state
+    # directory IS its view directory. The shortcut declines to answer and the parsed path must
+    # reject the stray mirror on its session id, as it always has.
+    $stray = Join-Path (Join-Path $script:Root 'autodev-implement\stages') 'implement-status.json'
+    New-Item -ItemType Directory -Path (Split-Path $stray -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $stray -Value '{"sessionId":"someone-else"}'
+    try {
+        $json = @{ sessionId = New-SessionId; stopReason = 'end_turn' } | ConvertTo-Json -Compress
+        $out = $json | powershell -NoProfile -ExecutionPolicy Bypass -File $script:StageScript agentStop
+        Assert-Equal '{}' (($out | Out-String).Trim())
+    }
+    finally { Remove-Item -LiteralPath $stray -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'a workspace path needing JSON unescaping still resolves to the same answer' {
+    # cwd reaches the hook as JSON, so every Windows separator arrives as '\\'. Decoding that by
+    # hand is the price of skipping ConvertFrom-Json; getting it wrong would look in the wrong
+    # directory for the mirror.
+    $sid = New-SessionId
+    $cwd = Join-Path $script:Root "fast path $sid"
+    New-Item -ItemType Directory -Path $cwd -Force | Out-Null
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd; stopReason = 'end_turn' })
+
+    Invoke-Hook 'subagentStart' @{ sessionId = $sid; cwd = $cwd; agentName = 'autodev-implement:autodev-tasking' } | Out-Null
+
+    # Drop the authoritative state so the mirror under the escaped path is the only enforcement
+    # state left. Without this the shortcut answers on the state file and never reads 'cwd' at
+    # all, and a broken decoder would still pass.
+    Remove-Item -LiteralPath (Get-StatePath $sid) -Force
+    Assert-Match '"decision":"block"' (Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd })
+}
+
+Test-Case 'a nested sessionId cannot be mistaken for the real one' {
+    # toolArgs is an arbitrary object, so an event payload can carry its own "sessionId" key.
+    # Reading that one would name a state file belonging to nobody, find it missing, and
+    # conclude there was nothing to enforce -- while a run was still in progress.
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'milestones'
+    $cwd = Get-SessionCwd $sid
+    $json = '{"toolArgs":{"sessionId":"not-a-real-session","prompt":"x"},"sessionId":' +
+    ($sid | ConvertTo-Json) + ',"cwd":' + ($cwd | ConvertTo-Json) + ',"stopReason":"end_turn"}'
+    $out = ($json | powershell -NoProfile -ExecutionPolicy Bypass -File $script:StageScript agentStop | Out-String).Trim()
+    Assert-Match '"decision":"block"' $out 'a nested key must not disable enforcement'
+}
+
+Test-Case 'the fast path never creates anything in the workspace' {
+    # Confirm-Directory is only supposed to run once a real sub-agent has been identified. The
+    # shortcut runs before that and must not litter '.autodev' into an unrelated repository.
+    $sid = New-SessionId
+    $cwd = Get-SessionCwd $sid
+    Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd; stopReason = 'end_turn' } | Out-Null
+    if (Test-Path -LiteralPath (Join-Path $cwd '.autodev')) {
+        throw 'the fast path created .autodev in a workspace with no run in progress'
+    }
+}
+
 Test-Case 'only tasking may run while the run is still idle' {
     # State exists (something was invoked) but tasking has never run.
     $sid = New-SessionId

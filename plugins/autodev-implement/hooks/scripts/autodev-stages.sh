@@ -794,6 +794,21 @@ read_verdict() {
   fi
 }
 
+# Fast path. agentStop fires at the end of every turn, in every session in every repository the
+# plugin is installed in. It cannot enforce anything until subagentStart has created state, and
+# read_state below costs several jq invocations even when there is nothing to read. The condition
+# is exactly the one that branch applies again further down, so this only settles the case
+# earlier and more cheaply.
+#
+# preToolUse is deliberately excluded. Unlike the autodev-plan gate tracker, its no-state branch
+# is not a no-op: it still refuses a 'task' call that would open the run with anything other than
+# the tasking agent.
+case "$EVENT_NAME" in
+  agentStop)
+    if [ ! -f "$STATE_PATH" ] && [ ! -f "$MIRROR_PATH" ]; then emit_empty; fi
+    ;;
+esac
+
 STATE="$(read_state)"
 
 case "$EVENT_NAME" in
