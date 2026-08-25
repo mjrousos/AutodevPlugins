@@ -1,0 +1,13 @@
+{
+  "name": "autodev",
+  "version": "0.1.0",
+  "description": "Runs the full plan-then-implement software development loop as a single Agent Factory, pausing for your approval before the review gates, before implementation, and at the code checkpoint.",
+  "author": {
+    "name": "Mike Rousos",
+    "email": "mjrousos@github.com",
+    "url": "https://github.com/mjrousos"
+  },
+  "license": "MIT",
+  "keywords": ["autodev", "factory", "planning", "implementation", "sdlc"],
+  "extensions": ["extensions/"]
+}

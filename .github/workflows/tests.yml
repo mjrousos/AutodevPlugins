@@ -59,6 +59,24 @@ jobs:
       - name: Run stage tracker tests
         run: bash plugins/autodev-implement/tests/stages.tests.sh
 
+  factory-tests:
+    name: Autodev factory (Node)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run factory unit tests
+        # The SDK is injected by the CLI into the extension host, so it cannot be installed here.
+        # register-stub.mjs resolves it to a local stub; the factory guards its joinSession call
+        # behind AUTODEV_FACTORY_TEST so importing the module does not try to talk to a CLI.
+        run: node --import ./plugins/autodev/tests/register-stub.mjs --test plugins/autodev/tests/factory.tests.mjs
+
   manifests:
     name: Manifests and line endings
     runs-on: ubuntu-latest
@@ -90,3 +108,33 @@ jobs:
           # directories. autodev-plan holds the canonical copy; this fails if another plugin's
           # copy was edited directly instead of the canonical one.
           bash scripts/sync-otel-emitter.sh --check
+      - name: Autodev factory prompt bundle must not drift
+        run: |
+          # The autodev factory carries the reviewer and worker instructions in its prompts,
+          # because a factory subagent cannot be given an agent_type. The bundle is generated
+          # from the canonical .agent.md files; this fails if one was edited without
+          # regenerating it.
+          bash scripts/sync-autodev-prompts.sh --check
+      - name: Factory extensions must parse
+        run: |
+          # A syntax error here would only surface as an extension that silently fails to load.
+          # Every extension module under plugins/ and samples/ is checked, not just autodev's, so
+          # a new one cannot be added without being covered.
+          status=0
+          count=0
+          while IFS= read -r f; do
+            count=$((count + 1))
+            if node --experimental-vm-modules -e "
+              const fs = require('node:fs');
+              const vm = require('node:vm');
+              new vm.SourceTextModule(fs.readFileSync(process.argv[1], 'utf8'));
+            " "$f"; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f does not parse"; status=1
+            fi
+          done < <(find plugins samples -path '*/extensions/*' -name '*.mjs' | sort)
+          if [ "$count" -eq 0 ]; then
+            echo "FAIL found no extension modules to check — has the layout moved?"; status=1
+          fi
+          exit $status

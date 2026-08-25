@@ -4,12 +4,20 @@ This repository contains plugins for automating different parts of the software 
 
 Plugins:
 
+- [Autodev](./plugins/autodev/README.md): Runs the whole loop — planning and implementation — as a
+  single Agent Factory, pausing for your approval before the review gates, before implementation,
+  and at the code checkpoint. Combines what `autodev-plan` and `autodev-implement` do into one run.
 - [Autodev-Plan](./plugins/autodev-plan/README.md): Generates a development plan based on a project or feature description, hardened by isolated architecture, security, and privacy review gates.
 - [Autodev-Implement](./plugins/autodev-implement/README.md): Implements a plan from Autodev-Plan milestone by milestone, hardened by isolated code, security, and privacy review loops.
 - [Autodev-Docs](./plugins/autodev-docs/README.md): Generates documentation for your codebase or project.
 
-> **Status:** `autodev-plan` and `autodev-implement` are implemented. `autodev-docs` is still a
-> scaffolded placeholder.
+> **Status:** `autodev`, `autodev-plan` and `autodev-implement` are implemented. `autodev-docs` is
+> still a scaffolded placeholder.
+>
+> `autodev` ships as a Copilot CLI *extension* rather than as agents and hooks, because an Agent
+> Factory has to be registered from code. Copilot CLI discovers extensions in `.github/extensions/`
+> and in your Copilot home, so install it with `plugins/autodev/install.sh` (or `install.ps1`) —
+> see [its README](./plugins/autodev/README.md).
 
 ## Samples
 
@@ -38,6 +46,13 @@ This repository is a plugin marketplace. Add it and then install the plugins you
 /plugin install autodev-docs@autodev-plugins
 ```
 
+The `autodev` factory is an extension, not an agent bundle, so it is installed by path rather than
+through the marketplace:
+
+```
+plugins/autodev/install.sh          # or install.ps1 on Windows
+```
+
 ## Repository layout
 
 ```
@@ -49,8 +64,10 @@ plugins/<plugin-name>/
 ├── .mcp.json                     # MCP server configuration
 ├── agents/                       # Agent definitions (*.agent.md)
 ├── skills/                       # Skills (<skill-name>/SKILL.md)
+├── extensions/<name>/            # SDK extensions (extension.mjs) — Agent Factories live here
 └── hooks/scripts/                # Scripts invoked by hooks
 samples/<sample-name>/            # Standalone teaching samples, installed by path
+scripts/                          # Repository maintenance scripts, verified by CI
 ```
 
 Each plugin's `plugin.json` references its `hooks.json` and `.mcp.json`. In the unimplemented
