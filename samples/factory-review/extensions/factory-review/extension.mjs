@@ -15,6 +15,9 @@
  *   ctx.phase     run-global progress                                              (three times)
  *   ctx.log       an audit trail for everything this factory silently drops        (throughout)
  *
+ * The extension also registers a `/review-factory` slash command, which starts the factory
+ * through `session.factory.run` — the caller-side half of the API, opposite `ctx`.
+ *
  * The three ways a factory fails *silently* are marked `GOTCHA` below. They are the reason this
  * sample exists. See README.md for the long version.
  *
@@ -373,4 +376,53 @@ const sampleReview = defineFactory({
     },
 });
 
-await joinSession({ factories: [sampleReview] });
+/* -------------------------------------------------------------------------------------------
+ * Session join, and the /review-factory slash command.
+ *
+ * `commands` is an ordinary session-config field, not a factory feature — an extension can
+ * register slash commands whether or not it defines a factory. It is here because a factory that
+ * a human wants to start is better reached with one keystroke than by asking the agent to call
+ * `run_factory`, and because it is the only place this sample exercises `session.factory` (the
+ * same API the README's "Observing a run" section describes).
+ * ------------------------------------------------------------------------------------------- */
+
+// The handler closes over `session`, which cannot be passed to it: CommandContext carries only
+// sessionId, command, commandName, and args. `session` is assigned before the CLI can dispatch a
+// command, so the closure is always initialized by the time the handler runs.
+const session = await joinSession({
+    factories: [sampleReview],
+    commands: [
+        {
+            name: "review-factory",
+            description: "Run the sample-review factory. Usage: /review-factory [target]",
+            handler: async (context) => {
+                const target = context.args.trim();
+                const args = target ? { target } : {};
+
+                await session.log(`sample-review: starting${target ? ` on ${target}` : " with default arguments"}.`);
+
+                // Deliberately NOT awaited. `session.factory.run` resolves only once the run
+                // reaches a terminal status, which is minutes away, and a command handler should
+                // hand the terminal straight back. The run outlives this handler; its outcome is
+                // logged when it settles. The .catch is not optional — an un-awaited rejection
+                // here would otherwise be an unhandled promise rejection in the extension host.
+                session.factory
+                    .run(sampleReview, { args })
+                    .then(async (run) => {
+                        if (run.status !== "completed") {
+                            const why = run.failure?.type ?? run.error ?? run.status;
+                            await session.log(`sample-review ${run.status} (run ${run.runId}): ${why}`, { level: "error" });
+                            return;
+                        }
+                        const summary = isPlainObject(run.result) ? run.result.summary : null;
+                        await session.log(`sample-review completed (run ${run.runId}): ${summary ?? "no summary returned"}`);
+                    })
+                    .catch(async (error) => {
+                        // Only pre-execution failures reject: an unknown factory, or a session
+                        // that already has a factory run in flight.
+                        await session.log(`sample-review could not start: ${error?.message ?? error}`, { level: "error" });
+                    });
+            },
+        },
+    ],
+});

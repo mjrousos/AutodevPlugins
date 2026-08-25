@@ -48,13 +48,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File samples\factory-review\insta
 samples/factory-review/install.sh          # --project to install into .github/extensions instead
 ```
 
-Then in Copilot CLI, `/extensions` to reload (or restart it), and ask for the factory by name:
+Then in Copilot CLI, `/extensions` to reload (or restart it). There are three ways to start it.
+
+**The slash command**, which the extension registers itself:
+
+```
+/review-factory samples/factory-review/extensions/factory-review/extension.mjs
+```
+
+The argument is optional — `/review-factory` on its own reviews the factory's default target. See
+[The slash command](#the-slash-command) for how it is wired up.
+
+**By asking the agent**, which reaches the same factory through the `run_factory` tool:
 
 ```
 Run the sample-review factory on samples/factory-review/extensions/factory-review/extension.mjs
 ```
 
-Or drive the tools directly:
+**Or drive the tools directly:**
 
 | Step | Tool call |
 |---|---|
@@ -225,6 +236,42 @@ the ID? `factories_manage` → `runs` lists the session's runs with their IDs an
 
 To watch it happen, run the sample with a limit you know is too low — `{"maxTotalSubagents": 3}`
 against the defaults — then resume it with a higher one and watch the finders replay instantly.
+
+## The slash command
+
+The extension registers `/review-factory` alongside the factory. `commands` is an ordinary
+session-config field — any extension can register slash commands, with or without a factory — but
+it is worth having here for two reasons: a factory a human wants to start is better reached with
+one keystroke than by asking the agent to call `run_factory`, and it is the only place this sample
+uses `session.factory`, the caller-side half of the API opposite `ctx`.
+
+```js
+const session = await joinSession({
+    factories: [sampleReview],
+    commands: [{
+        name: "review-factory",
+        description: "Run the sample-review factory. Usage: /review-factory [target]",
+        handler: async (context) => { /* context.args is the raw string after the name */ },
+    }],
+});
+```
+
+Three things about it are deliberate:
+
+- **The handler closes over `session`.** `CommandContext` carries only `sessionId`, `command`,
+  `commandName`, and `args` — there is no session on it, so the closure is the only route to
+  `session.factory`. `session` is assigned before the CLI can dispatch a command, so it is always
+  initialized by the time the handler runs.
+- **The run is not awaited.** `session.factory.run` resolves only at a terminal status, minutes
+  later, and a command handler should hand the terminal straight back. The run outlives the
+  handler; its outcome is reported through `session.log` when it settles.
+- **The `.catch` is not optional.** An un-awaited rejection would be an unhandled promise
+  rejection in the extension host. Only *pre-execution* failures reject — an unknown factory, or a
+  session that already has a run in flight — because every other outcome, including `error` and
+  `cancelled`, resolves with an envelope.
+
+`CommandHandler` returns `void`, so a command cannot return text to the user. Report through
+`session.log(message, { level })` instead.
 
 ## Observing a run
 
