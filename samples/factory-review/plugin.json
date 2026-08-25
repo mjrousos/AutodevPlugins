@@ -1,0 +1,13 @@
+{
+  "name": "factory-review",
+  "version": "0.1.0",
+  "description": "Sample plugin: a small Agent Factory that fans out reviewers across lenses and has independent skeptics verify every finding.",
+  "author": {
+    "name": "Mike Rousos",
+    "email": "mjrousos@github.com",
+    "url": "https://github.com/mjrousos"
+  },
+  "license": "MIT",
+  "keywords": ["sample", "factory", "agent-factory", "subagents", "review"],
+  "extensions": ["extensions/"]
+}

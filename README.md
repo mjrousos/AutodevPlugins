@@ -14,9 +14,15 @@ Plugins:
 ## Samples
 
 - [hook-otel-span](./samples/hook-otel-span/README.md): a minimal, installable plugin showing how
-  to emit an OpenTelemetry span from a Copilot CLI hook. Samples are not part of the marketplace;
-  install one by path with
-  `copilot plugin install mjrousos/AutodevPlugins:samples/hook-otel-span`.
+  to emit an OpenTelemetry span from a Copilot CLI hook.
+- [factory-review](./samples/factory-review/README.md): a small, readable **Agent Factory** — fan
+  out reviewers across lenses, have independent skeptics verify every finding, report what
+  survived. Covers the primitives, the three ways a factory fails silently, limits, and resume.
+  An Agent Factory has to be registered from code, so this one is a Copilot CLI *extension*:
+  install it with `samples/factory-review/install.sh` (or `install.ps1`).
+
+Samples are not part of the marketplace; install a hook or agent sample by path with
+`copilot plugin install mjrousos/AutodevPlugins:samples/<sample-name>`.
 
 
 ## Installation
