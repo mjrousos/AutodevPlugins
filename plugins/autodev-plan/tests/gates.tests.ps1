@@ -839,6 +839,11 @@ Test-Case 'a workspace path needing JSON unescaping still resolves to the same a
     Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd; stopReason = 'end_turn' })
 
     Invoke-Hook 'subagentStart' @{ sessionId = $sid; cwd = $cwd; agentName = 'autodev-plan:autodev-architecture-review' } | Out-Null
+
+    # Drop the authoritative state so the mirror under the escaped path is the only enforcement
+    # state left. Without this the shortcut answers on the state file and never reads 'cwd' at
+    # all, and a broken decoder would still pass.
+    Remove-Item -LiteralPath (Get-StatePath $sid) -Force
     $stop = Invoke-Hook 'agentStop' @{ sessionId = $sid; cwd = $cwd; stopReason = 'end_turn' } | ConvertFrom-Json
     Assert-Equal 'block' $stop.decision 'the mirror under an escaped path must still be found'
 }

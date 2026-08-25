@@ -862,10 +862,12 @@ function Read-JsonStringField {
 
 function Test-EnforcementStateAbsent {
     <#
-        True only when neither the authoritative state file nor its workspace mirror exists,
-        which is the whole question agentStop and preToolUse ask before concluding they have
-        nothing to enforce. False whenever that cannot be established cheaply and with
-        certainty, which sends the caller down the fully parsed path.
+        True only when neither the authoritative state file nor its workspace mirror exists.
+        That is the whole enforcement question for agentStop, the only caller: with no state
+        there is nothing for it to enforce. It is NOT the whole question for preToolUse, whose
+        no-state branch still refuses an out-of-order 'task', which is why that event is
+        deliberately not routed here. Returns false whenever absence cannot be established
+        cheaply and with certainty, which sends the caller down the fully parsed path.
 
         This is an optimization, never a second copy of the enforcement rules: every branch it
         can take ends in the same '{}' the parsed path would have produced.

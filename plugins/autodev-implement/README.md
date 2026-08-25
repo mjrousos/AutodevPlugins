@@ -89,10 +89,12 @@ exposing an identically named agent cannot be captured by this tracker or mutate
 Copilot CLI has no way to scope a hook to an agent: `subagentStart` can be filtered by agent name,
 but `agentStop` and `preToolUse` cannot, so once the plugin is installed they fire in **every**
 session — `agentStop` at the end of every turn — and each one costs a process. `agentStop` is a
-no-op until `subagentStart` has created state, so it answers that case on a fast path that touches
-nothing but the filesystem: no `ConvertFrom-Json`, `Join-Path` or `Test-Path` on Windows, and no
-`jq` on Linux and macOS. First use of those cmdlets in a fresh PowerShell process costs more than
-the entire check.
+no-op until `subagentStart` has created state, so it answers that case on a fast path that is as
+close to free as the platform allows. On Windows that means the filesystem and nothing else: no
+`ConvertFrom-Json`, `Join-Path` or `Test-Path`, whose first use in a fresh PowerShell process
+costs more than the entire check. On Linux and macOS the script has already spent `jq` validating
+the payload and reading `sessionId`/`cwd` before it reaches this point, so what the fast path
+saves there is the several further `jq` invocations `read_state` would have made.
 
 `preToolUse` has no such shortcut, and deliberately so: unlike the autodev-plan gate tracker, its
 no-state branch is not a no-op — it still refuses a `task` call that would open a run with
