@@ -254,16 +254,27 @@ durable result by ID without waiting for it to finish.
 ## Why this is an extension and not an agent
 
 An Agent Factory has to be **registered from code**, so it ships as a Copilot CLI *extension*
-(`extensions/factory-review/extension.mjs`) rather than as an `.agent.md`. Copilot CLI discovers
-extensions in `<git root>/.github/extensions/` and in your Copilot home, which is all the install
-scripts do.
+(`extensions/factory-review/extension.mjs`) rather than as an `.agent.md`.
 
-There is a second way in, useful for a throwaway: `factories_manage` with `operation: "author"`
+There are two ways to install one, and the choice matters more than it looks. A plugin can
+contribute an extension — `plugin.json` here declares `"extensions": ["extensions/"]`, an official
+manifest field — and that is the right route for **distributing to a team**, because it is the only
+one that also reaches Copilot cloud agent through `enabledPlugins`. But a plugin-contributed
+extension is resolved at CLI **startup**, so `/extensions` will not pick it up and you must restart.
+Copilot CLI also discovers extensions in `<git root>/.github/extensions/` and in your Copilot home,
+which is all the install scripts do — slower to distribute, but it reloads live, so it is the better
+**development** loop.
+
+> Note: installing a plugin by path or repository (`copilot plugin install owner/repo:path`) still
+> works but is **deprecated** — the CLI warns that only `plugin@marketplace` installs will be
+> supported in a future release. Prefer a marketplace entry for anything you intend to share.
+
+There is a third way in, useful for a throwaway: `factories_manage` with `operation: "author"`
 writes a factory into a session-scoped extension at runtime. One extra constraint applies there —
 **the `run` body is emitted verbatim and closes over nothing.** Every schema, constant, and helper
 must be defined *inside* the function, and external modules load with a dynamic `await import()`,
 never a static `import` or `require`. That is why this sample is a file: at this size, module
-scope is worth having.
+scope is worth having. A session-scoped factory also cannot be shared at all.
 
 ## What this sample omits for clarity
 

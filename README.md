@@ -22,7 +22,9 @@ Plugins:
   install it with `samples/factory-review/install.sh` (or `install.ps1`).
 
 Samples are not part of the marketplace; install a hook or agent sample by path with
-`copilot plugin install mjrousos/AutodevPlugins:samples/<sample-name>`.
+`copilot plugin install mjrousos/AutodevPlugins:samples/<sample-name>`. Note that installing by
+path or repository is deprecated — the CLI warns that only `plugin@marketplace` installs will be
+supported in a future release — so prefer a marketplace entry for anything you intend to share.
 
 
 ## Installation

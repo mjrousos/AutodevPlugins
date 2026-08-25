@@ -57,6 +57,10 @@ variable, and use the CLI:
 copilot plugin install mjrousos/AutodevPlugins:samples/hook-otel-span
 ```
 
+> Installing by repository path is **deprecated** — the CLI warns that only `plugin@marketplace`
+> installs will be supported in a future release. It remains the simplest way to try a sample,
+> since samples are deliberately not published to the marketplace.
+
 ```bash
 export HOOK_OTEL_ENABLED=1      # must be set BEFORE launching the CLI
 copilot
