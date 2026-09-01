@@ -689,7 +689,7 @@ export function renderHtml({ instanceId, initialView }) {
       header.append(node("div", "eyebrow", processLabel));
       header.append(node("h2", "", "Audit log"));
       header.append(node("p", "muted", "Read-only lifecycle events captured by autodev hooks."));
-      header.append(node("code", "source-path", ".autodev\\\\" + fileName));
+      header.append(node("code", "source-path", ".autodev/" + fileName));
       root.append(header);
 
       const summary = node("div", "summary-grid");

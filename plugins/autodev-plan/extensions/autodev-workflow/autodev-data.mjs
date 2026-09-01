@@ -575,16 +575,14 @@ export async function loadAutodevState(autodevDir) {
             }
         }),
     );
+    const sourceUpdatedAt = Math.max(...fileMetadata.map((file) => file.modifiedAt), 0);
 
     return {
         generatedAt: new Date().toISOString(),
-        sourceUpdatedAt: new Date(
-            Math.max(...fileMetadata.map((file) => file.modifiedAt), 0),
-        ).toISOString(),
+        sourceUpdatedAt: sourceUpdatedAt > 0 ? new Date(sourceUpdatedAt).toISOString() : null,
         sourceVersion: fileMetadata
             .map((file) => `${file.name}:${file.modifiedAt}:${file.size}`)
             .join("|"),
-        sourceDir: autodevDir,
         workflow: {
             status: workflowComplete ? "complete" : "active",
             label: workflowComplete ? "Workflow complete" : "Workflow in progress",
