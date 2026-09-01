@@ -1,7 +1,7 @@
 ---
 name: autodev-implementation
 description: Implements a single milestone of an autodev-implement todo list. Invoked programmatically by the autodev-implement orchestrator; not intended for direct use.
-model: gpt-5.5
+model: gpt-5.6-terra
 user-invocable: false
 ---
 

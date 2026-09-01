@@ -1,7 +1,7 @@
 ---
 name: autodev-code-fix
 description: Applies review findings to the code produced by an autodev-implement run. Invoked programmatically by the autodev-implement orchestrator; not intended for direct use.
-model: gpt-5.5
+model: gpt-5.6-terra
 user-invocable: false
 ---
 

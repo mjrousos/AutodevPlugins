@@ -1,7 +1,7 @@
 ---
 name: autodev-code-security-review
 description: Reviews the implemented code of an autodev-implement run for security vulnerabilities. Invoked programmatically by the autodev-implement orchestrator as an isolated review gate; not intended for direct use.
-model: claude-sonnet-5
+model: gpt-5.6-terra
 user-invocable: false
 tools: ["read", "search", "web"]
 ---

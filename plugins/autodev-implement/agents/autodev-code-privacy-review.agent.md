@@ -1,7 +1,7 @@
 ---
 name: autodev-code-privacy-review
 description: Reviews the implemented code of an autodev-implement run for privacy and data-protection problems. Invoked programmatically by the autodev-implement orchestrator as an isolated review gate; not intended for direct use.
-model: claude-sonnet-5
+model: gpt-5.6-terra
 user-invocable: false
 tools: ["read", "search"]
 ---

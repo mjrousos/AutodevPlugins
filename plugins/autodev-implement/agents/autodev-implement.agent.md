@@ -1,7 +1,7 @@
 ---
 name: autodev-implement
 description: Implements a plan end to end. Breaks the plan into milestones, implements each one, and hardens it through isolated code review, security review, and privacy review loops before handing it back.
-model: claude-opus-5
+model: gpt-5.6-sol
 user-invocable: true
 ---
 

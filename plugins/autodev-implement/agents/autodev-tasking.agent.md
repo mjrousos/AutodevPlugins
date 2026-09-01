@@ -1,7 +1,7 @@
 ---
 name: autodev-tasking
 description: Decomposes an implementation plan into a milestone-structured todo list. Invoked programmatically by the autodev-implement orchestrator; not intended for direct use.
-model: claude-opus-5
+model: gpt-5.6-sol
 user-invocable: false
 ---
 
