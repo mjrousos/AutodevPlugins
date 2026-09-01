@@ -17,8 +17,8 @@
     },
     {
       "name": "autodev-plan",
-      "description": "Generates a development plan based on a project or feature description, hardened by isolated architecture, security, and privacy review gates.",
-      "version": "0.3.7",
+      "description": "Generates a development plan based on a project or feature description, hardened by isolated architecture, security, and privacy review gates, with a live workflow canvas.",
+      "version": "0.4.0",
       "source": "./plugins/autodev-plan"
     },
     {

@@ -77,6 +77,17 @@ jobs:
         # behind AUTODEV_FACTORY_TEST so importing the module does not try to talk to a CLI.
         run: node --import ./plugins/autodev/tests/register-stub.mjs --test plugins/autodev/tests/factory.tests.mjs
 
+  workflow-canvas-tests:
+    name: Autodev workflow canvas (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run workflow canvas unit tests
+        run: node --test plugins/autodev-plan/tests/workflow-canvas.tests.mjs
+
   manifests:
     name: Manifests and line endings
     runs-on: ubuntu-latest
@@ -115,10 +126,10 @@ jobs:
           # from the canonical .agent.md files; this fails if one was edited without
           # regenerating it.
           bash scripts/sync-autodev-prompts.sh --check
-      - name: Factory extensions must parse
+      - name: Plugin extensions must parse
         run: |
           # A syntax error here would only surface as an extension that silently fails to load.
-          # Every extension module under plugins/ and samples/ is checked, not just autodev's, so
+          # Every extension module under plugins/ and samples/ is checked, so
           # a new one cannot be added without being covered.
           status=0
           count=0
