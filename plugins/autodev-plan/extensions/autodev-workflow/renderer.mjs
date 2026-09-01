@@ -481,6 +481,7 @@ export function renderHtml({ instanceId, initialView }) {
       view: document.body.dataset.initialView || "overview",
       auditKind: null,
       loading: false,
+      renderFailed: false,
     };
 
     const content = document.getElementById("content");
@@ -894,7 +895,7 @@ export function renderHtml({ instanceId, initialView }) {
         const response = await fetch(endpoint, { method: endpoint.includes("refresh") ? "POST" : "GET" });
         const body = await response.json();
         if (!response.ok) throw new Error(body.error || "Unable to load workflow state.");
-        if (state.data?.sourceVersion === body.sourceVersion) {
+        if (!state.renderFailed && state.data?.sourceVersion === body.sourceVersion) {
           return;
         }
         const renderedState = state.data ? captureRenderedState() : null;
@@ -904,7 +905,9 @@ export function renderHtml({ instanceId, initialView }) {
         if (renderedState) {
           restoreRenderedState(renderedState);
         }
+        state.renderFailed = false;
       } catch (error) {
+        state.renderFailed = true;
         const message = error instanceof Error ? error.message : "Unable to load workflow state.";
         const errorView = node("div", "error");
         const box = node("div");

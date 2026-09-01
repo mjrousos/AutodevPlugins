@@ -3,11 +3,13 @@ import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { runInNewContext } from "node:vm";
 
 import {
     loadAutodevState,
     locateAutodevDir,
 } from "../extensions/autodev-workflow/autodev-data.mjs";
+import { renderHtml } from "../extensions/autodev-workflow/renderer.mjs";
 
 async function withTemporaryDirectory(run) {
     const root = path.join(
@@ -82,4 +84,112 @@ test("capped milestones count as completed workflow milestones", async () => {
         );
         assert.equal(state.implementation.status, "complete");
     });
+});
+
+test("canvas recovers from a transient error when the source version is unchanged", async () => {
+    class FakeElement {
+        constructor() {
+            this.attributes = {};
+            this.children = [];
+            this.className = "";
+            this.dataset = {};
+            this.disabled = false;
+            this.style = {};
+            this.textContent = "";
+        }
+
+        addEventListener() {}
+
+        append(...children) {
+            this.children.push(...children);
+        }
+
+        focus() {}
+
+        querySelector() {
+            return null;
+        }
+
+        querySelectorAll() {
+            return [];
+        }
+
+        replaceChildren(...children) {
+            this.children = children;
+        }
+
+        setAttribute(name, value) {
+            this.attributes[name] = value;
+        }
+    }
+
+    const elements = new Map(
+        ["content", "refresh", "workflow-badge", "workflow-subtitle", "workflow-progress", "workflow-percent"]
+            .map((id) => [id, new FakeElement()]),
+    );
+    const workflowState = {
+        sourceUpdatedAt: "2026-09-01T12:00:00.000Z",
+        sourceVersion: "unchanged",
+        warnings: [],
+        workflow: {
+            label: "In progress",
+            percent: 50,
+            sessionId: "test-session",
+            status: "active",
+        },
+        plan: {
+            currentPhase: "Draft",
+            gates: [],
+            phases: [],
+        },
+        implementation: {
+            completedMilestones: 0,
+            currentPhase: "Not started",
+            gates: [],
+            milestoneCount: 0,
+            milestones: [],
+            phases: [],
+        },
+    };
+    const responses = [
+        { ok: true, json: async () => workflowState },
+        { ok: false, json: async () => ({ error: "Temporary read failure" }) },
+        { ok: true, json: async () => workflowState },
+    ];
+    let poll;
+    const html = renderHtml({ instanceId: "test", initialView: "overview" });
+    const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+    assert.ok(script);
+
+    runInNewContext(script, {
+        document: {
+            activeElement: null,
+            body: { dataset: { initialView: "overview" } },
+            createElement: () => new FakeElement(),
+            createTextNode: (text) => text,
+            getElementById: (id) => elements.get(id),
+            querySelectorAll: () => [],
+            scrollingElement: { scrollTop: 0 },
+        },
+        fetch: async () => responses.shift(),
+        requestAnimationFrame: (callback) => callback(),
+        setInterval: (callback) => {
+            poll = callback;
+            return 1;
+        },
+        window: {
+            scrollTo() {},
+            scrollX: 0,
+            scrollY: 0,
+        },
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(elements.get("workflow-badge").textContent, "In progress");
+
+    await poll();
+    assert.equal(elements.get("workflow-badge").textContent, "Unavailable");
+
+    await poll();
+    assert.equal(elements.get("workflow-badge").textContent, "In progress");
 });
