@@ -1,11 +1,13 @@
 import { createServer } from "node:http";
-import { createCanvas, CanvasError, joinSession } from "@github/copilot-sdk/extension";
+import path from "node:path";
+import { createCanvas, joinSession } from "@github/copilot-sdk/extension";
 import { loadAutodevState, locateAutodevDir } from "./autodev-data.mjs";
 import { renderHtml } from "./renderer.mjs";
 
 const servers = new Map();
 // Plugin extensions execute from their installed location, but inherit the consumer workspace cwd.
 const autodevAnchors = [process.cwd()];
+const pendingAutodevDir = path.join(process.cwd(), ".autodev");
 let autodevDir = null;
 let autodevDiscovery = null;
 
@@ -29,14 +31,7 @@ async function resolveAutodevDir() {
 
 async function getState() {
     const directory = await resolveAutodevDir();
-    if (!directory) {
-        throw new CanvasError(
-            "autodev_data_missing",
-            "Could not find a .autodev directory in this workspace.",
-        );
-    }
-
-    return loadAutodevState(directory);
+    return loadAutodevState(directory ?? pendingAutodevDir);
 }
 
 function writeJson(res, statusCode, body) {
@@ -167,7 +162,7 @@ const session = await joinSession({
 
                 return {
                     title: "Autodev workflow",
-                    status: directory ? "Live workspace state" : "No .autodev data found",
+                    status: directory ? "Live workspace state" : "Waiting for Autodev data",
                     url: entry.url,
                 };
             },
