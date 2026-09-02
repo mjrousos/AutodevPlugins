@@ -22,6 +22,11 @@ copilot --agent autodev-plan:autodev-plan
 > Agents contributed by a plugin are namespaced `<plugin>:<agent>`, so the entry point is
 > `autodev-plan:autodev-plan`. The bare name is not accepted.
 
+The plugin also contributes the `autodev-workflow` canvas. Open it during or after a run for a
+live view of plan gates, implementation milestones, review loops, audit details, and reviewer
+feedback. It reads `.autodev/` from the repository where Copilot CLI is running and begins showing
+data if that directory is created after the extension starts.
+
 ## Workflow
 
 | Step | Phase | Human involved? |
@@ -403,14 +408,19 @@ plugins/autodev-plan/
 │   ├── autodev-architecture-review.agent.md
 │   ├── autodev-security-review.agent.md
 │   └── autodev-privacy-review.agent.md
+├── extensions/autodev-workflow/
+│   ├── extension.mjs                  # Canvas registration and loopback server
+│   ├── autodev-data.mjs               # .autodev discovery and state projection
+│   └── renderer.mjs                   # Self-contained canvas UI
 ├── hooks/scripts/
 │   ├── autodev-gates.ps1             # Gate tracker (Windows)
 │   ├── autodev-gates.sh              # Gate tracker (Linux/macOS, needs jq)
 │   ├── autodev-otel.ps1              # OTLP span emitter (Windows) - canonical copy
 │   └── autodev-otel.sh               # OTLP span emitter (Linux/macOS) - canonical copy
 └── tests/
+    ├── workflow-canvas.tests.mjs      # Canvas packaging and state tests
     ├── gates.tests.ps1               # Gate tracker tests (Windows)
-    └── gates.tests.sh                # Gate tracker tests (Linux/macOS)
+    └── gates.tests.sh                 # Gate tracker tests (Linux/macOS)
 ```
 
 Both trackers implement the same state machine and are dispatched by event name. They are written
@@ -430,6 +440,9 @@ temporary working directory (and an isolated `COPILOT_HOME`), so running them ne
 session state.
 
 ```
+# Canvas state and packaging (Node 22+)
+node --test plugins/autodev-plan/tests/workflow-canvas.tests.mjs
+
 # Windows
 powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-plan/tests/gates.tests.ps1
 
