@@ -197,6 +197,130 @@ test("empty workflow state omits local paths and has no source timestamp", async
 
         assert.equal(state.sourceUpdatedAt, null);
         assert.equal(Object.hasOwn(state, "sourceDir"), false);
+        assert.equal(state.workflow.status, "pending");
+        assert.equal(state.workflow.label, "Workflow pending");
+    });
+});
+
+test("lowercase running gate verdicts are projected as active", async () => {
+    await withTemporaryDirectory(async (root) => {
+        const autodevDir = path.join(root, ".autodev");
+        await mkdir(autodevDir);
+        await Promise.all([
+            writeFile(
+                path.join(autodevDir, "gate-status.json"),
+                JSON.stringify({
+                    sessionId: "test-session",
+                    architectureVerdict: "running",
+                }),
+            ),
+            writeFile(
+                path.join(autodevDir, "implement-status.json"),
+                JSON.stringify({
+                    sessionId: "test-session",
+                    securityVerdict: "running",
+                }),
+            ),
+        ]);
+
+        const state = await loadAutodevState(autodevDir);
+
+        assert.equal(state.plan.gates[0].status, "active");
+        assert.equal(state.plan.gates[0].verdict, "RUNNING");
+        assert.equal(state.implementation.gates[0].status, "active");
+        assert.equal(state.implementation.gates[0].verdict, "RUNNING");
+        assert.equal(state.workflow.status, "active");
+    });
+});
+
+test("blocked implementation status requires intervention without audit events", async () => {
+    await withTemporaryDirectory(async (root) => {
+        const autodevDir = path.join(root, ".autodev");
+        await mkdir(autodevDir);
+        await writeFile(
+            path.join(autodevDir, "implement-status.json"),
+            JSON.stringify({
+                sessionId: "test-session",
+                milestoneCount: 1,
+                currentMilestone: 1,
+                taskingVerdict: "DONE",
+                implementVerdict: "BLOCKED",
+            }),
+        );
+
+        const state = await loadAutodevState(autodevDir);
+
+        assert.equal(state.implementation.milestones[0].status, "issues");
+    });
+});
+
+test("milestone state uses the latest audit session", async () => {
+    await withTemporaryDirectory(async (root) => {
+        const autodevDir = path.join(root, ".autodev");
+        await mkdir(autodevDir);
+        await Promise.all([
+            writeFile(
+                path.join(autodevDir, "implement-status.json"),
+                JSON.stringify({
+                    sessionId: "new-session",
+                    milestoneCount: 1,
+                    currentMilestone: 1,
+                    taskingVerdict: "DONE",
+                    implementVerdict: "DONE",
+                }),
+            ),
+            writeFile(
+                path.join(autodevDir, "implement-gate-audit.md"),
+                [
+                    "Session: `old-session`",
+                    "",
+                    "| Time (UTC) | Stage | Milestone | Attempt | Event | Verdict |",
+                    "|---|---|---:|---:|---|---|",
+                    "| 2026-09-01 12:00:00 | implementation | 1 | 1 | invoked | - |",
+                    "| 2026-09-01 12:01:00 | implementation | 1 | 1 | completed | DONE |",
+                    "",
+                    "---",
+                    "",
+                    "Session: `new-session`",
+                    "",
+                    "| Time (UTC) | Stage | Milestone | Attempt | Event | Verdict |",
+                    "|---|---|---:|---:|---|---|",
+                    "| 2026-09-02 12:00:00 | code-fix | 1 | 1 | invoked | - |",
+                    "| 2026-09-02 12:01:00 | code-fix | 1 | 1 | completed | BLOCKED |",
+                ].join("\n"),
+            ),
+            writeFile(
+                path.join(autodevDir, "implement-feedback-log.md"),
+                [
+                    "Session: `old-session`",
+                    "",
+                    "# code-fix (milestone 1) - attempt 1 - BLOCKED",
+                    "",
+                    "## Summary",
+                    "Old session feedback.",
+                    "",
+                    "---",
+                    "",
+                    "Session: `new-session`",
+                    "",
+                    "# code-fix (milestone 1) - attempt 1 - BLOCKED",
+                    "",
+                    "## Summary",
+                    "Current session feedback.",
+                    "",
+                    "## Notes",
+                    "Session: reviewed 3 artifacts",
+                ].join("\n"),
+            ),
+        ]);
+
+        const state = await loadAutodevState(autodevDir);
+
+        assert.equal(state.implementation.events.length, 2);
+        assert.equal(state.implementation.events[0].stage, "code-fix");
+        assert.equal(state.implementation.feedback.length, 1);
+        assert.equal(state.implementation.feedback[0].summary, "Current session feedback.");
+        assert.equal(state.implementation.milestones[0].status, "issues");
     });
 });
 

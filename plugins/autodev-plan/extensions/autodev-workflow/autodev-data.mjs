@@ -83,9 +83,14 @@ function parseTable(text, requiredHeading) {
     }
 
     const lines = text.split(/\r?\n/);
-    const headerIndex = lines.findIndex(
-        (line) => line.startsWith("|") && line.toLowerCase().includes(requiredHeading),
-    );
+    let headerIndex = -1;
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index];
+        if (line.startsWith("|") && line.toLowerCase().includes(requiredHeading)) {
+            headerIndex = index;
+            break;
+        }
+    }
     if (headerIndex < 0) {
         return [];
     }
@@ -146,15 +151,24 @@ function cleanSummary(value) {
         .slice(0, 900);
 }
 
+function latestSessionSection(text) {
+    const sessions = [...text.matchAll(/^Session: `[^`\r\n]+`\s*$/gm)];
+    return sessions.length > 0 ? text.slice(sessions.at(-1).index) : text;
+}
+
 function parseFeedback(text, process) {
     if (!text) {
         return [];
     }
 
+    const sessionText = latestSessionSection(text);
     const headerPattern = /^# (.+?) - attempt (\d+) - ([A-Z]+)\s*$/gm;
-    const matches = [...text.matchAll(headerPattern)];
+    const matches = [...sessionText.matchAll(headerPattern)];
     return matches.map((match, index) => {
-        const body = text.slice(match.index, matches[index + 1]?.index ?? text.length);
+        const body = sessionText.slice(
+            match.index,
+            matches[index + 1]?.index ?? sessionText.length,
+        );
         const descriptor = match[1];
         const milestoneMatch = descriptor.match(/^(.+?) \(milestone (\d+)\)$/);
         const stage = milestoneMatch?.[1] ?? descriptor;
@@ -270,9 +284,14 @@ function groupAttempts(events, feedback, stage, milestone = null) {
     });
 }
 
+function normalizeVerdict(verdict, fallback = "PENDING") {
+    const normalized = String(verdict ?? "").trim().toUpperCase();
+    return normalized || fallback;
+}
+
 function gateStatus(attempts, statusVerdict) {
     const latest = attempts.at(-1);
-    const verdict = latest?.verdict ?? statusVerdict ?? "PENDING";
+    const verdict = normalizeVerdict(latest?.verdict ?? statusVerdict);
     if (verdict === "PASS" || verdict === "DONE") {
         return "complete";
     }
@@ -282,18 +301,21 @@ function gateStatus(attempts, statusVerdict) {
     if (verdict === "ISSUES") {
         return "issues";
     }
+    if (verdict === "BLOCKED") {
+        return "issues";
+    }
     return "pending";
 }
 
 function buildPlan(events, feedback, status) {
     const gates = PLAN_GATES.map(({ key, label }) => {
         const attempts = groupAttempts(events, feedback, key);
-        const statusVerdict = status[`${key}Verdict`];
+        const verdict = normalizeVerdict(attempts.at(-1)?.verdict ?? status[`${key}Verdict`]);
         return {
             key,
             label,
-            status: gateStatus(attempts, statusVerdict),
-            verdict: attempts.at(-1)?.verdict ?? statusVerdict ?? "PENDING",
+            status: gateStatus(attempts, verdict),
+            verdict,
             attempts,
             issueLoops: attempts.filter((attempt) => attempt.verdict === "ISSUES").length,
         };
@@ -302,7 +324,8 @@ function buildPlan(events, feedback, status) {
     const allPassed = gates.every((gate) => gate.status === "complete");
     const activeGate = gates.find((gate) => gate.status === "active");
     const issueGate = [...gates].reverse().find((gate) => gate.status === "issues");
-    const hasStarted = events.length > 0;
+    const hasStarted =
+        events.length > 0 || gates.some((gate) => gate.status !== "pending");
     const currentPhase = allPassed
         ? "Complete"
         : activeGate
@@ -378,10 +401,25 @@ function buildImplementation(events, feedback, status, milestoneData) {
                   ? "passed"
                   : null);
         const closed = closure !== null;
+        const isCurrentMilestone = number === Number(status.currentMilestone);
+        const statusImplementVerdict = isCurrentMilestone
+            ? normalizeVerdict(status.implementVerdict, "")
+            : "";
+        const statusReviewVerdict = isCurrentMilestone
+            ? normalizeVerdict(status.reviewVerdict, "")
+            : "";
         const running = [...implementationAttempts, ...reviewAttempts, ...fixAttempts].some(
-            (attempt) => attempt.verdict === "RUNNING",
-        );
-        const hasIssues = reviewAttempts.at(-1)?.verdict === "ISSUES";
+            (attempt) => normalizeVerdict(attempt.verdict) === "RUNNING",
+        ) || statusImplementVerdict === "RUNNING" || statusReviewVerdict === "RUNNING";
+        const hasIssues =
+            normalizeVerdict(reviewAttempts.at(-1)?.verdict, "") === "ISSUES" ||
+            statusReviewVerdict === "ISSUES";
+        const blockedWorker = [implementationAttempts.at(-1), fixAttempts.at(-1)].some(
+            (attempt) => normalizeVerdict(attempt?.verdict, "") === "BLOCKED",
+        ) || statusImplementVerdict === "BLOCKED";
+        const implementationStarted =
+            implementationAttempts.length > 0 ||
+            ["RUNNING", "DONE", "BLOCKED"].includes(statusImplementVerdict);
 
         return {
             number,
@@ -392,9 +430,9 @@ function buildImplementation(events, feedback, status, milestoneData) {
                   ? "complete"
                 : running
                   ? "active"
-                  : hasIssues
+                  : hasIssues || blockedWorker
                     ? "issues"
-                    : implementationAttempts.length > 0
+                    : implementationStarted
                       ? "active"
                       : "pending",
             completedTasks: declared?.completedTasks ?? 0,
@@ -410,11 +448,12 @@ function buildImplementation(events, feedback, status, milestoneData) {
     const gates = IMPLEMENT_GATES.map(({ key, label }) => {
         const attempts = groupAttempts(events, feedback, key);
         const statusKey = key === "code-security-review" ? "securityVerdict" : "privacyVerdict";
+        const verdict = normalizeVerdict(attempts.at(-1)?.verdict ?? status[statusKey]);
         return {
             key,
             label,
-            status: gateStatus(attempts, status[statusKey]),
-            verdict: attempts.at(-1)?.verdict ?? status[statusKey] ?? "PENDING",
+            status: gateStatus(attempts, verdict),
+            verdict,
             attempts,
             issueLoops: attempts.filter((attempt) => attempt.verdict === "ISSUES").length,
         };
@@ -422,14 +461,23 @@ function buildImplementation(events, feedback, status, milestoneData) {
 
     const taskingAttempts = groupAttempts(events, feedback, "tasking");
     const taskingComplete =
-        taskingAttempts.at(-1)?.verdict === "DONE" || status.taskingVerdict === "DONE";
+        normalizeVerdict(taskingAttempts.at(-1)?.verdict, "") === "DONE" ||
+        normalizeVerdict(status.taskingVerdict, "") === "DONE";
     const completedMilestones = milestones.filter((milestone) =>
         ["complete", "capped"].includes(milestone.status),
     ).length;
     const userReviewReached =
         Number(status.userReviewReached) > 0 ||
         events.some((event) => event.stage === "user-review");
-    const gatesStarted = gates.some((gate) => gate.attempts.length > 0);
+    const statusHasStarted = [
+        "taskingVerdict",
+        "implementVerdict",
+        "reviewVerdict",
+        "securityVerdict",
+        "privacyVerdict",
+    ].some((key) => normalizeVerdict(status[key]) !== "PENDING");
+    const hasStarted = events.length > 0 || statusHasStarted;
+    const gatesStarted = gates.some((gate) => gate.status !== "pending");
     const allGatesPassed = gates.every((gate) => gate.status === "complete");
     const allComplete =
         taskingComplete &&
@@ -458,17 +506,17 @@ function buildImplementation(events, feedback, status, milestoneData) {
             currentPhase = `Milestone ${activeMilestone.number}`;
         } else if (taskingComplete) {
             currentPhase = "Implementation";
-        } else if (events.length > 0) {
+        } else if (hasStarted) {
             currentPhase = "Tasking";
         }
     }
 
     const phases = [
-        { key: "intake", label: "Intake", status: events.length > 0 ? "complete" : "active" },
+        { key: "intake", label: "Intake", status: hasStarted ? "complete" : "active" },
         {
             key: "tasking",
             label: "Tasking",
-            status: taskingComplete ? "complete" : events.length > 0 ? "active" : "pending",
+            status: taskingComplete ? "complete" : hasStarted ? "active" : "pending",
         },
         {
             key: "milestones",
@@ -495,7 +543,7 @@ function buildImplementation(events, feedback, status, milestoneData) {
     ];
 
     return {
-        status: allComplete ? "complete" : events.length > 0 ? "active" : "pending",
+        status: allComplete ? "complete" : hasStarted ? "active" : "pending",
         currentPhase,
         sessionId: status.sessionId ?? null,
         startedAt: events[0]?.time ?? null,
@@ -565,6 +613,11 @@ export async function loadAutodevState(autodevDir) {
     const completed = completedPhaseCount(allPhases);
     const total = allPhases.length;
     const workflowComplete = plan.status === "complete" && implementation.status === "complete";
+    const workflowStatus = workflowComplete
+        ? "complete"
+        : plan.status === "pending" && implementation.status === "pending"
+          ? "pending"
+          : "active";
     const fileMetadata = await Promise.all(
         Object.entries(files).map(async ([name, filePath]) => {
             try {
@@ -584,8 +637,12 @@ export async function loadAutodevState(autodevDir) {
             .map((file) => `${file.name}:${file.modifiedAt}:${file.size}`)
             .join("|"),
         workflow: {
-            status: workflowComplete ? "complete" : "active",
-            label: workflowComplete ? "Workflow complete" : "Workflow in progress",
+            status: workflowStatus,
+            label: workflowStatus === "complete"
+                ? "Workflow complete"
+                : workflowStatus === "active"
+                  ? "Workflow in progress"
+                  : "Workflow pending",
             percent: total > 0 ? Math.round((completed / total) * 100) : 0,
             completedPhases: completed,
             totalPhases: total,
