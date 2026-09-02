@@ -257,17 +257,22 @@ test("canvas displays audit log paths with cross-platform separators", async () 
         { ok: true, json: async () => createWorkflowState() },
     ]);
     await new Promise((resolve) => setImmediate(resolve));
+    const content = canvas.elements.get("content");
 
-    canvas.elements.get("content").dispatch("click", {
+    assert.doesNotThrow(() => content.dispatch("click", { target: {} }));
+
+    const auditLink = {
+        dataset: { audit: "plan" },
+    };
+    auditLink.closest = (selector) => selector === "[data-audit]" ? auditLink : null;
+    content.dispatch("click", {
         target: {
-            closest: (selector) => selector === "[data-audit]"
-                ? { dataset: { audit: "plan" } }
-                : null,
+            parentElement: auditLink,
         },
     });
 
     assert.equal(
-        canvas.elements.get("content").querySelector(".source-path").textContent,
+        content.querySelector(".source-path").textContent,
         ".autodev/gate-audit.md",
     );
 });

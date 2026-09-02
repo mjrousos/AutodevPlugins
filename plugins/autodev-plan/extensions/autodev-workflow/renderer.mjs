@@ -930,7 +930,13 @@ export function renderHtml({ instanceId, initialView }) {
       render();
     }));
     content.addEventListener("click", (event) => {
-      const auditLink = event.target.closest("[data-audit]");
+      const target = typeof event.target?.closest === "function"
+        ? event.target
+        : event.target?.parentElement;
+      const closest = typeof target?.closest === "function"
+        ? target.closest.bind(target)
+        : () => null;
+      const auditLink = closest("[data-audit]");
       if (auditLink) {
         state.auditKind = auditLink.dataset.audit;
         state.view = "audit";
@@ -939,7 +945,7 @@ export function renderHtml({ instanceId, initialView }) {
         return;
       }
 
-      if (event.target.closest("[data-back-overview]")) {
+      if (closest("[data-back-overview]")) {
         state.auditKind = null;
         state.view = "overview";
         render();
