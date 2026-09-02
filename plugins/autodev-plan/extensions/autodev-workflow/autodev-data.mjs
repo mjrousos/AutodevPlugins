@@ -586,15 +586,6 @@ export async function loadAutodevState(autodevDir) {
         todosText,
     ] = await Promise.all(Object.values(files).map((filePath) => readOptional(filePath)));
 
-    for (const [key, value] of Object.entries({
-        "gate-audit.md": planAuditText,
-        "implement-gate-audit.md": implementAuditText,
-    })) {
-        if (!value) {
-            warnings.push(`${key} was not found.`);
-        }
-    }
-
     const planEvents = parsePlanEvents(planAuditText);
     const implementEvents = parseImplementEvents(implementAuditText);
     const plan = buildPlan(

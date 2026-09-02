@@ -173,6 +173,7 @@ test("autodev-plan packages the workflow canvas as a normal extension", async ()
     await access(new URL("../extensions/autodev-workflow/renderer.mjs", import.meta.url));
     assert.match(entrypoint, /const autodevAnchors = \[process\.cwd\(\)\];/);
     assert.doesNotMatch(entrypoint, /new URL\("\.", import\.meta\.url\)/);
+    assert.doesNotMatch(entrypoint, /autodev_data_missing|CanvasError/);
 });
 
 test("autodev discovery retries after the workspace data appears", async () => {
@@ -188,10 +189,9 @@ test("autodev discovery retries after the workspace data appears", async () => {
     });
 });
 
-test("empty workflow state omits local paths and has no source timestamp", async () => {
+test("a missing .autodev directory produces pending empty state without warnings", async () => {
     await withTemporaryDirectory(async (root) => {
         const autodevDir = path.join(root, ".autodev");
-        await mkdir(autodevDir);
 
         const state = await loadAutodevState(autodevDir);
 
@@ -199,6 +199,30 @@ test("empty workflow state omits local paths and has no source timestamp", async
         assert.equal(Object.hasOwn(state, "sourceDir"), false);
         assert.equal(state.workflow.status, "pending");
         assert.equal(state.workflow.label, "Workflow pending");
+        assert.equal(state.implementation.completedMilestones, 0);
+        assert.equal(state.implementation.milestoneCount, 0);
+        assert.deepEqual(state.warnings, []);
+    });
+});
+
+test("not-yet-created phase files do not produce warnings", async () => {
+    await withTemporaryDirectory(async (root) => {
+        const autodevDir = path.join(root, ".autodev");
+        await mkdir(autodevDir);
+        await writeFile(
+            path.join(autodevDir, "gate-status.json"),
+            JSON.stringify({
+                sessionId: "planning-session",
+                architectureVerdict: "running",
+            }),
+        );
+
+        const state = await loadAutodevState(autodevDir);
+
+        assert.equal(state.plan.status, "active");
+        assert.equal(state.implementation.status, "pending");
+        assert.equal(state.implementation.milestoneCount, 0);
+        assert.deepEqual(state.warnings, []);
     });
 });
 
