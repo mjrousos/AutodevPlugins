@@ -20,7 +20,7 @@
     Written for Windows PowerShell 5.1: no -AsHashtable, no ternaries, no three-argument
     Join-Path.
 
-    Compared with the production emitter in plugins/autodev-plan/hooks/scripts/autodev-otel.ps1,
+    Compared with the production emitter in plugins/autodev/hooks/scripts/autodev-otel.ps1,
     this sample deliberately does the HTTP call in the hook process instead of in an isolated,
     kill-bounded child process. See "What this sample omits" in README.md.
 #>

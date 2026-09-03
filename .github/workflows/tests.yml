@@ -6,27 +6,30 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   gates-powershell:
-    name: Gate tracker (Windows PowerShell)
+    name: Autodev gates (Windows PowerShell)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Run gate tracker tests
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-plan/tests/gates.tests.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/gates.tests.ps1
 
   stages-powershell:
-    name: Stage tracker (Windows PowerShell)
+    name: Autodev stages (Windows PowerShell)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Run stage tracker tests
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-implement/tests/stages.tests.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/stages.tests.ps1
 
   gates-bash:
-    name: Gate tracker (bash)
+    name: Autodev gates (bash)
     strategy:
       fail-fast: false
       matrix:
@@ -40,10 +43,10 @@ jobs:
             if [ "$RUNNER_OS" = "macOS" ]; then brew install jq; else sudo apt-get update && sudo apt-get install -y jq; fi
           fi
       - name: Run gate tracker tests
-        run: bash plugins/autodev-plan/tests/gates.tests.sh
+        run: bash plugins/autodev/tests/gates.tests.sh
 
   stages-bash:
-    name: Stage tracker (bash)
+    name: Autodev stages (bash)
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +60,7 @@ jobs:
             if [ "$RUNNER_OS" = "macOS" ]; then brew install jq; else sudo apt-get update && sudo apt-get install -y jq; fi
           fi
       - name: Run stage tracker tests
-        run: bash plugins/autodev-implement/tests/stages.tests.sh
+        run: bash plugins/autodev/tests/stages.tests.sh
 
   factory-tests:
     name: Autodev factory (Node)
@@ -75,7 +78,7 @@ jobs:
         # The SDK is injected by the CLI into the extension host, so it cannot be installed here.
         # register-stub.mjs resolves it to a local stub; the factory guards its joinSession call
         # behind AUTODEV_FACTORY_TEST so importing the module does not try to talk to a CLI.
-        run: node --import ./plugins/autodev/tests/register-stub.mjs --test plugins/autodev/tests/factory.tests.mjs
+        run: node --import ./plugins/autodev-factory/tests/register-stub.mjs --test plugins/autodev-factory/tests/factory.tests.mjs
 
   workflow-canvas-tests:
     name: Autodev workflow canvas (Node)
@@ -86,7 +89,7 @@ jobs:
         with:
           node-version: "22"
       - name: Run workflow canvas unit tests
-        run: node --test plugins/autodev-plan/tests/workflow-canvas.tests.mjs
+        run: node --test plugins/autodev/tests/workflow-canvas.tests.mjs
 
   manifests:
     name: Manifests and line endings
@@ -105,6 +108,13 @@ jobs:
             fi
           done < <(find . -name '*.json' -not -path './.git/*')
           exit $status
+      - name: Plugin layout must contain exactly two plugins
+        run: |
+          expected="autodev autodev-factory"
+          actual="$(find plugins -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+          if [ "$actual" != "$expected" ]; then
+            echo "FAIL expected plugin dirs: $expected"; echo "     actual: $actual"; exit 1
+          fi
       - name: Shell hooks must use LF endings
         run: |
           # A CRLF shebang line makes the hook unrunnable on Linux and macOS.
@@ -113,11 +123,11 @@ jobs:
             if grep -qU $'\r' "$f"; then echo "FAIL $f contains CR"; status=1; else echo "ok   $f"; fi
           done < <(find . -name '*.sh' -not -path './.git/*')
           exit $status
-      - name: Telemetry emitter copies must not drift
+      - name: Telemetry emitter canonical files must exist
         run: |
-          # The emitter is shipped inside each plugin because plugins install as independent
-          # directories. autodev-plan holds the canonical copy; this fails if another plugin's
-          # copy was edited directly instead of the canonical one.
+          # The consolidated layout has one canonical emitter copy in autodev. The sync script
+          # is kept so additional plugin copies can be added safely in the future; for now this
+          # verifies the canonical files are present and readable.
           bash scripts/sync-otel-emitter.sh --check
       - name: Autodev factory prompt bundle must not drift
         run: |
