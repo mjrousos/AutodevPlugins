@@ -27,10 +27,10 @@ This repository is a plugin marketplace. Add it and then install the plugin you 
 /plugin install autodev@autodev-plugins
 ```
 
-### Upgrading from the previous layout
+### Upgrading existing installations
 
-Before installing `autodev`, uninstall the former plugins so their hooks cannot also capture the
-new agents:
+Before installing `autodev`, uninstall the legacy plugin IDs so their hooks cannot also capture
+the current agents:
 
 ```
 /plugin uninstall autodev-plan@autodev-plugins

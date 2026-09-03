@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Gate tracker for the merged autodev plugin (Linux / macOS).
+# Gate tracker for the autodev plugin (Linux / macOS).
 #
 # Invoked by hooks.json for four hook events. Reads the hook payload as JSON on stdin and
 # writes exactly one JSON object to stdout.

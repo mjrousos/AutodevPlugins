@@ -22,9 +22,9 @@ this single plugin.
 /plugin install autodev@autodev-plugins
 ```
 
-When upgrading from separate plugins, uninstall `autodev-plan`, `autodev-implement`, and
-`autodev-docs` first. Their old hooks remain active if the plugins stay installed and can process
-the merged plugin's agent events:
+When upgrading an existing installation, uninstall the legacy `autodev-plan`,
+`autodev-implement`, and `autodev-docs` plugin IDs first. Their hooks remain active if the plugins
+stay installed and can process the `autodev` plugin's agent events:
 
 ```
 /plugin uninstall autodev-plan@autodev-plugins

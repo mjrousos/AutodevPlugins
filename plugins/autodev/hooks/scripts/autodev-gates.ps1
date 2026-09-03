@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Gate tracker for the merged autodev plugin (Windows / PowerShell).
+    Gate tracker for the autodev plugin (Windows / PowerShell).
 
 .DESCRIPTION
     Invoked by hooks.json for four hook events. Reads the hook payload as JSON on stdin and

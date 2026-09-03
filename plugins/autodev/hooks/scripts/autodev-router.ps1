@@ -1,10 +1,9 @@
 <#
 .SYNOPSIS
-    Hook router for the merged autodev plugin (Windows / PowerShell).
+    Hook router for the autodev plugin (Windows / PowerShell).
 
 .DESCRIPTION
-    The plugin ships two independent enforcement trackers that used to live in two separate
-    plugins:
+    The plugin ships two independent enforcement trackers:
 
         autodev-gates.ps1   - the planning review-gate state machine (architecture, security,
                               privacy).

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Hook router for the merged autodev plugin (Linux / macOS).
+# Hook router for the autodev plugin (Linux / macOS).
 #
-# The plugin ships two independent enforcement trackers that used to live in two separate plugins:
+# The plugin ships two independent enforcement trackers:
 #
 #   autodev-gates.sh   - the planning review-gate state machine (architecture, security, privacy).
 #   autodev-stages.sh  - the implementation stage state machine (tasking, milestones, reviews).
