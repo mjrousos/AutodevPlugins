@@ -11,27 +11,15 @@
   "plugins": [
     {
       "name": "autodev",
-      "description": "Runs the full plan-then-implement software development loop as a single Agent Factory, pausing for your approval before the review gates, before implementation, and at the code checkpoint.",
-      "version": "0.1.0",
+      "description": "Plans and implements software changes through two orchestrated workflows: autodev-plan drafts a plan hardened by isolated architecture, security, and privacy review gates with a live workflow canvas, and autodev-implement builds it milestone by milestone, hardened by isolated code, security, and privacy review loops.",
+      "version": "0.5.0",
       "source": "./plugins/autodev"
     },
     {
-      "name": "autodev-plan",
-      "description": "Generates a development plan based on a project or feature description, hardened by isolated architecture, security, and privacy review gates, with a live workflow canvas.",
-      "version": "0.4.1",
-      "source": "./plugins/autodev-plan"
-    },
-    {
-      "name": "autodev-implement",
-      "description": "Implements a plan from Autodev-Plan milestone by milestone, hardened by isolated code, security, and privacy review loops.",
-      "version": "0.3.7",
-      "source": "./plugins/autodev-implement"
-    },
-    {
-      "name": "autodev-docs",
-      "description": "Generates documentation for your codebase or project.",
-      "version": "0.1.0",
-      "source": "./plugins/autodev-docs"
+      "name": "autodev-factory",
+      "description": "Runs the full plan-then-implement software development loop as a single Agent Factory, pausing for your approval before the review gates, before implementation, and at the code checkpoint.",
+      "version": "0.2.0",
+      "source": "./plugins/autodev-factory"
     }
   ]
 }
