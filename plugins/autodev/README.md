@@ -1,287 +1,685 @@
 # Autodev
 
-One [Agent Factory](https://github.com/github/copilot-cli) that runs the whole loop: it plans a
-feature the way `autodev-plan` does, stops and asks whether you are ready, and then implements it
-the way `autodev-implement` does — in a single run, with a single audit trail.
+Plans and implements software changes through two orchestrated workflows that ship together in one
+plugin:
 
-```
-INTAKE → CLARIFY → DRAFT → APPROVE → GATE:architecture → GATE:security → GATE:privacy
-                                                                              ↓
-                                                                      ┌── HANDOFF ──┐
-                                                                      │  "ready?"   │
-                                                                      └──────┬──────┘
-                                                                             ↓ yes
-   TASKING → [ IMPLEMENT → CODE-REVIEW ⇄ CODE-FIX ] per milestone → CHECKPOINT
-                                                                             ↓
-                                            SECURITY-REVIEW ⇄ CODE-FIX → PRIVACY-REVIEW ⇄ CODE-FIX
-                                                                             ↓
-                                                                          WRAPUP
-```
+- **`autodev-plan`** turns a rough feature request into an implementation plan that has survived
+  three independent expert reviews — architecture, security, and privacy — each run in an
+  **isolated sub-agent context** so its judgment is not contaminated by the reasoning that produced
+  the plan.
+- **`autodev-implement`** takes that plan and drives it to a complete, reviewed implementation:
+  broken into milestones, each implemented and code-reviewed in isolation until it passes, with a
+  code checkpoint for you and whole-implementation security and privacy reviews before the run ends.
 
-The reviewers and workers are the same ones the two plugins use — literally the same instructions,
-lifted from their canonical `.agent.md` files. What changes is who is in charge: the phase machine,
-the attempt caps, the verdict handling and the escalation paths are **code** here, not a document a
-model is asked to follow.
-
----
-
-## Why a factory rather than a third orchestrator agent
-
-The two existing plugins are built the only way they could be: a markdown orchestrator that drives
-the workflow, and a set of hooks that police it — refusing `ask_user` during autonomous phases,
-counting attempts, blocking an early stop, recording verdicts the orchestrator might otherwise
-misreport. That machinery exists because an agent following a document can wander off it.
-
-A factory cannot wander off. `run()` is JavaScript. The loop that re-invokes a reviewer until it
-returns `AUTODEV-VERDICT: PASS` is a `while` loop; the cap is an integer; the refusal to treat a
-missing verdict as a pass is an `if`. So the enforcement layer disappears into the orchestration,
-and what is left over — the evidence — is still written to `.autodev/`.
-
-Three things follow from that, and they are the honest trade-offs of this design:
-
-| | Plugins | Factory |
-| --- | --- | --- |
-| Gate enforcement | Hooks watch an agent that is asked to comply | The loop *is* the enforcement |
-| Reviewer isolation | A separate agent with `tools: ["read", "search"]` | A separate subagent with the same instructions, but the full tool set |
-| Interaction | The orchestrator talks to you throughout | Fixed checkpoints, as interactive forms |
-| Resumability | Re-run and re-do the work | Resume the run and replay the journal for free |
-
-The middle row is the one real regression. `ctx.agent()` has no way to restrict a subagent's tools,
-so the reviewers are told to stay read-only in their prompt and then **verified**: the plan's hash
-is compared before and after every plan gate, and before and after every code review the factory
-compares a snapshot of `git status --porcelain`, hashes of the staged and unstaged tracked diffs,
-a hash of every untracked file's contents, and hashes of the plan and todo list. The last three
-matter — porcelain alone reports only *which* paths are dirty, and a tracked diff ignores
-untracked files entirely, so a reviewer that edited a file the implementation stage had just
-created would show up in neither.
-
-A reviewer caught writing does not get to approve its own edit: the `PASS` is refused, the attempt
-is spent, and the reviewer is re-run. The same applies when the guard could not run at all —
-an unverifiable `PASS` is not a `PASS`. Both are recorded as process violations and reported at
-wrapup.
-
-### Why the instructions travel in the prompt
-
-`ctx.agent(prompt, options)` takes exactly `label`, `schema` and `model` — there is no
-`agent_type`, and a factory subagent's own `task` tool only offers the built-in agents. A factory
-therefore *cannot* delegate to `autodev-plan:autodev-architecture-review`, however much it would
-like to.
-
-So `scripts/sync-autodev-prompts.sh` lifts each agent's body out of its canonical `.agent.md`,
-along with the model its frontmatter declares, into `extensions/autodev/prompts.generated.mjs`.
-The factory sends the body as the subagent's instructions and the model as `options.model`. Edit
-the source agent, re-run the script; CI fails on drift. There is no second copy of a reviewer to
-keep in sync by hand.
-
----
+Both agents are the entry points you invoke directly. Their reviewers, workers, review-gate and
+implementation-stage enforcement, the OpenTelemetry emitter, and the workflow canvas all install as
+this single plugin.
 
 ## Installation
-
-The factory ships as a Copilot CLI **extension**, because an Agent Factory has to be registered
-from code. There are two ways to get it, and they trade off differently.
-
-**As a plugin** (`plugin.json` declares `"extensions": ["extensions/"]`, which the CLI honours —
-see the [plugin reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-plugin-reference)):
 
 ```
 /plugin marketplace add mjrousos/AutodevPlugins
 /plugin install autodev@autodev-plugins
 ```
 
-This is the right route for distributing to a team, and the only one that also works for Copilot
-cloud agent (via `enabledPlugins` in `.github/copilot/settings.json`). The catch: a
-plugin-contributed extension is resolved at CLI **startup**, so `/extensions` will not pick it up —
-you must restart the CLI after installing.
+When upgrading an existing installation, uninstall the legacy `autodev-plan`,
+`autodev-implement`, and `autodev-docs` plugin IDs first. Their hooks remain active if the plugins
+stay installed and can process the `autodev` plugin's agent events:
 
-**Directly**, which the CLI discovers in `<git root>/.github/extensions/` or your Copilot home
-(`~/.copilot/extensions/`). Slower to distribute, but it reloads live with `/extensions`, so it is
-the better development loop:
-
-```bash
-# For every repository you work in:
-plugins/autodev/install.sh
-
-# Or just this repository:
-plugins/autodev/install.sh --project
+```
+/plugin uninstall autodev-plan@autodev-plugins
+/plugin uninstall autodev-implement@autodev-plugins
+/plugin uninstall autodev-docs@autodev-plugins
 ```
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File plugins\autodev\install.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File plugins\autodev\install.ps1 -Scope Project
+## Usage
+
+Select the agent for the phase you are in and describe what you want. From the CLI:
+
+```
+copilot --agent autodev:autodev-plan        # plan a feature
+copilot --agent autodev:autodev-implement   # implement an existing plan
 ```
 
-Then run `/extensions` in the CLI (or restart it). `autodev` becomes available to `run_factory`.
-To remove it: `install.sh --uninstall` or `install.ps1 -Uninstall`.
+> Agents contributed by a plugin are namespaced `<plugin>:<agent>`, so the entry points are
+> `autodev:autodev-plan` and `autodev:autodev-implement`. The bare names are not accepted.
 
-You do not need `autodev-plan` or `autodev-implement` installed to use this — the instructions are
-baked into the extension.
+The plugin also contributes the `autodev-workflow` canvas. Open it during or after a run for a
+live view of plan gates, implementation milestones, review loops, audit details, and reviewer
+feedback. It reads `.autodev/` from the repository where Copilot CLI is running and begins showing
+data if that directory is created after the extension starts.
 
----
+## Planning workflow (`autodev-plan`)
 
-## Running it
+| Step | Phase | Human involved? |
+| --- | --- | --- |
+| 1 | **INTAKE** — establish the request and the plan file path | yes |
+| 2 | **CLARIFY** — orchestrator asks clarifying questions until it can write a real plan | yes |
+| 3 | **DRAFT** — plan written to disk | no |
+| 4 | **APPROVE** — you review, request changes, and give the go-ahead | yes |
+| 5 | **GATE: architecture** — loops until clean | **no** |
+| 6 | **GATE: security** — loops until clean | **no** |
+| 7 | **GATE: privacy** — loops until clean | **no** |
+| 8 | **WRAPUP** — reports plan path, tracker artifacts, and what the reviews changed | yes |
 
-Ask for it in the CLI:
+Steps 5–7 run sequentially and **fully autonomously**. Each reviewer returns a verdict; anything
+other than a pass sends the orchestrator back to revise the plan and re-invoke that same
+reviewer.
 
-> Run the autodev factory to build rate limiting for the public API.
+The plan is written to `./.autodev/plan.md` by default. The orchestrator offers to add
+`.autodev/` to your `.gitignore` and will not touch `.gitignore` without asking.
 
-Or invoke it directly with `run_factory`, name `autodev`:
+### Planning agents
+
+| Agent | Invocable by | Model | Tools | Role |
+| --- | --- | --- | --- | --- |
+| `autodev-plan` | user | GPT-5.6 Sol | all | Orchestrator and the only agent you talk to |
+| `autodev-architecture-review` | orchestrator only | GPT-5.6 Terra | read, search | Decomposition, coupling, failure modes, testability |
+| `autodev-security-review` | orchestrator only | GPT-5.6 Terra | read, search, web | Authn/authz, injection, secrets, supply chain, trust boundaries |
+| `autodev-privacy-review` | orchestrator only | GPT-5.6 Terra | read, search | Data inventory, minimization, retention, telemetry leakage |
+
+Each agent pins its own model via the `model` frontmatter key, so they run on the intended
+model regardless of the model selected for your session. Using a different model family for the
+reviewers than for the orchestrator is deliberate: a reviewer is more likely to catch what the
+author missed when it does not share the author's blind spots.
+
+The reviewers are `user-invocable: false`, so they stay out of your agent picker while remaining
+invocable by the orchestrator. They are prefixed `autodev-` because the CLI already ships
+built-in `security-review` and `code-review` agents that would otherwise collide.
+
+### Why the reviewers list `tools` and the orchestrator does not
+
+This asymmetry is deliberate and load-bearing, and it is easy to misread as an oversight when
+skimming the agent files.
+
+The `tools` frontmatter key is an **allowlist**: omit it and the agent gets every tool; specify
+it and the agent gets *only* what is listed. So on a reviewer, the interesting part of
+`tools: ["read", "search"]` is not what it grants — it is what it leaves out.
+
+The omissions that matter:
+
+- **`ask_user` and any other elicitation tool.** This is the primary reason the key is present
+  at all. Requirement: the review gates must complete with no human interaction. An agent that
+  cannot reach the user cannot stall waiting on one, cannot quietly turn a judgment call back
+  into a question, and cannot interrupt an otherwise unattended run. The `preToolUse` hook
+  denies `ask_user` during gating as well, but that hook is a *runtime* backstop; the allowlist
+  means the tool is never offered to the reviewer in the first place.
+- **`edit`, `create` and the write tools.** Reviewers report, the orchestrator fixes. A reviewer
+  that could edit the plan could quietly resolve its own findings, and the verdict would then
+  describe a document nobody agreed to.
+- **`task`.** A reviewer cannot spawn further sub-agents, so a gate cannot fan out into work the
+  tracker never sees.
+
+The orchestrator does the opposite and **omits `tools` entirely**, which grants everything. That
+is also intentional: it genuinely needs `ask_user` for the clarifying and wrap-up phases, and
+`ask_user` is not among the documented tool aliases, so naming an explicit allowlist risks
+silently dropping the one tool the workflow depends on most. Leaving the key off is the safer
+failure mode.
+
+The net effect is that each agent's tool surface encodes its role: reviewers *cannot* talk to
+the user or change the plan even if their prompt were ignored, while the orchestrator retains
+the full surface and is instead constrained at runtime by the hooks.
+
+## Implementation workflow (`autodev-implement`)
+
+Once a plan exists, `autodev-implement` takes it — normally one produced by `autodev-plan` — and
+drives it to a complete, reviewed implementation. The plan is broken into milestones, each
+milestone is implemented and then code-reviewed in an isolated context until it passes, and the
+finished implementation is put through security and privacy review before the run ends. **Nothing
+is deferred:** the run ends with the plan implemented, or it escalates to you and says so.
+
+```
+INTAKE → TASKING → ┌──────────────── for each milestone, in order ───────────────┐
+                   │  IMPLEMENT → [ CODE-REVIEW ⇄ CODE-FIX ] up to 10 rounds     │
+                   └────────────────────────────────────────────────────────────┘
+                                              ↓ (all milestones done)
+                                         USER-REVIEW  ⇄ CODE-FIX
+                                              ↓ (you say proceed)
+                                    SECURITY-REVIEW ⇄ CODE-FIX  up to 10 rounds
+                                              ↓
+                                    PRIVACY-REVIEW  ⇄ CODE-FIX  up to 10 rounds
+                                              ↓
+                                           WRAPUP
+```
+
+TASKING through the milestone loop runs without input from you. **USER-REVIEW is the one
+checkpoint where the run stops and waits** — you read the code and either approve it or say what
+needs to change, and anything you report is routed back through the fix agent. After you approve,
+the security and privacy reviews run autonomously.
+
+### Implementation agents
+
+| Agent | Model | Access | Role |
+| --- | --- | --- | --- |
+| `autodev-implement` | GPT-5.6 Sol | full | Orchestrator. Runs the phase machine, dispatches sub-agents, talks to you. |
+| `autodev-tasking` | GPT-5.6 Sol | read + write | Turns the plan into `.autodev/todos.md`, split into milestones sized at one to two weeks of human dev work each. |
+| `autodev-implementation` | GPT-5.6 Terra | full | Implements exactly one milestone, runs the project's build and tests, marks its tasks done. |
+| `autodev-code-review` | Claude Sonnet 5 | read-only | Reviews the milestone's changes against the plan. Required to report every finding in one pass. |
+| `autodev-code-fix` | GPT-5.6 Terra | full | Applies review findings. A finding it judges invalid is answered with a code comment explaining why the code is correct, not with a silent dismissal. |
+| `autodev-code-security-review` | GPT-5.6 Terra | read-only + web | Security review of the finished implementation. |
+| `autodev-code-privacy-review` | GPT-5.6 Terra | read-only | Privacy and data-protection review of the finished implementation. |
+
+Reviewers run in their own context and never see the reasoning that produced the code. Every
+sub-agent ends its response with a machine-readable verdict — `PASS`/`ISSUES` for reviewers,
+`DONE`/`BLOCKED` for the others. A missing or unreadable verdict never counts as a pass.
+
+## Enforcement
+
+Prompt instructions alone cannot guarantee that the gates and stages actually ran in isolation, so
+this plugin ships hooks that observe and enforce both workflows. The orchestrators cannot bypass
+them.
+
+The single `hooks.json` wires every hook event to a small **router**
+(`hooks/scripts/autodev-router.sh` and `.ps1`). The router dispatches each event to exactly one of
+two independent, separately-tested trackers and returns the empty result for anything that belongs
+to neither:
+
+- The **gate tracker** (`autodev-gates.sh`/`.ps1`) enforces the planning review gates.
+- The **stage tracker** (`autodev-stages.sh`/`.ps1`) enforces the implementation stages.
+
+Lifecycle and `task` events route by the sub-agent (or target agent) name — a review gate goes to
+the gate tracker, an implementation stage to the stage tracker. `agentStop` and `ask_user` route by
+the router's session-keyed marker under `<COPILOT_HOME>/autodev/routes/`, with the trackers'
+session-keyed state as a compatibility fallback. The gate tracker keeps its state under
+`<COPILOT_HOME>/autodev/gates/` and the stage tracker under `<COPILOT_HOME>/autodev/stages/`, so
+the two workflows never see each other's state machine. Workspace mirrors are left to the trackers
+for same-session recovery and are never used to choose a route.
+
+For the planning gates specifically, the tracker does the following:
+
+| Hook | What it does |
+| --- | --- |
+| `subagentStart` | Records that a gate was invoked and increments its attempt counter |
+| `subagentStop` | Parses the reviewer's verdict, records it, and appends a tracker footer to the response |
+| `agentStop` | **Blocks** the orchestrator from ending its turn while gates are outstanding |
+| `preToolUse` | **Denies** `ask_user` during gating, keeping steps 5–7 free of human interaction |
+
+Gating is **inferred, never declared**: it begins the first time a reviewer sub-agent starts, and
+ends when all three hold a pass. Sessions that never invoke either orchestrator are completely
+unaffected.
+
+### Cost when the workflow is not running
+
+Copilot CLI has no way to scope a hook to an agent: `subagentStart` can be filtered by agent name,
+but `agentStop` and `preToolUse` cannot, so once the plugin is installed they fire in **every**
+session — `agentStop` at the end of every turn — and each one costs a process. Both are no-ops
+until `subagentStart` has created state, so both answer that case on a fast path that is as close
+to free as the platform allows. On Windows that means the filesystem and nothing else: no
+`ConvertFrom-Json`, `Join-Path` or `Test-Path`, whose first use in a fresh PowerShell process
+costs more than the entire check. On Linux and macOS the script has already spent `jq` validating
+the payload and reading `sessionId`/`cwd` before it reaches this point, so what the fast path
+saves there is the several further `jq` invocations `read_state` would have made.
+
+The fast path only ever decides *"there is nothing to enforce"*. Anything it cannot settle with
+certainty — a session id that is not a plain JSON string, a `cwd` carrying an escape it does not
+decode — falls through to the fully parsed path, which remains the only implementation of the
+enforcement rules.
+
+### Verdict contract
+
+Every reviewer ends its response with:
+
+```
+AUTODEV-VERDICT: PASS
+```
+
+or `AUTODEV-VERDICT: ISSUES`. A **missing or unparseable verdict is recorded as `ISSUES`**, so a
+malfunctioning reviewer can never wave a plan through.
+
+### Loop bounds
+
+Three independent layers make an infinite loop impossible:
+
+1. **10 attempts per gate, per pass.** A gate re-run after a material change starts a fresh
+   budget rather than inheriting the previous pass's count.
+2. **40 total reviewer invocations per session**, which bounds re-gate cascades.
+3. **The CLI's own runaway guard** on forced continuations, which this plugin stays below.
+
+On hitting a limit the workflow **escalates**: blocking stops, `ask_user` is re-permitted, and
+the orchestrator brings you in with an explanation of why it is not converging.
+
+Escalation is enforced, not merely requested. Once a gate is out of attempts the `preToolUse`
+hook **denies any further `task` call to a reviewer agent**, so an orchestrator that ignores the
+instruction to stop still cannot start another review. Non-reviewer sub-agents stay available so
+it can still write up the escalation.
+
+### Watching a run: the `.autodev/` directory
+
+Everything the tracker records is mirrored next to the plan, in the same `.autodev/` directory,
+so you can follow a run while it happens and read the reviews afterwards:
+
+| File | What it holds |
+| --- | --- |
+| `.autodev/plan.md` | The plan itself, written by the orchestrator |
+| `.autodev/gate-status.json` | Per-gate attempt counts and verdicts, refreshed on every event |
+| `.autodev/gate-audit.md` | One row per reviewer lifecycle event |
+| `.autodev/feedback-log.md` | Every reviewer response, verbatim |
+
+`.autodev/` is gitignored (the orchestrator offers to add it on first use), so none of this ends
+up in version control.
+
+The state that normally enforces the gates lives at
+`<COPILOT_HOME>/autodev/gates/<sessionId>.json`, outside the workspace and keyed by session.
+That split is deliberate:
+
+- The orchestrator is allowed to edit files in the workspace while gating, so state it could
+  rewrite must not be the normal source of enforcement.
+- Two sessions running in the same repository keep independent attempt budgets, so they cannot
+  reset each other's counters and quietly disable every cap.
+
+`.autodev/gate-status.json` is both the live developer-facing view and a **disaster-recovery
+checkpoint**. The tracker reads it only when the authoritative file is missing or corrupt, and
+only when its `sessionId` exactly matches the current session. This prevents a lost
+`<COPILOT_HOME>` state directory from making the next reviewer look like a new session, resetting
+the audit/feedback logs, and re-running gates that already passed.
+
+The three tracker files are written **only** by hooks — the orchestrator does not write them and
+is instructed not to edit them. In particular, never edit `gate-status.json`: normal enforcement
+ignores it while the authoritative state exists, but it may be needed to recover the same
+session. If you run two autodev-plan sessions in one directory they will share these files (as
+they would share `plan.md`), so the logs interleave and the single recovery checkpoint belongs to
+whichever session wrote it last; the enforcement state behind them stays separate. Recovery,
+like the plan itself, assumes one active autodev-plan session per directory.
+
+#### `gate-status.json`
+
+Refreshed on every reviewer start and finish, so `cat`-ing it mid-run tells you exactly where a
+session is:
 
 ```json
 {
-  "request": "Add per-tenant rate limiting to the public API.",
-  "clarifyRounds": 3
+  "sessionId": "549a2b9c-e26b-4d38-8b8a-6ac7d0b012d4",
+  "architectureAttempts": 2, "architectureVerdict": "PASS",
+  "securityAttempts": 1,     "securityVerdict": "running",
+  "privacyAttempts": 0,      "privacyVerdict": "pending",
+  "totalInvocations": 3, "blocks": 0
 }
 ```
 
-### Arguments
+A verdict is `pending` (not yet run), `running` (in flight), `PASS`, or `ISSUES`.
 
-| Argument | Default | What it does |
-| --- | --- | --- |
-| `request` | *prompted for* | What to plan and implement. A paragraph is plenty — the clarifying round pulls out the rest. |
-| `repoRoot` | working directory | Absolute path to the repository. Resolved against `git rev-parse --show-toplevel`, and the default artifact paths move with it. |
-| `planPath` | `<repoRoot>/.autodev/plan.md` | Where the plan is written. Must be inside the repository — these paths reach write-capable subagents, and anything resolving outside falls back to the default. |
-| `todosPath` | `<repoRoot>/.autodev/todos.md` | Where the milestone todo list is written. Same rule as `planPath`. |
-| `startAt` | `"plan"` | `"implement"` skips planning entirely and works from the plan already on disk. |
-| `clarifyRounds` | `3` | How many rounds of clarifying questions to allow, 0–4. |
+#### `gate-audit.md`
 
-### Limits
-
-None are declared. Every loop bounds itself — 10 attempts per plan gate, a ceiling of 40 plan
-reviewer invocations, 10 rounds per code review, 3 tasking attempts — so the run terminates on its
-own. If you want a hard ceiling anyway, pass one per invocation:
-
-```json
-{ "name": "autodev", "args": { "request": "…" }, "limits": { "maxAiCredits": 400 } }
+```
+| Time (UTC)          | Gate         | Attempt | Event     | Verdict |
+| ------------------- | ------------ | ------- | --------- | ------- |
+| 2026-08-04 20:23:25 | architecture | 1       | invoked   | -       |
+| 2026-08-04 20:26:13 | architecture | 1       | completed | ISSUES  |
+| 2026-08-04 20:31:24 | architecture | 2       | invoked   | -       |
 ```
 
-A run that hits a declared limit stops with `factory_limit_reached` and keeps its journal. Resume it
-with a raised limit and the completed work replays for free — restarting from scratch pays for it
-twice. The stages that write a file — plan drafting and tasking — journal their own success, so a
-resumed run recognizes the artifact already on disk instead of re-drafting over a plan the gates
-have since amended.
+Every row is written by a hook observing a real sub-agent lifecycle event. If the gates did not
+genuinely run, the trail will show it.
 
+#### `feedback-log.md`
+
+The audit trail tells you *that* a gate objected; this tells you *what* it objected to. Each
+entry is the reviewer's full response, exactly as written. Entry headers are level 1, because
+reviewers use `##` and `###` for their own sections:
+
+```markdown
 ---
 
-## The three times it stops for you
+# architecture - attempt 1 - ISSUES
 
-Everything else is autonomous. Subagents have no `ask_user` tool at all, so an autonomous phase
-genuinely cannot interrupt you — the restriction that the plugins enforce with a hook is a property
-of the runtime here.
+_2026-08-04 20:26:13 UTC_
 
-**1. Plan approval.** The plan is drafted and summarized; the gates do not start until you say so.
-You can ask for changes first — they go to the plan reviser, and the plan is re-presented — for up
-to six rounds, after which you are asked once, plainly, whether to run the gates on the latest
-revision or stop. Running out of revision rounds is never treated as approval, and neither is
-asking for changes without describing any: that just re-presents the plan.
+## Summary
+...
 
-**2. The handoff.** All three gates have closed. You are told how each one went — including any
-that escalated rather than passed — and asked whether to implement. Three answers: implement now,
-stop with the plan, or stop so you can edit the plan yourself and re-run with
-`{"startAt": "implement"}`.
+### blocker Undo bypasses the server's move pipeline
+...
+```
 
-**3. The code checkpoint.** Every milestone is implemented and reviewed. You review the code. If you
-ask for changes they are routed to the fix agent verbatim — your words, not a paraphrase — and the
-checkpoint re-locks, because you should see the corrected code before the final security and
-privacy reviews run. As at plan approval, this runs for up to six rounds and then asks once whether
-to proceed; it never unlocks itself, and an empty change request re-presents the code rather than
-counting as sign-off.
+This exists because the orchestrator summarises reviewer findings as it goes, and a summary is
+lossy. When you want to audit a decision — or disagree with one — read this file.
 
-Plus escalations. When a gate or a final review exhausts its attempts, you are shown the findings
-that keep recurring and offered three options: retry with guidance the reviewer is missing, accept
-the risk, or stop. An escalated gate **never becomes a passed gate** — the audit trail keeps saying
-so, and wrapup says so too.
+`gate-audit.md` and `feedback-log.md` are **append-only across reviewers and planning sessions**.
+A new session adds a `Session: <id>` section and keeps every older row and reviewer response; the
+tracker never deletes or clears either Markdown file, including after wrap-up. This is deliberate
+human-review history, so archive or delete it manually only when you no longer need it.
 
-If the host has no interactive support, the checkpoints are skipped, the run stops at the handoff
-rather than implementing unasked, and every skip is recorded in the notes.
+`gate-status.json` is different: it remains the live/recovery state for the most recent session
+in that workspace and is overwritten as that session advances.
 
----
+### Escalation is enforced by refusing the tool call
 
-## What it writes
+Once a gate is out of attempts the `preToolUse` hook denies any further `task` call to a reviewer
+agent. That refusal is driven by the out-of-workspace state, so an orchestrator cannot lift it by
+editing `.autodev/`. Non-reviewer sub-agents stay available so it can still write up the
+escalation.
 
-Everything lands in `.autodev/` next to the plan. If that directory is not git-ignored you are
-asked, once, whether to ignore it — nothing is written to `.gitignore` without your answer.
+## OpenTelemetry
 
-| File | Contents |
+When a run is being observed with OpenTelemetry, each `subagentStop` also emits one span
+describing the gate that just finished, so `ISSUES` verdicts can be counted across sessions
+instead of only being readable in `.autodev/`.
+
+### Enabling it
+
+Hook telemetry is configured with `AUTODEV_OTEL_*` variables, **not** Copilot's own `OTEL_*`
+ones. Copilot CLI scrubs its telemetry configuration out of the environment it hands to command
+hooks: measured against CLI 1.0.81, a hook process sees no variable whose name begins with
+`OTEL_` or `COPILOT_OTEL_`, while everything else — including `AUTODEV_OTEL_*` — is inherited
+normally. Setting only Copilot's variables enables Copilot's exporter but leaves the hook blind,
+so it emits nothing.
+
+The minimum needed is one variable:
+
+```sh
+export AUTODEV_OTEL_ENABLED=1     # posts to http://localhost:4318/v1/traces
+```
+
+| Variable | Purpose |
 | --- | --- |
-| `plan.md` | The plan, as amended by the gates. |
-| `todos.md` | The milestone decomposition, maintained by the workers. |
-| `factory-audit.md` | One row per subagent invocation: phase, stage, attempt, model, verdict, response size, notes. |
-| `factory-feedback.md` | Every subagent response, verbatim. This is where a reviewer's actual findings live. |
-| `factory-status.json` | A live mirror of the run's state, rewritten after every stage. |
-| `factory-summary.md` | The wrapup: gate outcomes, milestones, unresolved findings, process violations, accounting. |
+| `AUTODEV_OTEL_ENABLED` | Truthy (`1`, `true`, `yes`, `on`) turns hook telemetry on. A falsy **value** (`0`, `false`, `no`, `off`) is an explicit **off** that outranks every other signal. Unset — or set to nothing but whitespace — falls through to the rules below. |
+| `AUTODEV_OTEL_ENDPOINT` | Base endpoint; `/v1/traces` is appended. Setting it is itself an opt-in, so it enables telemetry on its own. Defaults to `http://localhost:4318`, matching Copilot's own implicit default. |
+| `AUTODEV_OTEL_TRACES_ENDPOINT` | Used verbatim when set, in preference to the base endpoint. Also enables telemetry on its own. |
+| `AUTODEV_OTEL_PROTOCOL` | `grpc` disables export entirely — a shell script cannot speak gRPC. `http/json` and `http/protobuf` both export JSON. See the caveat below. |
+| `AUTODEV_OTEL_HEADERS` | Comma-separated `key=value` pairs, percent-decoded. Header values are never logged. |
+| `AUTODEV_OTEL_SERVICE_NAME` | Resource `service.name`; defaults to `github-copilot` so hook spans land beside Copilot's own. |
+| `AUTODEV_OTEL_TIMEOUT_SEC` | Request timeout, default 2, clamped to a maximum of 5. |
+| `AUTODEV_OTEL_DEBUG_FILE` | Writes each span document to this file, one per line, **instead of** posting it. Use this to see exactly what would be exported. It is a sink, not a switch: on its own it does not enable telemetry. |
 
-The names deliberately differ from the plugins' `gate-audit.md` and `feedback-log.md` so a factory
-run and a plugin run in the same repository cannot overwrite each other's evidence.
+An empty or whitespace-only value counts as *not set* rather than as an explicit off. That is
+deliberate: Windows does not carry an empty variable across a process boundary, so a hook or
+emitter -- both of which are child processes -- receives `AUTODEV_OTEL_ENABLED=` as unset no matter
+what the parent shell did. Honouring it as an off switch would work on Linux and macOS and quietly
+do nothing on Windows, which is precisely the kind of platform divergence this emitter exists to
+avoid. Whitespace-only values are treated as absent for every other variable here too, endpoints
+included. To turn hook telemetry off, give it a falsy value rather than an empty one.
 
-### About hooks
+The equivalent `COPILOT_OTEL_ENABLED`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` / `..._TRACES_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` and `OTEL_SERVICE_NAME` variables are still
+read, as a fallback for hosts that do not scrub them. Endpoints are resolved one namespace at a time: if any `AUTODEV_OTEL_*` endpoint is set, the legacy pair is not consulted at all, so an inherited `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` can never outrank `AUTODEV_OTEL_ENDPOINT` despite being the more specific name.
+Under Copilot CLI they are invisible, so do not rely on them.
 
-The plugins' `subagentStart`/`subagentStop` hooks **do not fire for factory subagents** — the gate
-and stage trackers cannot see this workflow at all, which is why their job moved into the code.
+### What is emitted
 
-Extension SDK hooks *can* observe factory subagent tool calls, and an earlier revision of this
-factory used them to record per-stage tool usage in the audit trail. That was removed. Registering
-extension hooks was observed to leave the session's hook processor in a state where every
-subsequent `subagentStart` failed — `Hook processor is not configured for session id` — which takes
-down subagent spawning for the whole session, this factory's own reviewers included. A column in an
-audit table is not worth that. **This extension registers no hooks.**
+One span per `subagentStop`, named `autodev.gate <gate>`. The span marks the instant the verdict
+was recorded rather than spanning the review: the reviewer's duration belongs to Copilot's own
+sub-agent span, which measures it in-process.
 
-What replaces them is not a weaker check but a stronger one. A hook can only watch an agent decide
-whether to comply; the loop here simply does not exit until a reviewer's response ends in
-`AUTODEV-VERDICT: PASS`, and the artifact guards catch a reviewer that wrote when it should not
-have.
+| Attribute | Value |
+| --- | --- |
+| `gen_ai.conversation.id`, `github.copilot.session.id` | The session id, matching Copilot's own spans |
+| `github.copilot.agent.name`, `github.copilot.agent.id` | The reviewer sub-agent |
+| `autodev.plugin` | `autodev` |
+| `autodev.gate` | `architecture`, `security` or `privacy` |
+| `autodev.verdict` | `PASS` or `ISSUES` |
+| `autodev.issues` | The **number of findings** the reviewer reported, counted from its `### [severity] title` headings. Clamped to at least `1` for an `ISSUES` verdict |
+| `autodev.blocked` | Always `0` here; present so a query spanning both plugins needs no special case |
+| `autodev.attempt`, `autodev.total_invocations` | Attempt counters for this gate and session |
 
----
+Sum `autodev.issues` to count problems found; count spans where `autodev.verdict = "ISSUES"` to
+count gates that came back dirty. Findings are counted for a `PASS` too — a pass that still raised
+nits genuinely found them. Because the count is parsed from the reviewer's own formatting, an
+`ISSUES` verdict whose headings could not be parsed reports `1` rather than `0`, so a formatting
+slip can never make a dirty gate look clean.
 
-## Maintenance
+**No reviewer content is ever exported** — not the response body, not the plan, not the prompt,
+and not `transcriptPath`. Only verdicts and identifiers leave the machine.
 
-The prompt bundle is generated. Never edit `extensions/autodev/prompts.generated.mjs` by hand:
+### The emitter only speaks OTLP/JSON
 
-```bash
-scripts/sync-autodev-prompts.sh          # regenerate after editing any source agent
-scripts/sync-autodev-prompts.sh --check  # what CI runs
+This is worth knowing before you point it at a non-Collector backend. The emitter always sends
+HTTP/JSON, because building protobuf from a shell script is not practical. `grpc` is therefore
+refused outright rather than sent JSON at a gRPC port.
+
+`http/protobuf` is a softer case and is **not** refused. The OTLP specification requires a
+receiver to support protobuf but makes JSON support optional, so a backend configured for
+protobuf is permitted to reject the JSON body. In practice the OpenTelemetry Collector — by far
+the most common target, and what Copilot CLI's own documented setup points at — accepts both on
+the same port, so refusing to export would break the common case to protect against the rare one.
+
+The trade-off is that against a strict protobuf-only backend, spans are dropped at the receiver
+and the emitter cannot tell: it discards transport errors by design, because surfacing them would
+mean writing to a hook's stdout. If you are exporting somewhere other than a Collector and see no
+`autodev.*` spans, set `AUTODEV_OTEL_DEBUG_FILE` to confirm the emitter is producing them, then
+check whether your endpoint accepts `Content-Type: application/json`.
+
+### Cost when telemetry is off
+
+With no `AUTODEV_OTEL_*` variable set — the default for essentially every user — no emitter process
+is spawned, no temp file is written and no network call is made. The residual cost is a shell
+`case` on one environment variable. The hooks keep no telemetry state at all: the span is built
+entirely from the `subagentStop` payload and the counters the tracker already maintains for
+enforcement, so enabling telemetry part way through a session works immediately and needs no
+warm-up.
+
+### Correlating with Copilot's own traces
+
+The emitter reads `traceparent` (and `tracestate`) from the hook payload. When present, the span
+is emitted as a **child of Copilot's own sub-agent span**: it adopts that trace id, sets
+`parentSpanId`, and the verdict shows up directly on the sub-agent's trace.
+
+Copilot CLI does not supply trace context to command hooks yet. Until it does, each span is its
+own root trace and correlates by attribute instead: Copilot records its session id as
+`gen_ai.conversation.id`, and the emitter exports the same raw value, so joining on it in your
+backend is exact rather than manual. Nothing needs to change in this plugin when the CLI starts
+sending the header — the spans simply start arriving parented.
+
+A malformed, reserved (`ff`), or all-zero `traceparent` is ignored rather than trusted, and the
+span falls back to a root.
+
+### Reliability
+
+Export is **best-effort and never authoritative**. A network failure drops a span silently, and a
+redelivered hook would double-count; `github.copilot.agent.id` and `autodev.attempt` are exported
+so duplicates can be identified at query time. Telemetry can never affect a session: the emitter
+runs as a separate process with both output streams discarded, is killed if it exceeds its
+budget, and its failure cannot change the hook's stdout or exit code.
+
+## Requirements
+
+- **Windows** — no extra prerequisites. Hooks run through the built-in `powershell.exe`, and the
+  script is Windows PowerShell 5.1 compatible.
+- **Linux / macOS** — hooks require [`jq`](https://jqlang.github.io/jq/). If `jq` is missing the
+  hooks degrade to a no-op: enforcement and the audit trail are disabled, but sessions are never
+  broken. OpenTelemetry export additionally needs `curl`; without it telemetry is skipped and
+  everything else still works.
+
+## Layout
+
+```
+plugins/autodev/
+├── plugin.json
+├── hooks.json                        # Four hook events, each wired to the hook router
+├── .mcp.json                         # Empty; this plugin needs no MCP servers
+├── agents/
+│   ├── autodev-plan.agent.md         # Planning orchestrator (entry point)
+│   ├── autodev-architecture-review.agent.md
+│   ├── autodev-security-review.agent.md
+│   ├── autodev-privacy-review.agent.md
+│   ├── autodev-implement.agent.md    # Implementation orchestrator (entry point)
+│   ├── autodev-tasking.agent.md
+│   ├── autodev-implementation.agent.md
+│   ├── autodev-code-review.agent.md
+│   ├── autodev-code-fix.agent.md
+│   ├── autodev-code-security-review.agent.md
+│   └── autodev-code-privacy-review.agent.md
+├── extensions/autodev-workflow/
+│   ├── extension.mjs                  # Canvas registration and loopback server
+│   ├── autodev-data.mjs               # .autodev discovery and state projection
+│   └── renderer.mjs                   # Self-contained canvas UI
+├── hooks/scripts/
+│   ├── autodev-router.ps1            # Hook router (Windows) — dispatches to the trackers
+│   ├── autodev-router.sh             # Hook router (Linux/macOS, needs jq)
+│   ├── autodev-gates.ps1             # Gate tracker (Windows)
+│   ├── autodev-gates.sh              # Gate tracker (Linux/macOS, needs jq)
+│   ├── autodev-stages.ps1            # Stage tracker (Windows)
+│   ├── autodev-stages.sh             # Stage tracker (Linux/macOS, needs jq)
+│   ├── autodev-otel.ps1              # OTLP span emitter (Windows) — single canonical copy
+│   └── autodev-otel.sh               # OTLP span emitter (Linux/macOS) — single canonical copy
+└── tests/
+    ├── workflow-canvas.tests.mjs      # Canvas packaging and state tests
+    ├── router.tests.ps1              # Hook router tests (Windows)
+    ├── router.tests.sh               # Hook router tests (Linux/macOS)
+    ├── gates.tests.ps1               # Gate tracker tests (Windows)
+    ├── gates.tests.sh                # Gate tracker tests (Linux/macOS)
+    ├── stages.tests.ps1             # Stage tracker tests (Windows)
+    └── stages.tests.sh              # Stage tracker tests (Linux/macOS)
 ```
 
-It reads nine agents — the three plan reviewers from `autodev-plan`, and tasking, implementation,
-code review, code fix, code security review and code privacy review from `autodev-implement` — plus
-the plan document template from the `autodev-plan` orchestrator. The two orchestrator agents are
-deliberately not in the bundle: orchestration is the part the factory replaces.
+The gate and stage trackers are independent state machines; the router decides which one owns each
+event and forwards the payload to it, and only it. All three scripts are written to **fail open**:
+`preToolUse` hooks are fail-closed by design in the CLI, so a crash there would permanently break
+`ask_user`. Every path is wrapped, always emits valid JSON, and always exits 0.
 
-Three prompts are authored in `extension.mjs` rather than lifted, because they cover work the
-plugin orchestrators did in their own context and no agent exists for them: the requirements
-analyst that generates the clarifying questions, the plan author, and the plan reviser. The reviser
-in particular has no candidate to lift: `autodev-code-fix` is the closest thing either plugin has,
-and its own scope rules forbid it to touch `.autodev/plan.md`.
+The two `autodev-otel.*` files are the single canonical copy of the emitter. Both the gate and
+stage trackers find it beside themselves in `hooks/scripts/`, so there is nothing to synchronise
+between plugins any more.
 
-### Tests
+## Tests
 
-```bash
-node --import ./plugins/autodev/tests/register-stub.mjs --test plugins/autodev/tests/factory.tests.mjs
+The gate, stage, and router implementations each have to stay behaviorally identical across
+PowerShell and bash, so each is covered by an equivalent suite in both languages. Each tracker test
+runs the hook script as a real subprocess — feeding a payload on stdin and asserting on the single
+JSON object it writes to stdout. The router tests replace the trackers with stubs so routing is
+verified in isolation. Every test gets its own temporary working directory (and an isolated
+`COPILOT_HOME`), so running them never touches real session state.
+
+```
+# Canvas state and packaging (Node 22+)
+node --test plugins/autodev/tests/workflow-canvas.tests.mjs
+
+# Windows
+powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/router.tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/gates.tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/stages.tests.ps1
+
+# Linux / macOS (requires jq)
+bash plugins/autodev/tests/router.tests.sh
+bash plugins/autodev/tests/gates.tests.sh
+bash plugins/autodev/tests/stages.tests.sh
 ```
 
-The orchestration cannot be unit tested without a live CLI session, so what is covered is
-everything that decides *what* the orchestration does: verdict parsing, the todo list's
-machine-readable contract, elicitation form construction from model-supplied JSON, path
-resolution, and audit-table escaping.
+Because every tracker assertion costs a process spawn — roughly a second on Windows, once
+PowerShell startup and the JSON cmdlets are paid for — the gate and stage suites shard themselves
+across parallel workers by default. That takes a full run from about 11 minutes to about 90
+seconds. When you are diagnosing a failure and want output grouped by section in a single ordered
+run:
 
-`@github/copilot-sdk` is injected by the CLI into the extension host and cannot be installed, so
-`tests/register-stub.mjs` resolves it to a local stub. `extension.mjs` skips `joinSession` when
-`AUTODEV_FACTORY_TEST=1`, which the suite sets before importing it.
+```
+powershell ... -File plugins/autodev/tests/gates.tests.ps1 -Sequential
+bash plugins/autodev/tests/gates.tests.sh --sequential
+```
 
----
+Both accept a worker count (`-Workers 4` / `--workers 4`). Sequential and parallel runs execute
+exactly the same cases; only the ordering and the section headings differ.
 
-## Known limitations
+A few tests seed the tracker's state file directly rather than driving forty real rounds to
+reach a limit. That is a deliberate trade: the tests that cover *accumulation* — the 9-versus-10
+attempt boundary, and two sessions counting independently — still push every round through the
+hook.
 
-- **Reviewers are not tool-restricted.** Mitigated by prompt, verified by hashing, and enforced by
-  refusing a `PASS` from a reviewer that wrote; see the trade-off table above.
-- **Path containment is lexical.** `planPath` and `todosPath` are kept inside the repository by
-  comparing resolved paths, which does not follow symlinks or Windows junctions. A link *inside*
-  the repository pointing outside it would not be caught.
-- **Unresolved code-review findings are recorded, not merged into `todos.md`.** The plugin
-  orchestrator writes them into the milestone's *Review notes*; the factory records them in
-  `factory-feedback.md`, the run result and the wrapup summary instead of editing a file a worker
-  owns.
-- **Re-gating is not automatic.** The plugins re-run earlier gates when a plan changes materially
-  after passing. Here the gates run once, in order, after your approval. If you change the plan at
-  the handoff, re-run the factory.
-- **The factory is session-scoped.** Extensions reload on `/clear`, and a run belongs to the session
-  that started it.
+Coverage includes verdict parsing (including the negatives — a verdict mentioned in prose must
+never count), the enforcement decisions, all three loop bounds, the refusal of further reviewer
+invocations once the budget is spent, re-gate invalidation, the `.autodev/` artifacts (including
+that a new session does not inherit a previous run left in the same directory), and the
+fail-safe paths: corrupt state, empty and garbage stdin, malformed `task` arguments,
+non-reviewer sub-agents, a hostile session id, and a missing `jq`.
+
+The suites also assert on `hooks.json` itself, because that file is what connects everything
+above to the CLI and a typo there would disable enforcement entirely while every other test
+stayed green. Those checks cover the matcher patterns (applied the way the CLI applies them,
+anchored as `^(?:PATTERN)$`), that each entry dispatches its own event name to the right script
+via `${PLUGIN_ROOT}`, that `powershell` is used rather than `pwsh`, and that every referenced
+script exists.
+
+CI runs the PowerShell suite on Windows and the bash suite on both Linux and macOS, and also
+validates every JSON manifest and checks that no `*.sh` file has CRLF endings — a CRLF shebang
+would make the hooks unrunnable on Linux and macOS.
+
+### What the automated tests do not cover
+
+Worth knowing before trusting a green run:
+
+- **The agent prompts.** Whether the orchestrator actually runs the gates in order, applies the
+  material-change rule, and escalates properly is model behavior, not script behavior. Nothing
+  here asserts on it.
+- **Whether the reviewers emit a parseable verdict.** If a reviewer stops following the contract
+  the fail-safe records `ISSUES`, so the workflow degrades into wasted attempts rather than
+  failing loudly.
+- **Concurrency.** State writes are atomic, but no test drives two hooks at once.
+- **The whole thing working together.** Covered by the manual walkthrough below.
+
+## Manual end-to-end check
+
+The automated suites test the gate tracker in isolation. This walkthrough exercises the real
+thing — CLI, plugin loading, agents, sub-agent isolation, and hooks — and is worth running after
+changing the agent prompts, the hook wiring, or the pinned models, and when adopting a new CLI
+version.
+
+Budget roughly 45–60 minutes and a few thousand AI credits, since it runs real reviews.
+
+**1. Create a throwaway repo with something worth reviewing.** Pick a feature with genuine
+security and privacy surface — authentication, data export, and file upload all work well. A
+trivial feature produces a trivial plan and proves little.
+
+```
+mkdir /tmp/autodev-e2e && cd /tmp/autodev-e2e && git init
+# add a small, realistic app skeleton (a few files is enough)
+```
+
+**2. Run the orchestrator against the plugin from your working copy.**
+
+```
+copilot -C /tmp/autodev-e2e --plugin-dir /path/to/plugins/autodev \
+  --agent autodev:autodev-plan
+```
+
+Describe the feature and let the workflow run. To keep an unattended run short you can
+pre-answer the clarifying questions in the initial prompt and tell it to skip the approval step.
+
+**3. Check the tracker artifacts**, in `/tmp/autodev-e2e/.autodev/`. These are the primary
+evidence: they are written by hooks observing real sub-agent events, so the orchestrator cannot
+fake them. Start with `gate-audit.md`.
+
+Expect to see, in order:
+
+- `architecture`, then `security`, then `privacy` — gates must not interleave
+- at least one `invoked` row per gate, each followed by a `completed` row with a verdict
+- attempt numbers incrementing within a gate whenever a verdict was `ISSUES`
+- every gate ending on `PASS` (or an escalation you were asked about)
+
+Then open `feedback-log.md` and compare it against what the orchestrator told you in the
+transcript. Every `ISSUES` round should have a corresponding entry, and the findings the
+orchestrator described should be recognisably the ones the reviewer actually raised.
+
+Tailing `gate-status.json` during the run is the easiest way to watch progress live.
+
+**4. Confirm the things that are easy to get wrong.**
+
+| Check | What you are confirming |
+| --- | --- |
+| A `premature-stop-blocked` row appears if the agent tried to stop early | `agentStop` enforcement is live |
+| The plan file exists at the agreed path and reflects reviewer feedback | Findings were applied, not just acknowledged |
+| You were not asked anything between approval and wrap-up | The gate phase stayed autonomous |
+| Wrap-up reports the plan path, the audit trail and the feedback log | The orchestrator followed through |
+| Reviewer responses carry a `[autodev gate tracker]` footer | The hooks are loaded and rewriting responses |
+| The orchestrator listed each finding, with severity, before revising | Reviewer feedback is visible to you, not just summarised away |
+
+If the footer never appears, the plugin's hooks are not loading — everything else in the run is
+then unverified, whatever the transcript claims.
+
+**5. Sanity-check the review quality.** Skim the findings and ask whether a competent reviewer
+would have raised them. The gates are only worth their cost if they catch real problems; a run
+where all three pass on the first attempt with a substantial feature is a signal the reviewers
+have gone toothless, not a success.
+
+**6. Optionally, prove the cap holds.** Escalation is the hardest path to reach naturally. To
+force it, edit the session's enforcement state at
+`<COPILOT_HOME>/autodev/gates/<sessionId>.json` mid-run and set `architectureAttempts` to
+`10` with `architectureVerdict` as `ISSUES`. The next reviewer invocation must be **denied** with
+an "out of budget" message, and the orchestrator must escalate to you rather than retrying.
+Editing `.autodev/gate-status.json` instead must have no effect on this check while the
+authoritative state exists. Do not delete the authoritative file afterwards: the workspace copy
+is also its same-session recovery checkpoint.
+
+**7. Clean up.**
+
+```
+rm -rf /tmp/autodev-e2e
+```

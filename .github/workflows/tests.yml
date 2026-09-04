@@ -14,7 +14,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run gate tracker tests
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-plan/tests/gates.tests.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/gates.tests.ps1
 
   stages-powershell:
     name: Stage tracker (Windows PowerShell)
@@ -23,7 +23,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run stage tracker tests
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev-implement/tests/stages.tests.ps1
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/stages.tests.ps1
+
+  router-powershell:
+    name: Hook router (Windows PowerShell)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run hook router tests
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File plugins/autodev/tests/router.tests.ps1
 
   gates-bash:
     name: Gate tracker (bash)
@@ -40,7 +49,7 @@ jobs:
             if [ "$RUNNER_OS" = "macOS" ]; then brew install jq; else sudo apt-get update && sudo apt-get install -y jq; fi
           fi
       - name: Run gate tracker tests
-        run: bash plugins/autodev-plan/tests/gates.tests.sh
+        run: bash plugins/autodev/tests/gates.tests.sh
 
   stages-bash:
     name: Stage tracker (bash)
@@ -57,7 +66,24 @@ jobs:
             if [ "$RUNNER_OS" = "macOS" ]; then brew install jq; else sudo apt-get update && sudo apt-get install -y jq; fi
           fi
       - name: Run stage tracker tests
-        run: bash plugins/autodev-implement/tests/stages.tests.sh
+        run: bash plugins/autodev/tests/stages.tests.sh
+
+  router-bash:
+    name: Hook router (bash)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install jq; else sudo apt-get update && sudo apt-get install -y jq; fi
+          fi
+      - name: Run hook router tests
+        run: bash plugins/autodev/tests/router.tests.sh
 
   factory-tests:
     name: Autodev factory (Node)
@@ -75,7 +101,7 @@ jobs:
         # The SDK is injected by the CLI into the extension host, so it cannot be installed here.
         # register-stub.mjs resolves it to a local stub; the factory guards its joinSession call
         # behind AUTODEV_FACTORY_TEST so importing the module does not try to talk to a CLI.
-        run: node --import ./plugins/autodev/tests/register-stub.mjs --test plugins/autodev/tests/factory.tests.mjs
+        run: node --import ./plugins/autodev-factory/tests/register-stub.mjs --test plugins/autodev-factory/tests/factory.tests.mjs
 
   workflow-canvas-tests:
     name: Autodev workflow canvas (Node)
@@ -86,7 +112,7 @@ jobs:
         with:
           node-version: "22"
       - name: Run workflow canvas unit tests
-        run: node --test plugins/autodev-plan/tests/workflow-canvas.tests.mjs
+        run: node --test plugins/autodev/tests/workflow-canvas.tests.mjs
 
   manifests:
     name: Manifests and line endings
@@ -113,12 +139,6 @@ jobs:
             if grep -qU $'\r' "$f"; then echo "FAIL $f contains CR"; status=1; else echo "ok   $f"; fi
           done < <(find . -name '*.sh' -not -path './.git/*')
           exit $status
-      - name: Telemetry emitter copies must not drift
-        run: |
-          # The emitter is shipped inside each plugin because plugins install as independent
-          # directories. autodev-plan holds the canonical copy; this fails if another plugin's
-          # copy was edited directly instead of the canonical one.
-          bash scripts/sync-otel-emitter.sh --check
       - name: Autodev factory prompt bundle must not drift
         run: |
           # The autodev factory carries the reviewer and worker instructions in its prompts,

@@ -196,7 +196,7 @@ value back in.
 ## What this sample omits for clarity
 
 Everything below is present in the production emitter at
-[`plugins/autodev-plan/hooks/scripts/autodev-otel.ps1`](../../plugins/autodev-plan/hooks/scripts/autodev-otel.ps1)
+[`plugins/autodev/hooks/scripts/autodev-otel.ps1`](../../plugins/autodev/hooks/scripts/autodev-otel.ps1)
 and its `.sh` twin, if you want the hardened version.
 
 | Omitted | Why it is safe to leave out of a sample |
@@ -288,7 +288,7 @@ Each event has its own payload shape, so re-check which fields exist before read
 
 **Measuring real duration.** Pair `subagentStart` with `subagentStop`: record the start time keyed
 by `agentId` in a file under the session state directory, then read and delete it in the stop hook
-and use the two timestamps as `startTimeUnixNano` and `endTimeUnixNano`. `plugins/autodev-plan`
+and use the two timestamps as `startTimeUnixNano` and `endTimeUnixNano`. `plugins/autodev`
 does exactly this kind of cross-invocation bookkeeping if you want a worked example — note that it
 brings real complexity, which is why this sample emits an instant instead.
 
