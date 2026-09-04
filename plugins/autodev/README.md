@@ -73,7 +73,7 @@ The plan is written to `./.autodev/plan.md` by default. The orchestrator offers 
 
 | Agent | Invocable by | Model | Tools | Role |
 | --- | --- | --- | --- | --- |
-| `autodev-plan` | user | Claude Opus 5 | all | Orchestrator and the only agent you talk to |
+| `autodev-plan` | user | GPT-5.6 Sol | all | Orchestrator and the only agent you talk to |
 | `autodev-architecture-review` | orchestrator only | GPT-5.6 Terra | read, search | Decomposition, coupling, failure modes, testability |
 | `autodev-security-review` | orchestrator only | GPT-5.6 Terra | read, search, web | Authn/authz, injection, secrets, supply chain, trust boundaries |
 | `autodev-privacy-review` | orchestrator only | GPT-5.6 Terra | read, search | Data inventory, minimization, retention, telemetry leakage |
@@ -151,13 +151,13 @@ the security and privacy reviews run autonomously.
 
 | Agent | Model | Access | Role |
 | --- | --- | --- | --- |
-| `autodev-implement` | Claude Opus 5 | full | Orchestrator. Runs the phase machine, dispatches sub-agents, talks to you. |
-| `autodev-tasking` | Claude Opus 5 | read + write | Turns the plan into `.autodev/todos.md`, split into milestones sized at one to two weeks of human dev work each. |
-| `autodev-implementation` | GPT-5.5 | full | Implements exactly one milestone, runs the project's build and tests, marks its tasks done. |
+| `autodev-implement` | GPT-5.6 Sol | full | Orchestrator. Runs the phase machine, dispatches sub-agents, talks to you. |
+| `autodev-tasking` | GPT-5.6 Sol | read + write | Turns the plan into `.autodev/todos.md`, split into milestones sized at one to two weeks of human dev work each. |
+| `autodev-implementation` | GPT-5.6 Terra | full | Implements exactly one milestone, runs the project's build and tests, marks its tasks done. |
 | `autodev-code-review` | Claude Sonnet 5 | read-only | Reviews the milestone's changes against the plan. Required to report every finding in one pass. |
-| `autodev-code-fix` | GPT-5.5 | full | Applies review findings. A finding it judges invalid is answered with a code comment explaining why the code is correct, not with a silent dismissal. |
-| `autodev-code-security-review` | Claude Sonnet 5 | read-only + web | Security review of the finished implementation. |
-| `autodev-code-privacy-review` | Claude Sonnet 5 | read-only | Privacy and data-protection review of the finished implementation. |
+| `autodev-code-fix` | GPT-5.6 Terra | full | Applies review findings. A finding it judges invalid is answered with a code comment explaining why the code is correct, not with a silent dismissal. |
+| `autodev-code-security-review` | GPT-5.6 Terra | read-only + web | Security review of the finished implementation. |
+| `autodev-code-privacy-review` | GPT-5.6 Terra | read-only | Privacy and data-protection review of the finished implementation. |
 
 Reviewers run in their own context and never see the reasoning that produced the code. Every
 sub-agent ends its response with a machine-readable verdict — `PASS`/`ISSUES` for reviewers,
