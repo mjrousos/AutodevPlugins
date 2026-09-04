@@ -506,9 +506,11 @@ function Invoke-Tracker {
         $proc.StandardInput.BaseStream.Flush()
         $proc.StandardInput.Close()
 
-        $out = $proc.StandardOutput.ReadToEnd()
-        $null = $proc.StandardError.ReadToEnd()
+        $stdoutRead = $proc.StandardOutput.ReadToEndAsync()
+        $stderrRead = $proc.StandardError.ReadToEndAsync()
         $proc.WaitForExit()
+        $out = $stdoutRead.Result
+        $null = $stderrRead.Result
 
         if ($proc.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($out)) {
             Write-EmptyResult
