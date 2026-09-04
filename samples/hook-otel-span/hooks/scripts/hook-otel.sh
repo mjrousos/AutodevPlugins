@@ -18,7 +18,7 @@
 # Written for bash 3.2 (the version macOS ships): no ${var,,}, no associative arrays.
 # Requires jq, and curl for the network path. Either being absent degrades to "no telemetry".
 #
-# Compared with the production emitter in plugins/autodev-plan/hooks/scripts/autodev-otel.sh,
+# Compared with the production emitter in plugins/autodev/hooks/scripts/autodev-otel.sh,
 # this sample deliberately does the HTTP call in the hook process instead of in an isolated,
 # kill-bounded child process. See "What this sample omits" in README.md.
 #

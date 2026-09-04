@@ -7,7 +7,7 @@
  * the host will accept, and how paths resolve. Those are the places where a quiet bug would turn
  * a review gate into a rubber stamp.
  *
- * Run: node --test plugins/autodev-factory/tests/
+ * Run: node --import ./plugins/autodev-factory/tests/register-stub.mjs --test plugins/autodev-factory/tests/factory.tests.mjs
  */
 
 import { test } from "node:test";
