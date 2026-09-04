@@ -1627,7 +1627,7 @@ async function handoff(ctx, run) {
             properties: {
                 decision: choiceField(
                     "Start implementation?",
-                    "Stopping here leaves the plan on disk; you can re-run autodev later with startAt: \"implement\".",
+                    "Stopping here leaves the plan on disk; you can re-run autodev-factory later with startAt: \"implement\".",
                     [
                         "Yes — start implementing",
                         "No — stop here, the plan is what I wanted",
@@ -1647,7 +1647,7 @@ async function handoff(ctx, run) {
     if (decision.includes("edit the plan")) {
         return {
             proceed: false,
-            reason: `you chose to edit the plan first — re-run autodev with {"startAt": "implement"} when it is ready`,
+            reason: `you chose to edit the plan first — re-run autodev-factory with {"startAt": "implement"} when it is ready`,
         };
     }
     return { proceed: false, reason: "you chose to stop after planning" };
