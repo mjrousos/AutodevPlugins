@@ -156,6 +156,14 @@ try {
     Assert-Empty "a task targeting a foreign autodev-like agent is not routed" `
         (Invoke-Router 'preToolUse' '{"sessionId":"s","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"other-plugin:autodev-code-fix\"}"}')
 
+    Reset-State
+    $null = Invoke-Router 'subagentStart' `
+        '{"sessionId":"plan-active","cwd":"","agentName":"autodev:autodev-security-review"}'
+    Assert-Routed "a cross-workflow task still reaches the stage tracker for validation" 'stages' `
+        (Invoke-Router 'preToolUse' '{"sessionId":"plan-active","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-code-review\"}"}')
+    Assert-Routed "a cross-workflow task does not replace the remembered plan workflow" 'gates' `
+        (Invoke-Router 'agentStop' '{"sessionId":"plan-active","cwd":""}')
+
     # --- agentStop and ask_user route by the active session's workflow -------------------------
 
     Reset-State

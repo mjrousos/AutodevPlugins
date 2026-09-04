@@ -196,9 +196,11 @@ try {
     try { $payload = $raw | ConvertFrom-Json -ErrorAction Stop } catch { Write-EmptyResult }
 
     $workflow = $null
+    $rememberWorkflow = $false
     switch ($EventName) {
         { $_ -in @('subagentStart', 'subagentStop') } {
             $workflow = Get-AgentWorkflow ([string]$payload.agentName)
+            $rememberWorkflow = $true
         }
         'preToolUse' {
             $toolName = ([string]$payload.toolName).ToLowerInvariant()
@@ -216,11 +218,15 @@ try {
 
     switch ($workflow) {
         'gates' {
-            Set-SessionWorkflow ([string]$payload.sessionId) 'gates'
+            if ($rememberWorkflow) {
+                Set-SessionWorkflow ([string]$payload.sessionId) 'gates'
+            }
             Invoke-Tracker (Join-Path $PSScriptRoot 'autodev-gates.ps1') $raw
         }
         'stages' {
-            Set-SessionWorkflow ([string]$payload.sessionId) 'stages'
+            if ($rememberWorkflow) {
+                Set-SessionWorkflow ([string]$payload.sessionId) 'stages'
+            }
             Invoke-Tracker (Join-Path $PSScriptRoot 'autodev-stages.ps1') $raw
         }
         default { Write-EmptyResult }

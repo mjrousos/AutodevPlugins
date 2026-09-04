@@ -405,7 +405,7 @@ sub-agent span, which measures it in-process.
 | --- | --- |
 | `gen_ai.conversation.id`, `github.copilot.session.id` | The session id, matching Copilot's own spans |
 | `github.copilot.agent.name`, `github.copilot.agent.id` | The reviewer sub-agent |
-| `autodev.plugin` | `autodev-plan` |
+| `autodev.plugin` | `autodev` |
 | `autodev.gate` | `architecture`, `security` or `privacy` |
 | `autodev.verdict` | `PASS` or `ISSUES` |
 | `autodev.issues` | The **number of findings** the reviewer reported, counted from its `### [severity] title` headings. Clamped to at least `1` for an `ISSUES` verdict |
@@ -658,7 +658,7 @@ Tailing `gate-status.json` during the run is the easiest way to watch progress l
 | The plan file exists at the agreed path and reflects reviewer feedback | Findings were applied, not just acknowledged |
 | You were not asked anything between approval and wrap-up | The gate phase stayed autonomous |
 | Wrap-up reports the plan path, the audit trail and the feedback log | The orchestrator followed through |
-| Reviewer responses carry a `[autodev-plan gate tracker]` footer | The hooks are loaded and rewriting responses |
+| Reviewer responses carry a `[autodev gate tracker]` footer | The hooks are loaded and rewriting responses |
 | The orchestrator listed each finding, with severity, before revising | Reviewer feedback is visible to you, not just summarised away |
 
 If the footer never appears, the plugin's hooks are not loading — everything else in the run is

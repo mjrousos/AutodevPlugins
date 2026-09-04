@@ -135,9 +135,11 @@ dispatch() {
 }
 
 TARGET=""
+REMEMBER_ROUTE=0
 case "$EVENT_NAME" in
   subagentStart | subagentStop)
     TARGET="$(classify_agent "$(json_get '.agentName')")"
+    REMEMBER_ROUTE=1
     ;;
   preToolUse)
     case "$(printf '%s' "$(json_get '.toolName')" | tr 'A-Z' 'a-z')" in
@@ -159,8 +161,14 @@ case "$EVENT_NAME" in
 esac
 
 case "$TARGET" in
-  gates) remember_route gates; dispatch "$GATES_SCRIPT" ;;
-  stages) remember_route stages; dispatch "$STAGES_SCRIPT" ;;
+  gates)
+    [ "$REMEMBER_ROUTE" -eq 1 ] && remember_route gates
+    dispatch "$GATES_SCRIPT"
+    ;;
+  stages)
+    [ "$REMEMBER_ROUTE" -eq 1 ] && remember_route stages
+    dispatch "$STAGES_SCRIPT"
+    ;;
   *) emit_empty ;;
 esac
 

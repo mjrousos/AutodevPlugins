@@ -134,6 +134,13 @@ reset_state
 assert_empty "a task targeting a foreign autodev-like agent is not routed" \
   "$(route preToolUse '{"sessionId":"s","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"other-plugin:autodev-code-fix\"}"}')"
 
+reset_state
+route subagentStart '{"sessionId":"plan-active","cwd":"","agentName":"autodev:autodev-security-review"}' >/dev/null
+assert_routed "a cross-workflow task still reaches the stage tracker for validation" stages \
+  "$(route preToolUse '{"sessionId":"plan-active","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-code-review\"}"}')"
+assert_routed "a cross-workflow task does not replace the remembered plan workflow" gates \
+  "$(route agentStop '{"sessionId":"plan-active","cwd":""}')"
+
 # --- agentStop and ask_user route by the active session's workflow --------------------------
 
 reset_state
