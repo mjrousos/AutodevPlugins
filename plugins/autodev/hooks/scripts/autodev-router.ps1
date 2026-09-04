@@ -96,9 +96,9 @@ function Get-TaskAgentType {
     }
 }
 
-# The router records its own session-keyed workflow marker before dispatching a lifecycle or task
-# event. Tracker state is a compatibility fallback for sessions that began before the marker
-# existed. Workspace mirrors remain solely the trackers' recovery mechanism.
+# The router records its own session-keyed workflow marker before dispatching a lifecycle event.
+# Tracker state is a compatibility fallback for sessions that began before the marker existed.
+# Workspace mirrors remain solely the trackers' recovery mechanism.
 function Get-RoutingPaths {
     param([string]$SessionId)
     if ([string]::IsNullOrWhiteSpace($SessionId)) { return $null }
@@ -150,6 +150,192 @@ function Get-SessionWorkflow {
     elseif ($gateExists) { return 'gates' }
     elseif ($stageExists) { return 'stages' }
     return $null
+}
+
+function Get-StateNumber {
+    param($State, [string]$Name)
+    $property = $State.PSObject.Properties[$Name]
+    if ($null -eq $property) { return 0 }
+    $number = 0
+    if ([int]::TryParse([string]$property.Value, [ref]$number) -and $number -ge 0) {
+        return $number
+    }
+    return 0
+}
+
+function Get-StateString {
+    param($State, [string]$Name, [string]$Default)
+    $property = $State.PSObject.Properties[$Name]
+    if ($null -eq $property -or $null -eq $property.Value) { return $Default }
+    return [string]$property.Value
+}
+
+function Test-StateCounter {
+    param($State, [string]$Name)
+    $property = $State.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $true }
+    $text = [Convert]::ToString($property.Value, [Globalization.CultureInfo]::InvariantCulture)
+    if ($text -notmatch '^[0-9]+$') { return $false }
+    $number = 0L
+    return [long]::TryParse($text, [ref]$number) -and $number -le 2147483647
+}
+
+function Test-StateVerdict {
+    param($State, [string]$Name, [string[]]$Allowed)
+    $property = $State.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $true }
+    return $property.Value -is [string] -and [string]$property.Value -in $Allowed
+}
+
+function Test-GateStateSemantics {
+    param($State)
+    foreach ($name in @(
+            'blocks', 'totalInvocations', 'architectureAttempts', 'securityAttempts',
+            'privacyAttempts'
+        )) {
+        if (-not (Test-StateCounter $State $name)) { return $false }
+    }
+    foreach ($name in @('architectureVerdict', 'securityVerdict', 'privacyVerdict')) {
+        if (-not (Test-StateVerdict $State $name @('pending', 'running', 'PASS', 'ISSUES'))) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-StageStateSemantics {
+    param($State)
+    foreach ($name in @(
+            'blocks', 'totalInvocations', 'taskingAttempts', 'milestoneCount',
+            'currentMilestone', 'completedMilestones', 'implementAttempts', 'reviewAttempts',
+            'fixInvocations', 'userReviewReached', 'securityAttempts', 'privacyAttempts'
+        )) {
+        if (-not (Test-StateCounter $State $name)) { return $false }
+    }
+    foreach ($name in @('taskingVerdict', 'implementVerdict')) {
+        if (-not (Test-StateVerdict $State $name @('pending', 'running', 'DONE', 'BLOCKED'))) {
+            return $false
+        }
+    }
+    foreach ($name in @('reviewVerdict', 'securityVerdict', 'privacyVerdict')) {
+        if (-not (Test-StateVerdict $State $name @('pending', 'running', 'PASS', 'ISSUES'))) {
+            return $false
+        }
+    }
+    return $true
+}
+
+# Missing or malformed state is treated as active because the owning tracker may still recover it
+# from its workspace mirror. This guard only releases a cross-workflow starter after the current
+# workflow is complete or escalated.
+function Test-WorkflowEnforcing {
+    param([string]$SessionId, [string]$Workflow)
+    $paths = Get-RoutingPaths $SessionId
+    if ($null -eq $paths) { return $false }
+    $statePath = if ($Workflow -eq 'gates') { $paths.GateState } else { $paths.StageState }
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { return $true }
+
+    try {
+        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
+        $safe = ($SessionId -replace '[^A-Za-z0-9._-]', '_')
+        if ([string]::IsNullOrEmpty($safe)) { $safe = 'unknown-session' }
+        if ([string]$state.sessionId -ne $safe) { return $true }
+
+        if ($Workflow -eq 'gates') {
+            if (-not (Test-GateStateSemantics $state)) { return $true }
+            $started = (Get-StateNumber $state 'architectureAttempts') -gt 0 -or
+                (Get-StateNumber $state 'securityAttempts') -gt 0 -or
+                (Get-StateNumber $state 'privacyAttempts') -gt 0
+            $complete = (Get-StateString $state 'architectureVerdict' 'pending') -eq 'PASS' -and
+                (Get-StateString $state 'securityVerdict' 'pending') -eq 'PASS' -and
+                (Get-StateString $state 'privacyVerdict' 'pending') -eq 'PASS'
+            $escalated = (Get-StateNumber $state 'totalInvocations') -ge 40 -or
+                ((Get-StateString $state 'architectureVerdict' 'pending') -ne 'PASS' -and
+                    (Get-StateNumber $state 'architectureAttempts') -ge 10) -or
+                ((Get-StateString $state 'securityVerdict' 'pending') -ne 'PASS' -and
+                    (Get-StateNumber $state 'securityAttempts') -ge 10) -or
+                ((Get-StateString $state 'privacyVerdict' 'pending') -ne 'PASS' -and
+                    (Get-StateNumber $state 'privacyAttempts') -ge 10)
+            return $started -and -not $complete -and -not $escalated
+        }
+
+        if (-not (Test-StageStateSemantics $state)) { return $true }
+        $milestoneCount = Get-StateNumber $state 'milestoneCount'
+        $completedMilestones = Get-StateNumber $state 'completedMilestones'
+        $milestones = if ($milestoneCount -gt 0) {
+            $milestoneCount
+        }
+        elseif ($completedMilestones -gt 0) {
+            $completedMilestones
+        }
+        else {
+            1
+        }
+        $taskingDone = (Get-StateString $state 'taskingVerdict' 'pending') -eq 'DONE'
+        $securityPassed = (Get-StateString $state 'securityVerdict' 'pending') -eq 'PASS'
+        $privacyPassed = (Get-StateString $state 'privacyVerdict' 'pending') -eq 'PASS'
+        if ((Get-StateNumber $state 'taskingAttempts') -eq 0) {
+            $stage = 'idle'
+        }
+        elseif ((Get-StateNumber $state 'totalInvocations') -ge (120 + 30 * $milestones)) {
+            $stage = 'escalated'
+        }
+        elseif (-not $taskingDone) {
+            $stage = if ((Get-StateNumber $state 'taskingAttempts') -ge 5) {
+                'escalated'
+            }
+            else {
+                'tasking'
+            }
+        }
+        elseif ($completedMilestones -lt $milestones) {
+            $stage = if (
+                (Get-StateString $state 'implementVerdict' 'pending') -ne 'DONE' -and
+                (Get-StateNumber $state 'implementAttempts') -ge 5
+            ) {
+                'escalated'
+            }
+            else {
+                'milestones'
+            }
+        }
+        elseif (-not $securityPassed) {
+            $securityAttempts = Get-StateNumber $state 'securityAttempts'
+            if ($securityAttempts -eq 0) {
+                $stage = 'user-review'
+            }
+            elseif ($securityAttempts -ge 10) {
+                $stage = 'escalated'
+            }
+            else {
+                $stage = 'security'
+            }
+        }
+        elseif (-not $privacyPassed) {
+            $stage = if ((Get-StateNumber $state 'privacyAttempts') -ge 10) {
+                'escalated'
+            }
+            else {
+                'privacy'
+            }
+        }
+        else {
+            $stage = 'complete'
+        }
+        return $stage -notin @('idle', 'complete', 'escalated')
+    }
+    catch {
+        return $true
+    }
+}
+
+function Write-CrossWorkflowDenial {
+    param([string]$Current, [string]$Target)
+    @{
+        permissionDecision       = 'deny'
+        permissionDecisionReason = "The autodev $Current workflow is still active. Finish or escalate it before starting the $Target workflow."
+    } | ConvertTo-Json -Compress
+    exit 0
 }
 
 # Forward the untouched payload to the chosen tracker over an isolated child process and pass its
@@ -206,6 +392,11 @@ try {
             $toolName = ([string]$payload.toolName).ToLowerInvariant()
             if ($toolName -eq 'task') {
                 $workflow = Get-AgentWorkflow (Get-TaskAgentType $payload.toolArgs)
+                $currentWorkflow = Get-SessionWorkflow ([string]$payload.sessionId)
+                if ($currentWorkflow -and $workflow -and $currentWorkflow -ne $workflow -and
+                    (Test-WorkflowEnforcing ([string]$payload.sessionId) $currentWorkflow)) {
+                    Write-CrossWorkflowDenial $currentWorkflow $workflow
+                }
             }
             elseif ($toolName -eq 'ask_user' -or $toolName -eq 'askuserquestion') {
                 $workflow = Get-SessionWorkflow ([string]$payload.sessionId)

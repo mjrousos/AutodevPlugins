@@ -75,10 +75,10 @@ classify_agent() {
   esac
 }
 
-# The router records its own session-keyed workflow marker before dispatching a lifecycle or task
-# event. Tracker state is a compatibility fallback for sessions that began before the marker
-# existed. Workspace mirrors are deliberately not consulted here: they are shared across sessions
-# and remain solely the trackers' recovery mechanism.
+# The router records its own session-keyed workflow marker before dispatching a lifecycle event.
+# Tracker state is a compatibility fallback for sessions that began before the marker existed.
+# Workspace mirrors are deliberately not consulted here: they are shared across sessions and
+# remain solely the trackers' recovery mechanism.
 COPILOT_HOME_DIR="${COPILOT_HOME:-$HOME/.copilot}"
 SESSION_ID="$(json_get '.sessionId')"
 SAFE_SESSION_ID="$(printf '%s' "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')"
@@ -120,6 +120,145 @@ route_by_session() {
   fi
 }
 
+# A cross-workflow task is legal only after the current workflow is complete or escalated. Missing
+# or malformed state is treated as active: the owning tracker may still be able to recover it from
+# its workspace mirror, so allowing a different starter would risk bypassing that enforcement.
+workflow_is_enforcing() {
+  local workflow="$1" path snapshot owner
+  case "$workflow" in
+    gates) path="$GATE_STATE" ;;
+    stages) path="$STAGE_STATE" ;;
+    *) return 1 ;;
+  esac
+  [ -f "$path" ] || return 0
+  snapshot="$(cat "$path" 2>/dev/null)" || return 0
+  printf '%s' "$snapshot" | jq -e . >/dev/null 2>&1 || return 0
+  owner="$(printf '%s' "$snapshot" | jq -r '.sessionId // ""' 2>/dev/null)"
+  [ "$owner" = "$SAFE_SESSION_ID" ] || return 0
+
+  if [ "$workflow" = "gates" ]; then
+    printf '%s' "$snapshot" | jq -e '
+      def nonnegint:
+        (type == "number"
+         and . >= 0 and . <= 2147483647 and floor == .
+         and (tostring | test("^[0-9]+$")))
+        or (type == "string"
+            and test("^[0-9]+$")
+            and (tonumber <= 2147483647));
+      def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+      def verdict_ok($key):
+        (has($key) | not)
+        or (.[$key] | type == "string" and
+            (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
+      counter_ok("blocks")
+      and counter_ok("totalInvocations")
+      and counter_ok("architectureAttempts")
+      and counter_ok("securityAttempts")
+      and counter_ok("privacyAttempts")
+      and verdict_ok("architectureVerdict")
+      and verdict_ok("securityVerdict")
+      and verdict_ok("privacyVerdict")
+    ' >/dev/null 2>&1 || return 0
+
+    printf '%s' "$snapshot" | jq -e '
+      def n($key):
+        (.[$key] // 0)
+        | if type == "number" then . elif type == "string" then (tonumber? // 0) else 0 end;
+      def s($key): .[$key] // "pending";
+      def started:
+        n("architectureAttempts") > 0 or n("securityAttempts") > 0 or n("privacyAttempts") > 0;
+      def complete:
+        s("architectureVerdict") == "PASS"
+        and s("securityVerdict") == "PASS"
+        and s("privacyVerdict") == "PASS";
+      def escalated:
+        n("totalInvocations") >= 40
+        or (s("architectureVerdict") != "PASS" and n("architectureAttempts") >= 10)
+        or (s("securityVerdict") != "PASS" and n("securityAttempts") >= 10)
+        or (s("privacyVerdict") != "PASS" and n("privacyAttempts") >= 10);
+      started and (complete | not) and (escalated | not)
+    ' >/dev/null 2>&1
+    return
+  fi
+
+  printf '%s' "$snapshot" | jq -e '
+    def nonnegint:
+      (type == "number"
+       and . >= 0 and . <= 2147483647 and floor == .
+       and (tostring | test("^[0-9]+$")))
+      or (type == "string"
+          and test("^[0-9]+$")
+          and (tonumber <= 2147483647));
+    def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    def worker_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "DONE" or . == "BLOCKED"));
+    def review_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
+    counter_ok("blocks")
+    and counter_ok("totalInvocations")
+    and counter_ok("taskingAttempts")
+    and counter_ok("milestoneCount")
+    and counter_ok("currentMilestone")
+    and counter_ok("completedMilestones")
+    and counter_ok("implementAttempts")
+    and counter_ok("reviewAttempts")
+    and counter_ok("fixInvocations")
+    and counter_ok("userReviewReached")
+    and counter_ok("securityAttempts")
+    and counter_ok("privacyAttempts")
+    and worker_ok("taskingVerdict")
+    and worker_ok("implementVerdict")
+    and review_ok("reviewVerdict")
+    and review_ok("securityVerdict")
+    and review_ok("privacyVerdict")
+  ' >/dev/null 2>&1 || return 0
+
+  printf '%s' "$snapshot" | jq -e '
+    def n($key):
+      (.[$key] // 0)
+      | if type == "number" then . elif type == "string" then (tonumber? // 0) else 0 end;
+    def s($key): .[$key] // "pending";
+    def milestones:
+      if n("milestoneCount") > 0 then n("milestoneCount")
+      elif n("completedMilestones") > 0 then n("completedMilestones")
+      else 1
+      end;
+    def stage:
+      if n("taskingAttempts") == 0 then "idle"
+      elif n("totalInvocations") >= (120 + 30 * milestones) then "escalated"
+      elif s("taskingVerdict") != "DONE" then
+        if n("taskingAttempts") >= 5 then "escalated" else "tasking" end
+      elif n("completedMilestones") < milestones then
+        if s("implementVerdict") != "DONE" and n("implementAttempts") >= 5
+        then "escalated"
+        else "milestones"
+        end
+      elif s("securityVerdict") != "PASS" then
+        if n("securityAttempts") == 0 then "user-review"
+        elif n("securityAttempts") >= 10 then "escalated"
+        else "security"
+        end
+      elif s("privacyVerdict") != "PASS" then
+        if n("privacyAttempts") >= 10 then "escalated" else "privacy" end
+      else "complete"
+      end;
+    stage != "idle" and stage != "complete" and stage != "escalated"
+  ' >/dev/null 2>&1
+}
+
+deny_cross_workflow() {
+  local current="$1" target="$2"
+  jq -cn --arg current "$current" --arg target "$target" \
+    '{permissionDecision: "deny",
+      permissionDecisionReason:
+        ("The autodev " + $current + " workflow is still active. Finish or escalate it before starting the " + $target + " workflow.")}'
+  exit 0
+}
+
 # Forward the untouched payload to the chosen tracker and pass its result back verbatim. If the
 # tracker somehow produces nothing, fall back to the empty result so the hook contract holds.
 dispatch() {
@@ -145,6 +284,11 @@ case "$EVENT_NAME" in
     case "$(printf '%s' "$(json_get '.toolName')" | tr 'A-Z' 'a-z')" in
       task)
         TARGET="$(classify_agent "$(get_task_agent_type)")"
+        CURRENT="$(route_by_session)"
+        if [ -n "$CURRENT" ] && [ -n "$TARGET" ] && [ "$CURRENT" != "$TARGET" ] &&
+          workflow_is_enforcing "$CURRENT"; then
+          deny_cross_workflow "$CURRENT" "$TARGET"
+        fi
         ;;
       ask_user | askuserquestion)
         TARGET="$(route_by_session)"

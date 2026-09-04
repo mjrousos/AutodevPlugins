@@ -80,6 +80,15 @@ assert_empty() {
   fi
 }
 
+assert_denied() {
+  # $1 test name, $2 actual output
+  if printf '%s' "$2" | jq -e '.permissionDecision == "deny"' >/dev/null 2>&1; then
+    pass "$1"
+  else
+    fail "$1" "expected a denial but got: $2"
+  fi
+}
+
 # --- lifecycle events route by the sub-agent's name -----------------------------------------
 
 reset_state
@@ -136,10 +145,65 @@ assert_empty "a task targeting a foreign autodev-like agent is not routed" \
 
 reset_state
 route subagentStart '{"sessionId":"plan-active","cwd":"","agentName":"autodev:autodev-security-review"}' >/dev/null
-assert_routed "a cross-workflow task still reaches the stage tracker for validation" stages \
-  "$(route preToolUse '{"sessionId":"plan-active","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-code-review\"}"}')"
-assert_routed "a cross-workflow task does not replace the remembered plan workflow" gates \
+assert_denied "tasking cannot start while the planning workflow is active" \
+  "$(route preToolUse '{"sessionId":"plan-active","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')"
+assert_routed "a denied implementation starter does not replace the remembered plan workflow" gates \
   "$(route agentStop '{"sessionId":"plan-active","cwd":""}')"
+
+reset_state
+route subagentStart '{"sessionId":"implementation-active","cwd":"","agentName":"autodev:autodev-tasking"}' >/dev/null
+assert_denied "a plan gate cannot start while the implementation workflow is active" \
+  "$(route preToolUse '{"sessionId":"implementation-active","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
+assert_routed "a denied plan starter does not replace the remembered implementation workflow" stages \
+  "$(route agentStop '{"sessionId":"implementation-active","cwd":""}')"
+
+reset_state
+route subagentStart '{"sessionId":"plan-complete","cwd":"","agentName":"autodev:autodev-privacy-review"}' >/dev/null
+mkdir -p "$GATES_DIR"
+printf '%s' '{"sessionId":"plan-complete","totalInvocations":3,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":1,"securityVerdict":"PASS","privacyAttempts":1,"privacyVerdict":"PASS"}' \
+  > "$GATES_DIR/plan-complete.json"
+assert_routed "tasking may start after the planning workflow completes" stages \
+  "$(route preToolUse '{"sessionId":"plan-complete","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')"
+
+reset_state
+route subagentStart '{"sessionId":"implementation-complete","cwd":"","agentName":"autodev:autodev-code-privacy-review"}' >/dev/null
+mkdir -p "$STAGES_DIR"
+printf '%s' '{"sessionId":"implementation-complete","taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"securityVerdict":"PASS","privacyVerdict":"PASS"}' \
+  > "$STAGES_DIR/implementation-complete.json"
+assert_routed "a plan gate may start after the implementation workflow completes" gates \
+  "$(route preToolUse '{"sessionId":"implementation-complete","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
+
+reset_state
+route subagentStart '{"sessionId":"corrupt-plan","cwd":"","agentName":"autodev:autodev-privacy-review"}' >/dev/null
+mkdir -p "$GATES_DIR"
+printf '%s' '{"sessionId":"corrupt-plan","blocks":"bad","architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":1,"securityVerdict":"PASS","privacyAttempts":1,"privacyVerdict":"PASS"}' \
+  > "$GATES_DIR/corrupt-plan.json"
+assert_denied "semantically corrupt plan state keeps the cross-workflow guard active" \
+  "$(route preToolUse '{"sessionId":"corrupt-plan","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')"
+
+reset_state
+route subagentStart '{"sessionId":"milestone-fallback","cwd":"","agentName":"autodev:autodev-code-review"}' >/dev/null
+mkdir -p "$STAGES_DIR"
+printf '%s' '{"sessionId":"milestone-fallback","totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":0,"completedMilestones":2,"implementVerdict":"DONE","securityAttempts":0,"securityVerdict":"pending","privacyVerdict":"pending"}' \
+  > "$STAGES_DIR/milestone-fallback.json"
+assert_denied "completed milestones set the stage ceiling when milestone count is unavailable" \
+  "$(route preToolUse '{"sessionId":"milestone-fallback","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
+
+reset_state
+route subagentStart '{"sessionId":"stale-tasking","cwd":"","agentName":"autodev:autodev-tasking"}' >/dev/null
+mkdir -p "$STAGES_DIR"
+printf '%s' '{"sessionId":"stale-tasking","taskingAttempts":1,"taskingVerdict":"running","privacyVerdict":"PASS"}' \
+  > "$STAGES_DIR/stale-tasking.json"
+assert_denied "stale downstream passes cannot release an active tasking stage" \
+  "$(route preToolUse '{"sessionId":"stale-tasking","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
+
+reset_state
+route subagentStart '{"sessionId":"stale-milestone","cwd":"","agentName":"autodev:autodev-implementation"}' >/dev/null
+mkdir -p "$STAGES_DIR"
+printf '%s' '{"sessionId":"stale-milestone","taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":2,"completedMilestones":1,"implementAttempts":0,"implementVerdict":"pending","securityAttempts":10,"securityVerdict":"ISSUES","privacyVerdict":"PASS"}' \
+  > "$STAGES_DIR/stale-milestone.json"
+assert_denied "stale downstream escalation cannot release an active milestone stage" \
+  "$(route preToolUse '{"sessionId":"stale-milestone","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
 
 # --- agentStop and ask_user route by the active session's workflow --------------------------
 
