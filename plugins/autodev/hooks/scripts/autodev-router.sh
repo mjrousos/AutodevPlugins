@@ -259,17 +259,145 @@ deny_cross_workflow() {
   exit 0
 }
 
-# Forward the untouched payload to the chosen tracker and pass its result back verbatim. If the
-# tracker somehow produces nothing, fall back to the empty result so the hook contract holds.
-dispatch() {
-  local script="$1" out
-  [ -f "$script" ] || emit_empty
-  out="$(printf '%s' "$RAW_INPUT" | bash "$script" "$EVENT_NAME" 2>/dev/null)"
-  if [ -n "$out" ]; then
-    printf '%s\n' "$out"
-  else
-    printf '{}\n'
+# Validate one JSON object with the RFC grammar instead of jq's permissive number parser, which
+# accepts NaN and Infinity. Values are never converted to floating point, so valid large exponents
+# remain valid.
+is_strict_json_object() {
+  # Apple awk treats NUL as a C-string terminator, so reject it with byte-oriented tools before
+  # parsing. Otherwise '{}\0garbage' could validate as the truncated prefix and then be forwarded
+  # intact by cat.
+  if LC_ALL=C od -An -tx1 "$1" 2>/dev/null \
+    | grep -Eq '(^|[[:space:]])00([[:space:]]|$)'; then
+    return 1
   fi
+  awk '
+    function skip_ws(    c) {
+      while (pos <= length(text)) {
+        c = substr(text, pos, 1)
+        if (c != " " && c != "\t" && c != "\r" && c != "\n") break
+        pos++
+      }
+    }
+    function parse_string(    c, esc, i) {
+      if (substr(text, pos, 1) != "\"") return 0
+      pos++
+      while (pos <= length(text)) {
+        c = substr(text, pos, 1)
+        if (c == "\"") { pos++; return 1 }
+        if (c == sprintf("%c", 0) || c ~ /[\001-\037]/) return 0
+        if (c == "\\") {
+          pos++
+          if (pos > length(text)) return 0
+          esc = substr(text, pos, 1)
+          if (esc == "u") {
+            for (i = 1; i <= 4; i++) {
+              pos++
+              if (pos > length(text) || substr(text, pos, 1) !~ /^[0-9A-Fa-f]$/) return 0
+            }
+          } else if (index("\"\\/bfnrt", esc) == 0) {
+            return 0
+          }
+        }
+        pos++
+      }
+      return 0
+    }
+    function parse_number(    rest) {
+      rest = substr(text, pos)
+      if (!match(rest, /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/)) return 0
+      pos += RLENGTH
+      return 1
+    }
+    function parse_literal(literal) {
+      if (substr(text, pos, length(literal)) != literal) return 0
+      pos += length(literal)
+      return 1
+    }
+    function parse_array(    c) {
+      pos++
+      skip_ws()
+      if (substr(text, pos, 1) == "]") { pos++; return 1 }
+      while (1) {
+        if (!parse_value()) return 0
+        skip_ws()
+        c = substr(text, pos, 1)
+        if (c == "]") { pos++; return 1 }
+        if (c != ",") return 0
+        pos++
+        skip_ws()
+      }
+    }
+    function parse_object(    c) {
+      pos++
+      skip_ws()
+      if (substr(text, pos, 1) == "}") { pos++; return 1 }
+      while (1) {
+        if (!parse_string()) return 0
+        skip_ws()
+        if (substr(text, pos, 1) != ":") return 0
+        pos++
+        if (!parse_value()) return 0
+        skip_ws()
+        c = substr(text, pos, 1)
+        if (c == "}") { pos++; return 1 }
+        if (c != ",") return 0
+        pos++
+        skip_ws()
+      }
+    }
+    function parse_value(    c, ok) {
+      skip_ws()
+      c = substr(text, pos, 1)
+      if (c == "{" || c == "[") {
+        depth++
+        if (depth > 64) return 0
+        ok = (c == "{") ? parse_object() : parse_array()
+        depth--
+        return ok
+      }
+      if (c == "\"") return parse_string()
+      if (c == "t") return parse_literal("true")
+      if (c == "f") return parse_literal("false")
+      if (c == "n") return parse_literal("null")
+      return parse_number()
+    }
+    {
+      text = text $0 "\n"
+    }
+    END {
+      pos = 1
+      skip_ws()
+      if (substr(text, pos, 1) != "{") exit 1
+      if (!parse_value()) exit 1
+      skip_ws()
+      exit(pos == length(text) + 1 ? 0 : 1)
+    }
+  ' "$1"
+}
+
+# Forward one valid JSON object from a successful tracker. Any child failure or malformed output
+# degrades to the empty result so a broken tracker cannot make the fail-closed preToolUse hook deny
+# unrelated work.
+dispatch() {
+  local script="$1" output_file status
+  [ -f "$script" ] || emit_empty
+  output_file="$(mktemp "${TMPDIR:-/tmp}/autodev-router-output-XXXXXX")" || emit_empty
+  if printf '%s' "$RAW_INPUT" | bash "$script" "$EVENT_NAME" > "$output_file" 2>/dev/null; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -ne 0 ]; then
+    rm -f "$output_file"
+    emit_empty
+  fi
+  if ! is_strict_json_object "$output_file"; then
+    rm -f "$output_file"
+    emit_empty
+  fi
+  cat "$output_file"
+  rm -f "$output_file"
+  printf '\n'
   exit 0
 }
 

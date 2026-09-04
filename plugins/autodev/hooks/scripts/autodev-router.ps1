@@ -338,6 +338,150 @@ function Write-CrossWorkflowDenial {
     exit 0
 }
 
+function Test-StrictJsonObject {
+    param([string]$Json)
+    if ([string]::IsNullOrWhiteSpace($Json)) { return $false }
+
+    # PowerShell 5.1's ConvertFrom-Json accepts JavaScript extensions such as NaN, Infinity,
+    # unquoted keys, and malformed numbers. Parse the JSON grammar directly without converting
+    # numbers to floating point, so valid large exponents remain valid.
+    $state = @{ Text = $Json; Index = 0; Depth = 0 }
+    $skipWhitespace = {
+        while ($state.Index -lt $state.Text.Length) {
+            $character = $state.Text[$state.Index]
+            if ($character -ne ' ' -and $character -ne "`t" -and
+                $character -ne "`r" -and $character -ne "`n") {
+                break
+            }
+            $state.Index += 1
+        }
+    }
+    $parseString = {
+        if ($state.Index -ge $state.Text.Length -or $state.Text[$state.Index] -ne '"') {
+            return $false
+        }
+        $state.Index += 1
+        while ($state.Index -lt $state.Text.Length) {
+            $character = $state.Text[$state.Index]
+            if ($character -eq '"') {
+                $state.Index += 1
+                return $true
+            }
+            if ([int][char]$character -lt 32) { return $false }
+            if ($character -eq '\') {
+                $state.Index += 1
+                if ($state.Index -ge $state.Text.Length) { return $false }
+                $escape = $state.Text[$state.Index]
+                if ($escape -eq 'u') {
+                    for ($digit = 0; $digit -lt 4; $digit++) {
+                        $state.Index += 1
+                        if ($state.Index -ge $state.Text.Length -or
+                            $state.Text[$state.Index] -notmatch '^[0-9A-Fa-f]$') {
+                            return $false
+                        }
+                    }
+                }
+                elseif ('"\/bfnrt'.IndexOf($escape) -lt 0) {
+                    return $false
+                }
+            }
+            $state.Index += 1
+        }
+        return $false
+    }
+    $parseNumber = {
+        $remaining = $state.Text.Substring($state.Index)
+        $match = [regex]::Match(
+            $remaining,
+            '^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?'
+        )
+        if (-not $match.Success) { return $false }
+        $state.Index += $match.Length
+        return $true
+    }
+    $parseLiteral = {
+        param([string]$Literal)
+        if ($state.Index + $Literal.Length -gt $state.Text.Length -or
+            $state.Text.Substring($state.Index, $Literal.Length) -ne $Literal) {
+            return $false
+        }
+        $state.Index += $Literal.Length
+        return $true
+    }
+    $parseValue = $null
+    $parseArray = {
+        $state.Index += 1
+        & $skipWhitespace
+        if ($state.Index -lt $state.Text.Length -and $state.Text[$state.Index] -eq ']') {
+            $state.Index += 1
+            return $true
+        }
+        while ($true) {
+            if (-not (& $parseValue)) { return $false }
+            & $skipWhitespace
+            if ($state.Index -ge $state.Text.Length) { return $false }
+            if ($state.Text[$state.Index] -eq ']') {
+                $state.Index += 1
+                return $true
+            }
+            if ($state.Text[$state.Index] -ne ',') { return $false }
+            $state.Index += 1
+            & $skipWhitespace
+        }
+    }
+    $parseObject = {
+        $state.Index += 1
+        & $skipWhitespace
+        if ($state.Index -lt $state.Text.Length -and $state.Text[$state.Index] -eq '}') {
+            $state.Index += 1
+            return $true
+        }
+        while ($true) {
+            if (-not (& $parseString)) { return $false }
+            & $skipWhitespace
+            if ($state.Index -ge $state.Text.Length -or $state.Text[$state.Index] -ne ':') {
+                return $false
+            }
+            $state.Index += 1
+            if (-not (& $parseValue)) { return $false }
+            & $skipWhitespace
+            if ($state.Index -ge $state.Text.Length) { return $false }
+            if ($state.Text[$state.Index] -eq '}') {
+                $state.Index += 1
+                return $true
+            }
+            if ($state.Text[$state.Index] -ne ',') { return $false }
+            $state.Index += 1
+            & $skipWhitespace
+        }
+    }
+    $parseValue = {
+        & $skipWhitespace
+        if ($state.Index -ge $state.Text.Length) { return $false }
+        $character = $state.Text[$state.Index]
+        if ($character -eq '{' -or $character -eq '[') {
+            $state.Depth += 1
+            if ($state.Depth -gt 64) { return $false }
+            $parsed = if ($character -eq '{') { & $parseObject } else { & $parseArray }
+            $state.Depth -= 1
+            return $parsed
+        }
+        if ($character -eq '"') { return & $parseString }
+        if ($character -eq 't') { return & $parseLiteral 'true' }
+        if ($character -eq 'f') { return & $parseLiteral 'false' }
+        if ($character -eq 'n') { return & $parseLiteral 'null' }
+        return & $parseNumber
+    }
+
+    & $skipWhitespace
+    if ($state.Index -ge $state.Text.Length -or $state.Text[$state.Index] -ne '{') {
+        return $false
+    }
+    if (-not (& $parseValue)) { return $false }
+    & $skipWhitespace
+    return $state.Index -eq $state.Text.Length
+}
+
 # Forward the untouched payload to the chosen tracker over an isolated child process and pass its
 # result back verbatim. Running the tracker as a child keeps this router's stdout clean and lets
 # the tracker read the payload from its own stdin exactly as it would when invoked directly.
@@ -366,7 +510,12 @@ function Invoke-Tracker {
         $null = $proc.StandardError.ReadToEnd()
         $proc.WaitForExit()
 
-        if ([string]::IsNullOrWhiteSpace($out)) { Write-EmptyResult }
+        if ($proc.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($out)) {
+            Write-EmptyResult
+        }
+        if (-not (Test-StrictJsonObject $out)) {
+            Write-EmptyResult
+        }
         Write-Output ($out.TrimEnd("`r", "`n"))
         exit 0
     }

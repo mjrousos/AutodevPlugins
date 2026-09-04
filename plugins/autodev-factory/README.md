@@ -78,7 +78,9 @@ keep in sync by hand.
 ## Installation
 
 The factory ships as a Copilot CLI **extension**, because an Agent Factory has to be registered
-from code. There are two ways to get it, and they trade off differently.
+from code. Extensions are experimental: start with `copilot --experimental` or run
+`/experimental on` before installing or reloading one. There are two installation routes, and they
+trade off differently.
 
 **As a plugin** (`plugin.json` declares `"extensions": ["extensions/"]`, which the CLI honours —
 see the [plugin reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-plugin-reference)):
@@ -114,8 +116,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File plugins\autodev-factory\inst
 powershell -NoProfile -ExecutionPolicy Bypass -File plugins\autodev-factory\install.ps1 -Scope Project
 ```
 
-Then run `/extensions` in the CLI (or restart it). `autodev-factory` becomes available to `run_factory`.
-To remove it: `install.sh --uninstall` or `install.ps1 -Uninstall`.
+Then run `/extensions` in an experimental-enabled CLI (or restart it with `copilot --experimental`).
+`autodev-factory` becomes available to `run_factory`. To remove it: `install.sh --uninstall` or
+`install.ps1 -Uninstall`.
 
 You do not need the `autodev` plugin installed to use this — the instructions are
 baked into the extension.

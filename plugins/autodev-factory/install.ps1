@@ -8,8 +8,8 @@
     depends on the CLI version, so this script exists to make the outcome certain either way: it
     copies the extension into one of the two directories the CLI is guaranteed to scan.
 
-    After installing, run /extensions in the CLI (or restart it) and the 'autodev-factory' factory becomes
-    available to run_factory.
+    After installing, enable experimental features and run /extensions (or restart with
+    'copilot --experimental') so the 'autodev-factory' factory becomes available to run_factory.
 
 .PARAMETER Scope
     'User' (default) installs to the Copilot home. 'Project' installs into the current repository's
@@ -98,4 +98,4 @@ foreach ($file in $required) {
 }
 
 Write-Host "installed autodev-factory extension -> $targetDir"
-Write-Host "run /extensions in Copilot CLI (or restart it), then invoke the 'autodev-factory' factory."
+Write-Host "enable experimental features, then run /extensions (or restart with 'copilot --experimental') and invoke the 'autodev-factory' factory."

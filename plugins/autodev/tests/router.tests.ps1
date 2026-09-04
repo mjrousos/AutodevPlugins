@@ -321,6 +321,64 @@ try {
     Assert-Empty "ask_user with no active workflow is ignored" `
         (Invoke-Router 'preToolUse' '{"sessionId":"nostate","cwd":"","toolName":"ask_user"}')
 
+    # --- tracker failures and malformed output fail open ---------------------------------------
+
+    Set-Content -LiteralPath (Join-Path $script:Sandbox 'autodev-gates.ps1') -Encoding UTF8 -Value @'
+param([string]$EventName)
+Write-Output '{"partial":'
+exit 1
+'@
+    Assert-Empty "a failing tracker with partial output degrades to empty JSON" `
+        (Invoke-Router 'subagentStart' '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')
+
+    Set-Content -LiteralPath (Join-Path $script:Sandbox 'autodev-gates.ps1') -Encoding UTF8 -Value @'
+param([string]$EventName)
+Write-Output '{}'
+Write-Output '{}'
+'@
+    Assert-Empty "multiple tracker JSON values degrade to empty JSON" `
+        (Invoke-Router 'subagentStart' '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')
+
+    foreach ($malformed in @(
+            '{"x":NaN}', '{"x":Infinity}', '{x:1}', '{true:1}',
+            '{"x":+1}', '{"x":01}', '{"x":.1}', '{"x":1.}', '{"x":"\q"}'
+        )) {
+        Set-Content -LiteralPath (Join-Path $script:Sandbox 'autodev-gates.ps1') -Encoding UTF8 -Value @"
+param([string]`$EventName)
+Write-Output '$malformed'
+"@
+        Assert-Empty "nonstandard tracker JSON '$malformed' degrades to empty JSON" `
+            (Invoke-Router 'subagentStart' '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')
+    }
+
+    Set-Content -LiteralPath (Join-Path $script:Sandbox 'autodev-gates.ps1') -Encoding UTF8 -Value @'
+param([string]$EventName)
+Write-Output '{"routed":"gates","text":"quoted \"value\"","flags":[true,false,null],"number":1e400}'
+'@
+    Assert-Routed "strict valid JSON with escapes, literals, and a large exponent is forwarded" 'gates' `
+        (Invoke-Router 'subagentStart' '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')
+
+    Set-Content -LiteralPath (Join-Path $script:Sandbox 'autodev-gates.ps1') -Encoding UTF8 -Value @'
+param([string]$EventName)
+Write-Output ('{"routed":"gates","text":"a' + [char]127 + 'b"}')
+'@
+    Assert-Routed "a valid DEL character inside a JSON string is forwarded" 'gates' `
+        (Invoke-Router 'subagentStart' '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')
+
+    Set-Content -LiteralPath (Join-Path $script:Sandbox 'autodev-gates.ps1') -Encoding UTF8 -Value @'
+param([string]$EventName)
+Write-Output ('{"routed":"gates","text":"a' + [char]0 + 'b"}')
+'@
+    Assert-Empty "an unescaped NUL character in tracker output degrades to empty JSON" `
+        (Invoke-Router 'subagentStart' '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')
+
+    Set-Content -LiteralPath (Join-Path $script:Sandbox 'autodev-gates.ps1') -Encoding UTF8 -Value @'
+param([string]$EventName)
+Write-Output ('{}' + [char]0 + 'garbage')
+'@
+    Assert-Empty "a NUL after a complete object cannot hide trailing output" `
+        (Invoke-Router 'subagentStart' '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')
+
     # --- fail-safe: malformed input never produces anything but the empty result --------------
 
     Reset-State

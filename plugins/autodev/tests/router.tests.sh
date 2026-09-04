@@ -286,6 +286,61 @@ reset_state
 assert_empty "ask_user with no active workflow is ignored" \
   "$(route preToolUse '{"sessionId":"nostate","cwd":"","toolName":"ask_user"}')"
 
+# --- tracker failures and malformed output fail open -----------------------------------------
+
+cat > "$SANDBOX/autodev-gates.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '{"partial":'
+exit 1
+STUB
+assert_empty "a failing tracker with partial output degrades to empty JSON" \
+  "$(route subagentStart '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')"
+
+cat > "$SANDBOX/autodev-gates.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '{}\n{}\n'
+STUB
+assert_empty "multiple tracker JSON values degrade to empty JSON" \
+  "$(route subagentStart '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')"
+
+for malformed in \
+  '{"x":NaN}' '{"x":Infinity}' '{x:1}' '{true:1}' \
+  '{"x":+1}' '{"x":01}' '{"x":.1}' '{"x":1.}' \
+  '{"x":"\q"}'; do
+  printf '#!/usr/bin/env bash\nprintf %s %s\n' "'%s'" "'$malformed'" \
+    > "$SANDBOX/autodev-gates.sh"
+  assert_empty "nonstandard tracker JSON '$malformed' degrades to empty JSON" \
+    "$(route subagentStart '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')"
+done
+
+cat > "$SANDBOX/autodev-gates.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s' '{"routed":"gates","text":"quoted \"value\"","flags":[true,false,null],"number":1e400}'
+STUB
+assert_routed "strict valid JSON with escapes, literals, and a large exponent is forwarded" gates \
+  "$(route subagentStart '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')"
+
+cat > "$SANDBOX/autodev-gates.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '{"routed":"gates","text":"a\177b"}'
+STUB
+assert_routed "a valid DEL character inside a JSON string is forwarded" gates \
+  "$(route subagentStart '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')"
+
+cat > "$SANDBOX/autodev-gates.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '{"routed":"gates","text":"a\000b"}'
+STUB
+assert_empty "an unescaped NUL byte in tracker output degrades to empty JSON" \
+  "$(route subagentStart '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')"
+
+cat > "$SANDBOX/autodev-gates.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '{}\000garbage'
+STUB
+assert_empty "a NUL after a complete object cannot hide trailing output" \
+  "$(route subagentStart '{"sessionId":"s","cwd":"","agentName":"autodev:autodev-security-review"}')"
+
 # --- fail-safe: malformed input never produces anything but the empty result ----------------
 
 reset_state

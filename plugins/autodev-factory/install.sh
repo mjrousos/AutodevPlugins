@@ -11,8 +11,8 @@
 #   plugins/autodev-factory/install.sh --project    install into this repository (.github/extensions)
 #   plugins/autodev-factory/install.sh --uninstall  remove a user-scope install
 #
-# After installing, run /extensions in the CLI (or restart it) and the `autodev-factory` factory becomes
-# available to run_factory.
+# After installing, enable experimental features and run /extensions (or restart with
+# `copilot --experimental`) so the `autodev-factory` factory becomes available to run_factory.
 
 set -u
 
@@ -100,4 +100,4 @@ for file in extension.mjs prompts.generated.mjs; do
 done
 
 echo "installed autodev-factory extension -> $TARGET_DIR"
-echo "run /extensions in Copilot CLI (or restart it), then invoke the 'autodev-factory' factory."
+echo "enable experimental features, then run /extensions (or restart with 'copilot --experimental') and invoke the 'autodev-factory' factory."

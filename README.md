@@ -45,15 +45,23 @@ an installation it recognizes at `extensions/autodev` before installing the rena
 `autodev` installs its two agents (`autodev-plan` and `autodev-implement`) under the shared
 `autodev:` namespace, along with the review-gate and implementation-stage hooks.
 
-`autodev-factory` is an extension, not an agent bundle, so — in addition to being listed in the
-marketplace — it is installed from code into a directory the CLI scans for extensions:
+`autodev-factory` is an extension and supports two installation routes. For team distribution,
+enable experimental features (`copilot --experimental` or `/experimental on`), install it from the
+marketplace, then restart the CLI because plugin-contributed extensions are loaded at startup:
+
+```
+/plugin install autodev-factory@autodev-plugins
+```
+
+For a direct installation, enable experimental features, copy it into a directory the CLI scans,
+then reload it during development with `/extensions`:
 
 ```
 plugins/autodev-factory/install.sh          # or install.ps1 on Windows
 ```
 
-After installing, run `/extensions` in the CLI (or restart it) and invoke the `autodev-factory`
-factory with `run_factory`. See [its README](./plugins/autodev-factory/README.md).
+Then invoke the `autodev-factory` factory with `run_factory`. See
+[its README](./plugins/autodev-factory/README.md).
 
 ## Namespaces
 
