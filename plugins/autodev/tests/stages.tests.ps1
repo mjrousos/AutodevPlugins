@@ -222,6 +222,7 @@ function Set-ImplState {
         createdAt           = (Get-Date).ToUniversalTime().ToString('o')
         updatedAt           = (Get-Date).ToUniversalTime().ToString('o')
         blocks              = 0
+        needsUserReached    = 0
         totalInvocations    = 0
         taskingAttempts     = 0
         taskingVerdict      = 'pending'
@@ -406,6 +407,49 @@ foreach ($case in $reviewVerdictCases) {
         $footer = Get-Footer (Stop-Agent -SessionId $sid -Agent 'code-review' -Response $c.Body)
         Assert-Match "Recorded verdict: $($c.Expect)" $footer
     }.GetNewClosure()
+}
+
+Test-Case 'security NEEDS-USER pauses, stops cleanly, and resumes only the same review' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'security'
+    Start-Agent -SessionId $sid -Agent 'code-security-review'
+    $footer = Get-Footer (Stop-Agent -SessionId $sid -Agent 'code-security-review' -Response @'
+### [major] Owner approval is required
+
+## Required user action
+
+The service owner must complete an external approval and record durable evidence.
+
+AUTODEV-VERDICT: NEEDS-USER
+'@)
+    Assert-Match 'Recorded verdict: NEEDS-USER' $footer
+    Assert-Match 'Stop now and explain the required user action' $footer
+
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    $state.totalInvocations = Get-MaxTotal
+    Set-Content -LiteralPath (Get-StatePath $sid) -Value ($state | ConvertTo-Json -Depth 5) -Encoding UTF8
+
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-fix')
+    $unrelatedArgs = @{ agent_type = 'explore' } | ConvertTo-Json -Compress
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $unrelatedArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
+    Assert-Equal '{}' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-privacy-review')
+
+    $resumed = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-security-review' -Verdict 'PASS')
+    Assert-Match 'autodev-code-privacy-review' $resumed
+}
+
+Test-Case 'milestone code review NEEDS-USER fails safe as ISSUES' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE' | Out-Null
+    Invoke-Round -SessionId $sid -Agent 'implementation' -Verdict 'DONE' | Out-Null
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-review' -Verdict 'NEEDS-USER')
+    Assert-Match 'Recorded verdict: ISSUES' $footer
 }
 
 $workerVerdictCases = @(

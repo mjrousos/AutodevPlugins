@@ -612,6 +612,71 @@ async function writeStatus(run) {
     await writeFile(run.statusPath, `${JSON.stringify(status, null, 2)}\n`, "utf8").catch(() => {});
 }
 
+async function loadNeedsUserResume(run, userEvidence) {
+    const evidence = asText(userEvidence).trim();
+    if (!evidence) {
+        return { error: "resumeNeedsUser requires non-empty userEvidence describing the completed action, decision, or proof." };
+    }
+
+    let prior;
+    try {
+        prior = JSON.parse(await readFile(run.statusPath, "utf8"));
+    } catch {
+        return { error: `No readable paused factory status was found at ${run.statusPath}.` };
+    }
+    if (!prior || typeof prior !== "object" || Array.isArray(prior) || !prior.gates || typeof prior.gates !== "object") {
+        return { error: `The factory status at ${run.statusPath} does not contain resumable gate state.` };
+    }
+    if (
+        (typeof prior.planPath === "string" && resolve(prior.planPath) !== run.planPath) ||
+        (typeof prior.todosPath === "string" && resolve(prior.todosPath) !== run.todosPath)
+    ) {
+        return { error: "The paused factory status belongs to different plan or todo artifacts." };
+    }
+
+    const candidates = [
+        { flow: "plan", key: "security", title: "Security", prompt: "autodev-security-review" },
+        { flow: "plan", key: "privacy", title: "Privacy", prompt: "autodev-privacy-review" },
+        {
+            flow: "final",
+            key: "codeSecurity",
+            phase: "Code security review",
+            title: "security",
+            prompt: "autodev-code-security-review",
+        },
+        {
+            flow: "final",
+            key: "codePrivacy",
+            phase: "Code privacy review",
+            title: "privacy",
+            prompt: "autodev-code-privacy-review",
+        },
+    ];
+    const waiting = candidates.filter((candidate) => prior.gates[candidate.key]?.status === "needs-user");
+    if (waiting.length !== 1) {
+        return { error: `Expected exactly one NEEDS-USER review in ${run.statusPath}, but found ${waiting.length}.` };
+    }
+
+    const resume = waiting[0];
+    const priorOutcome = prior.gates[resume.key];
+    run.gates = { ...prior.gates };
+    run.milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
+    run.notes = Array.isArray(prior.notes) ? [...prior.notes] : [];
+    run.violations = Array.isArray(prior.violations) ? [...prior.violations] : [];
+    run.project.context = "Existing Autodev artifacts; resuming the paused reviewer before any other agent.";
+    if (!run.request) run.request = `the existing plan at ${run.planPath}`;
+
+    const findings = asText(priorOutcome.findings).trim() || "The prior reviewer paused for required user action.";
+    resume.previousFindings = [
+        findings,
+        "",
+        "## User-provided decision, action, or evidence",
+        "",
+        evidence,
+    ].join("\n");
+    return resume;
+}
+
 /* -------------------------------------------------------------------------------------------
  * Subagent invocation.
  * ------------------------------------------------------------------------------------------- */
@@ -1411,22 +1476,37 @@ async function approvePlan(ctx, run) {
  * Sequential, deliberately: each reviewer should see the plan as amended by the previous one.
  * ------------------------------------------------------------------------------------------- */
 
-async function runPlanGates(ctx, run) {
-    for (const gate of PLAN_GATES) {
+async function runPlanGates(ctx, run, { startKey = null, previousFindings = null } = {}) {
+    const startIndex = startKey ? PLAN_GATES.findIndex((gate) => gate.key === startKey) : 0;
+    if (startIndex < 0) return { stop: `Unknown plan review resume target: ${startKey}.` };
+    for (const [index, gate] of PLAN_GATES.entries()) {
+        if (index < startIndex) continue;
         setPhase(ctx, run, `${gate.title} gate`);
-        const outcome = await runPlanGate(ctx, run, gate);
+        const outcome = await runPlanGate(ctx, run, gate, {
+            previousFindings: gate.key === startKey ? previousFindings : null,
+        });
         run.gates[gate.key] = outcome;
         await writeStatus(run);
         if (outcome.status === "stopped") {
             return { stop: `The ${gate.title.toLowerCase()} gate was stopped by you.` };
         }
+        if (outcome.status === "needs-user") {
+            return {
+                needsUser: true,
+                stop:
+                    `The ${gate.title.toLowerCase()} gate requires an authorized decision or external action. ` +
+                    `No revision agent was run. Review the required action in ${run.feedbackPath}, complete it, ` +
+                    `then start a new factory run with resumeNeedsUser: true and userEvidence so this same gate ` +
+                    `can verify the new evidence before any other agent runs.`,
+            };
+        }
     }
     return {};
 }
 
-async function runPlanGate(ctx, run, gate) {
+async function runPlanGate(ctx, run, gate, { previousFindings: initialPreviousFindings = null } = {}) {
     const guard = () => fileSnapshot(run.planPath);
-    let previousFindings = null;
+    let previousFindings = initialPreviousFindings;
     let guidance = "";
     let escalations = 0;
     let attempt = 0;
@@ -1462,6 +1542,13 @@ async function runPlanGate(ctx, run, gate) {
         if (review.verdict === "PASS" && !review.violated && !review.unverified) {
             ctx.log(`${gate.title} gate passed on attempt ${attempt}`);
             return { status: "passed", attempts: attempt };
+        }
+        if (
+            review.verdict === "NEEDS-USER" &&
+            gate.key !== "architecture"
+        ) {
+            ctx.log(`${gate.title} gate requires user action; stopping without invoking a revision agent`);
+            return { status: "needs-user", attempts: attempt, findings: review.response };
         }
 
         // A reviewer that edited the plan it was reviewing does not get to approve the result of
@@ -1555,7 +1642,8 @@ function buildGateTask(run, gate, attempt, budget, previousFindings, guidance) {
             ``,
             `## Previous findings`,
             ``,
-            `Your previous review raised the findings below. The plan has been revised in response.`,
+            `Your previous review raised the findings below. The plan has been revised in response, or`,
+            `the user has supplied the required decision, completed external action, or evidence below.`,
             `Focus on verifying that each was genuinely addressed. Raise a new finding only if it is`,
             `blocker or major and the plan introduced it, worsened it, or it directly affects behavior`,
             `added or changed by the plan.`,
@@ -1927,8 +2015,9 @@ function buildCodeReviewTask(run, { scope, changedAreas, round, budget, previous
             ``,
             `## Previous findings`,
             ``,
-            `Your previous review raised the findings below. They have since been addressed. Verify each`,
-            `was genuinely fixed, and review the current state of the code as a whole.`,
+            `Your previous review raised the findings below. They have since been addressed, or the user`,
+            `has supplied the required decision, completed external action, or evidence below. Verify each`,
+            `was genuinely resolved, and review the current state of the code as a whole.`,
             ``,
             truncate(previousFindings, 12000),
         );
@@ -2085,22 +2174,37 @@ const FINAL_REVIEWS = Object.freeze([
     { key: "codePrivacy", phase: "Code privacy review", title: "privacy", prompt: "autodev-code-privacy-review" },
 ]);
 
-async function runFinalReviews(ctx, run) {
-    for (const review of FINAL_REVIEWS) {
+async function runFinalReviews(ctx, run, { startKey = null, previousFindings = null } = {}) {
+    const startIndex = startKey ? FINAL_REVIEWS.findIndex((review) => review.key === startKey) : 0;
+    if (startIndex < 0) return { stop: `Unknown final review resume target: ${startKey}.` };
+    for (const [index, review] of FINAL_REVIEWS.entries()) {
+        if (index < startIndex) continue;
         setPhase(ctx, run, review.phase);
-        const outcome = await runFinalReview(ctx, run, review);
+        const outcome = await runFinalReview(ctx, run, review, {
+            previousFindings: review.key === startKey ? previousFindings : null,
+        });
         run.gates[review.key] = outcome;
         await writeStatus(run);
         if (outcome.status === "stopped") {
             return { stop: `The ${review.title} review was stopped by you.` };
         }
+        if (outcome.status === "needs-user") {
+            return {
+                needsUser: true,
+                stop:
+                    `The ${review.title} review requires an authorized decision or external action. ` +
+                    `No fix agent was run. Review the required action in ${run.feedbackPath}, complete it, ` +
+                    `then start a new factory run with resumeNeedsUser: true and userEvidence so this same reviewer ` +
+                    `can verify the new evidence before any other agent runs.`,
+            };
+        }
     }
     return {};
 }
 
-async function runFinalReview(ctx, run, review) {
+async function runFinalReview(ctx, run, review, { previousFindings: initialPreviousFindings = null } = {}) {
     const guard = () => codeSnapshot(run.repoRoot, [run.planPath, run.todosPath]);
-    let previousFindings = null;
+    let previousFindings = initialPreviousFindings;
     let guidance = "";
     let escalations = 0;
     let round = 0;
@@ -2130,6 +2234,10 @@ async function runFinalReview(ctx, run, review) {
         if (result.verdict === "PASS" && !result.violated && !result.unverified) {
             ctx.log(`${review.title} review passed on round ${round}`);
             return { status: "passed", attempts: round };
+        }
+        if (result.verdict === "NEEDS-USER") {
+            ctx.log(`${review.title} review requires user action; stopping without invoking a fix agent`);
+            return { status: "needs-user", attempts: round, findings: result.response };
         }
         // Same rule as the gates: it reviewed its own edit, or its restraint could not be
         // checked, so the PASS does not stand.
@@ -2190,6 +2298,7 @@ function gateLine(title, outcome) {
     if (!outcome) return `- ${title}: not run`;
     if (outcome.status === "passed") return `- ${title}: passed on attempt ${outcome.attempts}`;
     if (outcome.status === "stopped") return `- ${title}: stopped by the user after ${outcome.attempts} attempts`;
+    if (outcome.status === "needs-user") return `- ${title}: **waiting for required user action** after attempt ${outcome.attempts}`;
     return `- ${title}: **escalated** after ${outcome.attempts} attempts (${outcome.reason})`;
 }
 
@@ -2302,6 +2411,8 @@ const autodevFactory = defineFactory({
             '  planPath?: string     — where the plan goes. Defaults to <repoRoot>/.autodev/plan.md.',
             '  todosPath?: string    — where the todo list goes. Defaults to <repoRoot>/.autodev/todos.md.',
             '  startAt?: "plan" | "implement" — "implement" skips planning and uses the existing plan. Defaults to "plan".',
+            "  resumeNeedsUser?: boolean — resume the single NEEDS-USER review recorded in factory-status.json.",
+            "  userEvidence?: string — required with resumeNeedsUser; the completed action, decision, or durable evidence.",
             "  clarifyRounds?: number — how many rounds of clarifying questions to allow, 0-4. Defaults to 3.",
             "}",
             "",
@@ -2342,9 +2453,74 @@ const autodevFactory = defineFactory({
         };
 
         const startAt = args.startAt === "implement" ? "implement" : "plan";
+        const resume = args.resumeNeedsUser === true ? await loadNeedsUserResume(run, args.userEvidence) : null;
+        if (resume?.error) {
+            return {
+                status: "needs-user",
+                reason: resume.error,
+                repoRoot: run.repoRoot,
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                statusPath: run.statusPath,
+            };
+        }
+        if (resume && !(await fileExists(run.planPath))) {
+            return {
+                status: "needs-user",
+                reason: `The paused review cannot resume because the plan is missing at ${run.planPath}.`,
+                repoRoot: run.repoRoot,
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                statusPath: run.statusPath,
+            };
+        }
+        if (resume?.flow === "final" && !(await fileExists(run.todosPath))) {
+            return {
+                status: "needs-user",
+                reason: `The paused implementation review cannot resume because the todo list is missing at ${run.todosPath}.`,
+                repoRoot: run.repoRoot,
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                statusPath: run.statusPath,
+            };
+        }
+
+        if (resume?.flow === "final") {
+            run.notes.push(`Resumed the paused ${resume.title} review with user-provided evidence before invoking any other agent.`);
+            const finalReviews = await runFinalReviews(ctx, run, {
+                startKey: resume.key,
+                previousFindings: resume.previousFindings,
+            });
+            if (finalReviews.stop) {
+                return wrapup(ctx, run, {
+                    status: finalReviews.needsUser ? "needs-user" : "implemented",
+                    reason: finalReviews.stop,
+                });
+            }
+            const clean =
+                run.gates.codeSecurity?.status === "passed" &&
+                run.gates.codePrivacy?.status === "passed" &&
+                run.milestones.every((milestone) => !milestone.unresolvedFindings);
+            return wrapup(ctx, run, {
+                status: clean ? "completed" : "completed-with-findings",
+                reason: clean ? null : "some reviews did not reach a PASS — see the notes",
+            });
+        }
 
         // --- Planning -------------------------------------------------------------------
-        if (startAt === "plan") {
+        if (resume?.flow === "plan") {
+            run.notes.push(`Resumed the paused ${resume.title} gate with user-provided evidence before invoking any other agent.`);
+            const gated = await runPlanGates(ctx, run, {
+                startKey: resume.key,
+                previousFindings: resume.previousFindings,
+            });
+            if (gated.stop) {
+                return wrapup(ctx, run, {
+                    status: gated.needsUser ? "needs-user" : "plan-incomplete",
+                    reason: gated.stop,
+                });
+            }
+        } else if (startAt === "plan") {
             const intakeResult = await intake(ctx, run, { requireRequest: true });
             if (intakeResult.stop) return wrapup(ctx, run, { status: "stopped", reason: intakeResult.stop });
 
@@ -2357,7 +2533,12 @@ const autodevFactory = defineFactory({
             if (approved.stop) return wrapup(ctx, run, { status: "plan-drafted", reason: approved.stop });
 
             const gated = await runPlanGates(ctx, run);
-            if (gated.stop) return wrapup(ctx, run, { status: "plan-incomplete", reason: gated.stop });
+            if (gated.stop) {
+                return wrapup(ctx, run, {
+                    status: gated.needsUser ? "needs-user" : "plan-incomplete",
+                    reason: gated.stop,
+                });
+            }
         } else {
             // Implementing an existing plan needs no feature description: the plan is the brief.
             const intakeResult = await intake(ctx, run, { requireRequest: false });
@@ -2373,7 +2554,7 @@ const autodevFactory = defineFactory({
         }
 
         // --- The handoff ----------------------------------------------------------------
-        if (startAt === "plan") {
+        if (startAt === "plan" || resume?.flow === "plan") {
             const decision = await handoff(ctx, run);
             if (!decision.proceed) {
                 return wrapup(ctx, run, { status: "plan-complete", reason: decision.reason });
@@ -2391,7 +2572,12 @@ const autodevFactory = defineFactory({
         if (checkpoint.stop) return wrapup(ctx, run, { status: "implemented", reason: checkpoint.stop });
 
         const finalReviews = await runFinalReviews(ctx, run);
-        if (finalReviews.stop) return wrapup(ctx, run, { status: "implemented", reason: finalReviews.stop });
+        if (finalReviews.stop) {
+            return wrapup(ctx, run, {
+                status: finalReviews.needsUser ? "needs-user" : "implemented",
+                reason: finalReviews.stop,
+            });
+        }
 
         const clean =
             run.gates.codeSecurity?.status === "passed" &&
@@ -2432,6 +2618,8 @@ export {
     questionsToSchema,
     readVerdict,
     resolveUnder,
+    runFinalReview,
+    runPlanGate,
     sanitizeKey,
     truncate,
 };

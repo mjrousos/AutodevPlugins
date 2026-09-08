@@ -12,9 +12,15 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 
 process.env.AUTODEV_FACTORY_TEST = "1";
+
+const execFileAsync = promisify(execFile);
 
 const {
     artifactPaths,
@@ -27,6 +33,8 @@ const {
     questionsToSchema,
     readVerdict,
     resolveUnder,
+    runFinalReview,
+    runPlanGate,
     sanitizeKey,
     truncate,
 } = await import("../extensions/autodev-factory/extension.mjs");
@@ -38,6 +46,7 @@ const {
 test("readVerdict reads a well-formed trailing verdict", () => {
     assert.equal(readVerdict("## Findings\n\nNone.\n\nAUTODEV-VERDICT: PASS"), "PASS");
     assert.equal(readVerdict("blah\nAUTODEV-VERDICT: ISSUES\n"), "ISSUES");
+    assert.equal(readVerdict("AUTODEV-VERDICT: NEEDS-USER"), "NEEDS-USER");
     assert.equal(readVerdict("AUTODEV-VERDICT: DONE"), "DONE");
     assert.equal(readVerdict("AUTODEV-VERDICT: BLOCKED"), "BLOCKED");
 });
@@ -88,6 +97,185 @@ test("readVerdict refuses a verdict that is not the last thing in the response",
     assert.equal(readVerdict(response), null);
     // Trailing whitespace and blank lines are still a trailing verdict.
     assert.equal(readVerdict("## Findings\n\nNone.\n\nAUTODEV-VERDICT: PASS\n\n   \n"), "PASS");
+});
+
+async function createReviewRun() {
+    const repoRoot = await mkdtemp(join(tmpdir(), "autodev-factory-review-"));
+    const paths = artifactPaths(repoRoot);
+    await mkdir(resolve(repoRoot, ".autodev"), { recursive: true });
+    await writeFile(paths.planPath, "# Plan\n", "utf8");
+    await writeFile(paths.todosPath, "# Todos\n", "utf8");
+    await execFileAsync("git", ["init", "--quiet"], { cwd: repoRoot });
+    return {
+        repoRoot,
+        ...paths,
+        runId: "test-run",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        phase: "test",
+        request: "test feature",
+        project: { context: "test project", build: "none", test: "none", conventions: "" },
+        planReviewerCalls: 0,
+        subagentCalls: 0,
+        attempts: [],
+        violations: [],
+        gates: {},
+        milestones: [],
+        notes: [],
+    };
+}
+
+test("plan NEEDS-USER stops before a reviser even when the reviewer changed the plan", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    const labels = [];
+    const ctx = {
+        log() {},
+        async agent(_prompt, options) {
+            labels.push(options.label);
+            await writeFile(run.planPath, "# Reviewer changed this plan\n", "utf8");
+            return "## Required user action\n\nOwner approval is required.\n\nAUTODEV-VERDICT: NEEDS-USER";
+        },
+    };
+
+    const outcome = await runPlanGate(ctx, run, {
+        key: "security",
+        title: "Security",
+        prompt: "autodev-security-review",
+    });
+
+    assert.equal(outcome.status, "needs-user");
+    assert.deepEqual(labels, ["plan-gate:security:1"]);
+    assert.equal(run.violations[0]?.kind, "reviewer-write");
+});
+
+test("implementation NEEDS-USER stops before a fixer even when the reviewer changed code", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    const sourcePath = resolve(run.repoRoot, "source.txt");
+    await writeFile(sourcePath, "before\n", "utf8");
+    const labels = [];
+    const ctx = {
+        log() {},
+        async agent(_prompt, options) {
+            labels.push(options.label);
+            await writeFile(sourcePath, "reviewer changed code\n", "utf8");
+            return "## Required user action\n\nOwner approval is required.\n\nAUTODEV-VERDICT: NEEDS-USER";
+        },
+    };
+
+    const outcome = await runFinalReview(ctx, run, {
+        key: "codeSecurity",
+        phase: "Code security review",
+        title: "security",
+        prompt: "autodev-code-security-review",
+    });
+
+    assert.equal(outcome.status, "needs-user");
+    assert.deepEqual(labels, ["final-review:codeSecurity:1"]);
+    assert.equal(run.violations[0]?.kind, "reviewer-write");
+});
+
+test("a new factory run resumes the recorded NEEDS-USER reviewer before any other agent", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    await writeFile(
+        run.statusPath,
+        `${JSON.stringify(
+            {
+                runId: "prior-run",
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                gates: {
+                    codeSecurity: { status: "passed", attempts: 1 },
+                    codePrivacy: {
+                        status: "needs-user",
+                        attempts: 1,
+                        findings: "The privacy owner must approve the retention policy.",
+                    },
+                },
+                milestones: [{ number: 1, title: "feature", status: "complete", reviewRounds: 1 }],
+                notes: [],
+                violations: [],
+            },
+            null,
+            2,
+        )}\n`,
+        "utf8",
+    );
+
+    const labels = [];
+    const prompts = [];
+    const result = await autodevFactory.run({
+        args: {
+            repoRoot: run.repoRoot,
+            resumeNeedsUser: true,
+            userEvidence: "Approved by the privacy owner in issue #123.",
+        },
+        runId: "resumed-run",
+        phase() {},
+        log() {},
+        async agent(prompt, options) {
+            labels.push(options.label);
+            prompts.push(prompt);
+            return "## Findings\n\nNone.\n\nAUTODEV-VERDICT: PASS";
+        },
+    });
+
+    assert.equal(result.status, "completed");
+    assert.deepEqual(labels, ["final-review:codePrivacy:1"]);
+    assert.match(prompts[0], /Approved by the privacy owner in issue #123/);
+    assert.match(prompts[0], /The privacy owner must approve the retention policy/);
+});
+
+test("a resumed plan gate that still needs user action stops without replaying planning agents", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    await writeFile(
+        run.statusPath,
+        `${JSON.stringify(
+            {
+                runId: "prior-plan-run",
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                gates: {
+                    architecture: { status: "passed", attempts: 1 },
+                    security: {
+                        status: "needs-user",
+                        attempts: 1,
+                        findings: "The service owner must approve production access.",
+                    },
+                },
+                milestones: [],
+                notes: [],
+                violations: [],
+            },
+            null,
+            2,
+        )}\n`,
+        "utf8",
+    );
+
+    const labels = [];
+    const prompts = [];
+    const result = await autodevFactory.run({
+        args: {
+            repoRoot: run.repoRoot,
+            resumeNeedsUser: true,
+            userEvidence: "The owner deferred the decision; no approval exists yet.",
+        },
+        runId: "resumed-plan-run",
+        phase() {},
+        log() {},
+        async agent(prompt, options) {
+            labels.push(options.label);
+            prompts.push(prompt);
+            return "## Required user action\n\nApproval is still required.\n\nAUTODEV-VERDICT: NEEDS-USER";
+        },
+    });
+
+    assert.equal(result.status, "needs-user");
+    assert.deepEqual(labels, ["plan-gate:security:1"]);
+    assert.match(prompts[0], /The owner deferred the decision; no approval exists yet/);
 });
 
 /* ---------------------------------------------------------------------------------------------

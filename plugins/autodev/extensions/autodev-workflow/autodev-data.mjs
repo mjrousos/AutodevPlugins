@@ -162,7 +162,7 @@ function parseFeedback(text, process) {
     }
 
     const sessionText = latestSessionSection(text);
-    const headerPattern = /^# (.+?) - attempt (\d+) - ([A-Z]+)\s*$/gm;
+    const headerPattern = /^# (.+?) - attempt (\d+) - ([A-Z-]+)\s*$/gm;
     const matches = [...sessionText.matchAll(headerPattern)];
     return matches.map((match, index) => {
         const body = sessionText.slice(
@@ -301,6 +301,9 @@ function gateStatus(attempts, statusVerdict) {
     if (verdict === "ISSUES") {
         return "issues";
     }
+    if (verdict === "NEEDS-USER") {
+        return "needs-user";
+    }
     if (verdict === "BLOCKED") {
         return "issues";
     }
@@ -323,18 +326,21 @@ function buildPlan(events, feedback, status) {
 
     const allPassed = gates.every((gate) => gate.status === "complete");
     const activeGate = gates.find((gate) => gate.status === "active");
+    const waitingGate = gates.find((gate) => gate.status === "needs-user");
     const issueGate = [...gates].reverse().find((gate) => gate.status === "issues");
     const hasStarted =
         events.length > 0 || gates.some((gate) => gate.status !== "pending");
     const currentPhase = allPassed
         ? "Complete"
-        : activeGate
-          ? `Gate: ${activeGate.label}`
-          : issueGate
-            ? `Draft refinement after ${issueGate.label}`
-            : hasStarted
-              ? "Gate review"
-              : "Intake";
+        : waitingGate
+          ? `Waiting for user: ${waitingGate.label}`
+          : activeGate
+            ? `Gate: ${activeGate.label}`
+            : issueGate
+              ? `Draft refinement after ${issueGate.label}`
+              : hasStarted
+                ? "Gate review"
+                : "Intake";
 
     const prereqsComplete = hasStarted;
     const phases = [
@@ -350,7 +356,7 @@ function buildPlan(events, feedback, status) {
     ];
 
     return {
-        status: allPassed ? "complete" : hasStarted ? "active" : "pending",
+        status: allPassed ? "complete" : waitingGate ? "needs-user" : hasStarted ? "active" : "pending",
         currentPhase,
         sessionId: status.sessionId ?? null,
         startedAt: events[0]?.time ?? null,
@@ -490,11 +496,14 @@ function buildImplementation(events, feedback, status, milestoneData) {
         currentPhase = "Complete";
     } else {
         const activeGate = gates.find((gate) => gate.status === "active");
+        const waitingGate = gates.find((gate) => gate.status === "needs-user");
         const issueGate = [...gates].reverse().find((gate) => gate.status === "issues");
         const activeMilestone = milestones.find((milestone) =>
             ["active", "issues"].includes(milestone.status),
         );
-        if (activeGate) {
+        if (waitingGate) {
+            currentPhase = `Waiting for user: ${waitingGate.label}`;
+        } else if (activeGate) {
             currentPhase = `Gate: ${activeGate.label}`;
         } else if (issueGate) {
             currentPhase = `Fixing ${issueGate.label} findings`;
@@ -543,7 +552,13 @@ function buildImplementation(events, feedback, status, milestoneData) {
     ];
 
     return {
-        status: allComplete ? "complete" : hasStarted ? "active" : "pending",
+        status: allComplete
+            ? "complete"
+            : gates.some((gate) => gate.status === "needs-user")
+              ? "needs-user"
+              : hasStarted
+                ? "active"
+                : "pending",
         currentPhase,
         sessionId: status.sessionId ?? null,
         startedAt: events[0]?.time ?? null,
@@ -606,6 +621,8 @@ export async function loadAutodevState(autodevDir) {
     const workflowComplete = plan.status === "complete" && implementation.status === "complete";
     const workflowStatus = workflowComplete
         ? "complete"
+        : plan.status === "needs-user" || implementation.status === "needs-user"
+          ? "needs-user"
         : plan.status === "pending" && implementation.status === "pending"
           ? "pending"
           : "active";
@@ -631,6 +648,8 @@ export async function loadAutodevState(autodevDir) {
             status: workflowStatus,
             label: workflowStatus === "complete"
                 ? "Workflow complete"
+                : workflowStatus === "needs-user"
+                  ? "User action required"
                 : workflowStatus === "active"
                   ? "Workflow in progress"
                   : "Workflow pending",

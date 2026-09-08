@@ -250,7 +250,7 @@ seed_state() { # sid  jq-assignment-expression
   mkdir -p "$(dirname "$path")"
   jq -n --arg sid "$sid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
     sessionId: $sid, createdAt: $now, updatedAt: $now,
-    blocks: 0, totalInvocations: 0,
+    blocks: 0, needsUserReached: 0, totalInvocations: 0,
     taskingAttempts: 0, taskingVerdict: "pending",
     milestoneCount: 0, currentMilestone: 0, completedMilestones: 0,
     implementAttempts: 0, implementVerdict: "pending",
@@ -373,6 +373,49 @@ review_verdict_case 'mid-body PASS then final ISSUES' $'AUTODEV-VERDICT: PASS ma
 review_verdict_case 'commentary after the verdict' $'AUTODEV-VERDICT: PASS\nBut actually I am unsure.' 'ISSUES'
 review_verdict_case 'no verdict at all' 'I forgot to include one.' 'ISSUES'
 review_verdict_case 'empty response' '' 'ISSUES'
+
+t_needs_user_pause_resume() {
+  local sid footer
+  sid="$(new_session_id)"
+  seed_stage "$sid" security
+  start_agent "$sid" code-security-review
+  footer="$(stop_agent "$sid" code-security-review '### [major] Owner approval is required
+
+## Required user action
+
+The service owner must complete an external approval and record durable evidence.
+
+AUTODEV-VERDICT: NEEDS-USER' | jq -r '.modifiedResponse // ""')"
+  assert_match 'Recorded verdict: NEEDS-USER' "$footer" || return 1
+  assert_match 'Stop now and explain the required user action' "$footer" || return 1
+
+  jq --argjson total "$(max_total)" '.totalInvocations = $total' "$(state_path "$sid")" \
+    > "$(state_path "$sid").tmp" &&
+    mv "$(state_path "$sid").tmp" "$(state_path "$sid")"
+
+  assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" code-security-review)" || return 1
+  assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" code-fix)" || return 1
+  assert_match '"permissionDecision":"deny"' "$(task_check "$sid" explore)" || return 1
+  assert_match '"permissionDecision":"deny"' "$(tool_check "$sid" ask_user)" || return 1
+
+  assert_equal '{}' "$(agent_stop "$sid")" || return 1
+  assert_equal '{}' "$(agent_task_check "$sid" code-security-review)" || return 1
+  assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" code-privacy-review)" || return 1
+  footer="$(round "$sid" code-security-review PASS)"
+  assert_match 'autodev-code-privacy-review' "$footer"
+}
+run_test 'security NEEDS-USER pauses, stops cleanly, and resumes only the same review' t_needs_user_pause_resume
+
+t_milestone_needs_user_fails_safe() {
+  local sid footer
+  sid="$(new_session_id)"
+  set_todo_list "$sid" 1
+  round "$sid" tasking DONE >/dev/null
+  round "$sid" implementation DONE >/dev/null
+  footer="$(round "$sid" code-review NEEDS-USER)"
+  assert_match 'Recorded verdict: ISSUES' "$footer"
+}
+run_test 'milestone code review NEEDS-USER fails safe as ISSUES' t_milestone_needs_user_fails_safe
 
 t_worker_verdict() {
   local sid footer

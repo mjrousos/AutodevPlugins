@@ -136,7 +136,7 @@ TODO_PATH="$VIEW_DIR/todos.md"
 default_state() {
   jq -n --arg sid "$SAFE_SESSION_ID" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
     sessionId: $sid, createdAt: $now, updatedAt: $now,
-    blocks: 0, totalInvocations: 0,
+    blocks: 0, needsUserReached: 0, totalInvocations: 0,
     taskingAttempts: 0, taskingVerdict: "pending",
     milestoneCount: 0, currentMilestone: 0, completedMilestones: 0,
     implementAttempts: 0, implementVerdict: "pending",
@@ -177,8 +177,14 @@ read_state_file() {
     def review_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+           or . == "NEEDS-USER"));
+    def ordinary_review_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
           (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
     counter_ok("blocks")
+    and counter_ok("needsUserReached")
     and counter_ok("totalInvocations")
     and counter_ok("taskingAttempts")
     and counter_ok("milestoneCount")
@@ -192,12 +198,14 @@ read_state_file() {
     and counter_ok("privacyAttempts")
     and worker_ok("taskingVerdict")
     and worker_ok("implementVerdict")
-    and review_ok("reviewVerdict")
+    and ordinary_review_ok("reviewVerdict")
     and review_ok("securityVerdict")
     and review_ok("privacyVerdict")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
-  jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
+  # Feed both documents through stdin rather than process-substitution paths. Git Bash may
+  # resolve jq to the native Windows executable, which cannot open /dev/fd/*.
+  printf '%s\n%s\n' "$(default_state)" "$snapshot" | jq -s '.[0] * .[1]' 2>/dev/null
 }
 
 read_state() {
@@ -523,7 +531,8 @@ get_max_total_invocations() {
 # Rewrites the global STATE.
 reset_downstream_verdicts() {
   STATE="$(printf '%s' "$STATE" | jq \
-    '.securityVerdict = "pending" | .securityAttempts = 0
+    '.needsUserReached = 0
+     | .securityVerdict = "pending" | .securityAttempts = 0
      | .privacyVerdict = "pending" | .privacyAttempts = 0')"
 }
 
@@ -534,6 +543,7 @@ reset_downstream_verdicts() {
 #
 # Rewrites the global STATE.
 reset_final_verdicts_after_fix() {
+  STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 0')"
   if [ "$(state_str "$STATE" 'securityVerdict')" = "PASS" ]; then
     STATE="$(printf '%s' "$STATE" | jq '.securityVerdict = "pending" | .securityAttempts = 0')"
   fi
@@ -592,7 +602,15 @@ advance_milestone() {
 get_stage() {
   local state="$1" total
   [ "$(state_num "$state" 'taskingAttempts')" -eq 0 ] 2>/dev/null && { printf 'idle'; return; }
-  [ "$(state_num "$state" 'totalInvocations')" -ge "$(get_max_total_invocations "$state")" ] 2>/dev/null &&
+  # A reviewer that requires external action must always produce a resumable pause, even when
+  # that invocation also reaches the session-wide safety ceiling.
+  if [ "$(state_str "$state" 'securityVerdict')" = "NEEDS-USER" ] ||
+    [ "$(state_str "$state" 'privacyVerdict')" = "NEEDS-USER" ]; then
+    printf 'needs-user'
+    return
+  fi
+  [ "$(state_num "$state" 'needsUserReached')" -eq 0 ] 2>/dev/null &&
+    [ "$(state_num "$state" 'totalInvocations')" -ge "$(get_max_total_invocations "$state")" ] 2>/dev/null &&
     { printf 'escalated'; return; }
 
   if [ "$(state_str "$state" 'taskingVerdict')" != "DONE" ]; then
@@ -742,6 +760,13 @@ get_next_action() {
         printf 'Invoke autodev:autodev-code-privacy-review.'
       fi
       ;;
+    needs-user)
+      if [ "$(state_str "$state" 'securityVerdict')" = "NEEDS-USER" ]; then
+        printf 'Stop now and explain the required user action. After the user supplies it in a later turn, re-invoke only autodev:autodev-code-security-review.'
+      else
+        printf 'Stop now and explain the required user action. After the user supplies it in a later turn, re-invoke only autodev:autodev-code-privacy-review.'
+      fi
+      ;;
     complete)
       printf 'The implementation is complete and every review has passed. Proceed to WRAPUP.'
       ;;
@@ -774,8 +799,8 @@ read_verdict() {
     | grep -vE '^`{3,}[A-Za-z0-9]*$' \
     | tail -n 1)"
   raw="$(printf '%s' "$last" \
-    | grep -oiE '^[*`>_-]*[[:space:]]*AUTODEV-VERDICT:[[:space:]]*(PASS|ISSUES|DONE|BLOCKED)[*`.[:space:]]*$' \
-    | grep -oiE '(PASS|ISSUES|DONE|BLOCKED)[*`.[:space:]]*$' \
+    | grep -oiE '^[*`>_-]*[[:space:]]*AUTODEV-VERDICT:[[:space:]]*(PASS|ISSUES|NEEDS-USER|DONE|BLOCKED)[*`.[:space:]]*$' \
+    | grep -oiE '(PASS|ISSUES|NEEDS-USER|DONE|BLOCKED)[*`.[:space:]]*$' \
     | tr -d '*`. \t' \
     | tr '[:lower:]' '[:upper:]')"
   [ -n "$raw" ] || { printf '%s' "$fallback"; return; }
@@ -789,6 +814,7 @@ read_verdict() {
     case "$raw" in
       PASS)   printf 'DONE' ;;
       ISSUES) printf 'BLOCKED' ;;
+      NEEDS-USER) printf 'BLOCKED' ;;
       *)      printf '%s' "$raw" ;;
     esac
   fi
@@ -932,6 +958,8 @@ case "$EVENT_NAME" in
     RESPONSE="$(json_get '.response')"
     KIND="$(get_agent_kind "$AGENT")"
     VERDICT="$(read_verdict "$RESPONSE" "$KIND")"
+    # NEEDS-USER is reserved for whole-implementation security and privacy reviews.
+    [ "$AGENT" = "code-review" ] && [ "$VERDICT" = "NEEDS-USER" ] && VERDICT='ISSUES'
 
     MILESTONE_LABEL='-'
     EXTRA_NOTES=''
@@ -1009,10 +1037,14 @@ $1"; fi; }
         fi
         ;;
       code-security-review)
-        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.securityVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" \
+          '.securityVerdict = $v
+           | .needsUserReached = (if $v == "NEEDS-USER" then 0 else .needsUserReached end)')"
         ;;
       code-privacy-review)
-        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" '.privacyVerdict = $v')"
+        STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" \
+          '.privacyVerdict = $v
+           | .needsUserReached = (if $v == "NEEDS-USER" then 0 else .needsUserReached end)')"
         ;;
     esac
 
@@ -1047,7 +1079,7 @@ $EXTRA_NOTES"
     FOOTER="$FOOTER
 Next required action: $(get_next_action "$STATE" "$STAGE")"
     case "$STAGE" in
-      complete|escalated|user-review)
+      complete|escalated|user-review|needs-user)
         FOOTER="$FOOTER
 Audit trail: $AUDIT_PATH
 Feedback log: $FEEDBACK_PATH"
@@ -1097,6 +1129,21 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
         STATE="$(printf '%s' "$STATE" | jq '.userReviewReached = 1')"
         write_state "$STATE"
         add_audit_row "user-review" "-" "0" "handed to user" "-"
+      fi
+      emit_empty
+    fi
+    if [ "$STAGE" = "needs-user" ]; then
+      ensure_dir "$STATE_DIR" || true
+      ensure_dir "$VIEW_DIR" || true
+      if [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
+        if [ "$(state_str "$STATE" 'securityVerdict')" = "NEEDS-USER" ]; then
+          WAITING_AGENT='code-security-review'
+        else
+          WAITING_AGENT='code-privacy-review'
+        fi
+        STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 1')"
+        write_state "$STATE"
+        add_audit_row "$WAITING_AGENT" "-" "0" "waiting for user" "NEEDS-USER"
       fi
       emit_empty
     fi
@@ -1156,6 +1203,23 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
 
     if [ "$TOOL_NAME" = "task" ]; then
       TARGET="$(resolve_agent "$(get_task_agent_type)")"
+      if [ "$STAGE" = "needs-user" ]; then
+        if [ "$(state_str "$STATE" 'securityVerdict')" = "NEEDS-USER" ]; then
+          WAITING_AGENT='code-security-review'
+        else
+          WAITING_AGENT='code-privacy-review'
+        fi
+        if [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
+          REASON="The $WAITING_AGENT stage returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
+        elif [ "$TARGET" != "$WAITING_AGENT" ]; then
+          REASON="The autodev-implement workflow is waiting on user action for $WAITING_AGENT. Only autodev:autodev-$WAITING_AGENT may resume it after the user supplies the required decision, action, or evidence."
+        else
+          emit_empty
+        fi
+        jq -cn --arg r "$REASON" \
+          '{permissionDecision: "deny", permissionDecisionReason: $r}' 2>/dev/null || emit_empty
+        exit 0
+      fi
       # Anything that is not one of this plugin's sub-agents is none of our business.
       [ -n "$TARGET" ] || emit_empty
 
@@ -1263,6 +1327,17 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
         add_audit_row "user-review" "-" "0" "handed to user" "-"
       fi
       emit_empty
+    fi
+    if [ "$STAGE" = "needs-user" ]; then
+      if [ "$(state_str "$STATE" 'securityVerdict')" = "NEEDS-USER" ]; then
+        WAITING_REVIEW='security'
+      else
+        WAITING_REVIEW='privacy'
+      fi
+      REASON="The $WAITING_REVIEW review returned NEEDS-USER. Do not call ask_user; explain the required authorized decision or external action in your response and end the turn so the user can handle it and resume later."
+      jq -cn --arg r "$REASON" \
+        '{permissionDecision: "deny", permissionDecisionReason: $r}' 2>/dev/null || emit_empty
+      exit 0
     fi
     is_autonomous_stage "$STAGE" || emit_empty
 

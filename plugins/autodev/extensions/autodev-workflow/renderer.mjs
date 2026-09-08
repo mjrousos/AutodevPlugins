@@ -261,6 +261,10 @@ export function renderHtml({ instanceId, initialView }) {
       background: color-mix(in srgb, var(--true-color-red, #cf222e) 15%, transparent);
       color: var(--true-color-red, #cf222e);
     }
+    .needs-user .icon, .badge.needs-user {
+      background: color-mix(in srgb, var(--true-color-orange, #bc4c00) 15%, transparent);
+      color: var(--true-color-orange, #bc4c00);
+    }
     .capped .icon, .badge.capped {
       background: color-mix(in srgb, var(--true-color-red, #cf222e) 15%, transparent);
       color: var(--true-color-red, #cf222e);
@@ -508,13 +512,14 @@ export function renderHtml({ instanceId, initialView }) {
         complete: "Complete",
         active: "In progress",
         issues: "Needs refinement",
+        "needs-user": "User action required",
         capped: "Closed with findings",
         pending: "Pending",
       }[status] || status;
     }
 
     function iconFor(status) {
-      return { complete: "✓", active: "●", issues: "!", capped: "!", pending: "·" }[status] || "·";
+      return { complete: "✓", active: "●", issues: "!", "needs-user": "!", capped: "!", pending: "·" }[status] || "·";
     }
 
     function formatDate(value) {

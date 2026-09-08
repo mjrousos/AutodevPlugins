@@ -190,13 +190,16 @@ function Test-StateVerdict {
 function Test-GateStateSemantics {
     param($State)
     foreach ($name in @(
-            'blocks', 'totalInvocations', 'architectureAttempts', 'securityAttempts',
+            'blocks', 'needsUserReached', 'totalInvocations', 'architectureAttempts', 'securityAttempts',
             'privacyAttempts'
         )) {
         if (-not (Test-StateCounter $State $name)) { return $false }
     }
-    foreach ($name in @('architectureVerdict', 'securityVerdict', 'privacyVerdict')) {
-        if (-not (Test-StateVerdict $State $name @('pending', 'running', 'PASS', 'ISSUES'))) {
+    if (-not (Test-StateVerdict $State 'architectureVerdict' @('pending', 'running', 'PASS', 'ISSUES'))) {
+        return $false
+    }
+    foreach ($name in @('securityVerdict', 'privacyVerdict')) {
+        if (-not (Test-StateVerdict $State $name @('pending', 'running', 'PASS', 'ISSUES', 'NEEDS-USER'))) {
             return $false
         }
     }
@@ -208,7 +211,7 @@ function Test-StageStateSemantics {
     foreach ($name in @(
             'blocks', 'totalInvocations', 'taskingAttempts', 'milestoneCount',
             'currentMilestone', 'completedMilestones', 'implementAttempts', 'reviewAttempts',
-            'fixInvocations', 'userReviewReached', 'securityAttempts', 'privacyAttempts'
+            'fixInvocations', 'userReviewReached', 'needsUserReached', 'securityAttempts', 'privacyAttempts'
         )) {
         if (-not (Test-StateCounter $State $name)) { return $false }
     }
@@ -217,8 +220,11 @@ function Test-StageStateSemantics {
             return $false
         }
     }
-    foreach ($name in @('reviewVerdict', 'securityVerdict', 'privacyVerdict')) {
-        if (-not (Test-StateVerdict $State $name @('pending', 'running', 'PASS', 'ISSUES'))) {
+    if (-not (Test-StateVerdict $State 'reviewVerdict' @('pending', 'running', 'PASS', 'ISSUES'))) {
+        return $false
+    }
+    foreach ($name in @('securityVerdict', 'privacyVerdict')) {
+        if (-not (Test-StateVerdict $State $name @('pending', 'running', 'PASS', 'ISSUES', 'NEEDS-USER'))) {
             return $false
         }
     }
@@ -249,12 +255,15 @@ function Test-WorkflowEnforcing {
             $complete = (Get-StateString $state 'architectureVerdict' 'pending') -eq 'PASS' -and
                 (Get-StateString $state 'securityVerdict' 'pending') -eq 'PASS' -and
                 (Get-StateString $state 'privacyVerdict' 'pending') -eq 'PASS'
-            $escalated = (Get-StateNumber $state 'totalInvocations') -ge 40 -or
-                ((Get-StateString $state 'architectureVerdict' 'pending') -ne 'PASS' -and
+            $needsUserPause = (Get-StateString $state 'securityVerdict' 'pending') -eq 'NEEDS-USER' -or
+                (Get-StateString $state 'privacyVerdict' 'pending') -eq 'NEEDS-USER' -or
+                (Get-StateNumber $state 'needsUserReached') -gt 0
+            $escalated = (-not $needsUserPause -and (Get-StateNumber $state 'totalInvocations') -ge 40) -or
+                ((Get-StateString $state 'architectureVerdict' 'pending') -notin @('PASS', 'NEEDS-USER') -and
                     (Get-StateNumber $state 'architectureAttempts') -ge 10) -or
-                ((Get-StateString $state 'securityVerdict' 'pending') -ne 'PASS' -and
+                ((Get-StateString $state 'securityVerdict' 'pending') -notin @('PASS', 'NEEDS-USER') -and
                     (Get-StateNumber $state 'securityAttempts') -ge 10) -or
-                ((Get-StateString $state 'privacyVerdict' 'pending') -ne 'PASS' -and
+                ((Get-StateString $state 'privacyVerdict' 'pending') -notin @('PASS', 'NEEDS-USER') -and
                     (Get-StateNumber $state 'privacyAttempts') -ge 10)
             return $started -and -not $complete -and -not $escalated
         }
@@ -277,7 +286,16 @@ function Test-WorkflowEnforcing {
         if ((Get-StateNumber $state 'taskingAttempts') -eq 0) {
             $stage = 'idle'
         }
-        elseif ((Get-StateNumber $state 'totalInvocations') -ge (120 + 30 * $milestones)) {
+        elseif (
+            (Get-StateString $state 'securityVerdict' 'pending') -eq 'NEEDS-USER' -or
+            (Get-StateString $state 'privacyVerdict' 'pending') -eq 'NEEDS-USER'
+        ) {
+            $stage = 'needs-user'
+        }
+        elseif (
+            (Get-StateNumber $state 'needsUserReached') -eq 0 -and
+            (Get-StateNumber $state 'totalInvocations') -ge (120 + 30 * $milestones)
+        ) {
             $stage = 'escalated'
         }
         elseif (-not $taskingDone) {
@@ -323,6 +341,28 @@ function Test-WorkflowEnforcing {
             $stage = 'complete'
         }
         return $stage -notin @('idle', 'complete', 'escalated')
+    }
+    catch {
+        return $true
+    }
+}
+
+function Test-WorkflowNeedsUser {
+    param([string]$SessionId, [string]$Workflow)
+    $paths = Get-RoutingPaths $SessionId
+    if ($null -eq $paths) { return $false }
+    $statePath = if ($Workflow -eq 'gates') { $paths.GateState } else { $paths.StageState }
+    # The owning tracker may recover a missing or corrupt authoritative file from its workspace
+    # mirror. Route the unclassified task to it rather than letting the task bypass a remembered
+    # pause while the router temporarily cannot inspect the verdict.
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) { return $true }
+    try {
+        $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop
+        $safe = ($SessionId -replace '[^A-Za-z0-9._-]', '_')
+        if ([string]::IsNullOrEmpty($safe)) { $safe = 'unknown-session' }
+        if ([string]$state.sessionId -ne $safe) { return $true }
+        return (Get-StateString $state 'securityVerdict' 'pending') -eq 'NEEDS-USER' -or
+            (Get-StateString $state 'privacyVerdict' 'pending') -eq 'NEEDS-USER'
     }
     catch {
         return $true
@@ -547,6 +587,10 @@ try {
                 if ($currentWorkflow -and $workflow -and $currentWorkflow -ne $workflow -and
                     (Test-WorkflowEnforcing ([string]$payload.sessionId) $currentWorkflow)) {
                     Write-CrossWorkflowDenial $currentWorkflow $workflow
+                }
+                if (-not $workflow -and $currentWorkflow -and
+                    (Test-WorkflowNeedsUser ([string]$payload.sessionId) $currentWorkflow)) {
+                    $workflow = $currentWorkflow
                 }
             }
             elseif ($toolName -eq 'ask_user' -or $toolName -eq 'askuserquestion') {

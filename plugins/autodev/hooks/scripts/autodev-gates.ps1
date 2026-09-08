@@ -118,6 +118,7 @@ function New-DefaultState {
         createdAt        = (Get-Date).ToUniversalTime().ToString('o')
         updatedAt        = (Get-Date).ToUniversalTime().ToString('o')
         blocks           = 0
+        needsUserReached = 0
         totalInvocations = 0
     }
     foreach ($gate in $script:GateOrder) {
@@ -149,7 +150,7 @@ function Read-State {
             $ownerProp = $parsed.PSObject.Properties['sessionId']
             if ($null -eq $ownerProp -or [string]$ownerProp.Value -ne $SessionId) { continue }
 
-            $numericKeys = @('blocks', 'totalInvocations')
+            $numericKeys = @('blocks', 'needsUserReached', 'totalInvocations')
             foreach ($gate in $script:GateOrder) { $numericKeys += "${gate}Attempts" }
             foreach ($key in $numericKeys) {
                 $prop = $parsed.PSObject.Properties[$key]
@@ -171,7 +172,9 @@ function Read-State {
                 $prop = $parsed.PSObject.Properties[$key]
                 if ($null -eq $prop -or $null -eq $prop.Value) { continue }
                 $verdict = [string]$prop.Value
-                if ($verdict -notin @('pending', 'running', 'PASS', 'ISSUES')) {
+                $allowed = @('pending', 'running', 'PASS', 'ISSUES')
+                if ($gate -ne 'architecture') { $allowed += 'NEEDS-USER' }
+                if ($verdict -notin $allowed) {
                     throw "Invalid state verdict '$key'."
                 }
                 $state[$key] = $verdict
@@ -401,8 +404,14 @@ function Get-Phase {
     }
     if (-not $started) { return 'idle' }
     if ($allPassed) { return 'complete' }
+    foreach ($gate in $script:GateOrder) {
+        if ([string]$State["${gate}Verdict"] -eq 'NEEDS-USER') { return 'needs-user' }
+    }
     if ($escalated) { return 'escalated' }
-    if ([int]$State['totalInvocations'] -ge $script:MaxTotalInvocations) { return 'escalated' }
+    if ([int]$State['needsUserReached'] -eq 0 -and
+        [int]$State['totalInvocations'] -ge $script:MaxTotalInvocations) {
+        return 'escalated'
+    }
     return 'gating'
 }
 
@@ -481,7 +490,7 @@ function Read-VerdictFromResponse {
         # Tolerate a trailing code fence wrapped around the verdict.
         if ($line -match '^`{3,}[A-Za-z0-9]*$') { continue }
         # Tolerate markdown emphasis, blockquote markers and trailing punctuation.
-        if ($line -match '^[\s*`>_-]*AUTODEV-VERDICT:\s*(PASS|ISSUES)[\s*`.]*$') {
+        if ($line -match '^[\s*`>_-]*AUTODEV-VERDICT:\s*(PASS|ISSUES|NEEDS-USER)[\s*`.]*$') {
             return $Matches[1].ToUpperInvariant()
         }
         return 'ISSUES'
@@ -812,6 +821,9 @@ try {
 
             $response = [string]$payload.response
             $verdict = Read-VerdictFromResponse -Response $response
+            # Only security and privacy have the NEEDS-USER contract. An architecture reviewer
+            # using it is malformed output and fails safe as ordinary ISSUES.
+            if ($gate -eq 'architecture' -and $verdict -eq 'NEEDS-USER') { $verdict = 'ISSUES' }
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             if ([int]$state["${gate}Attempts"] -lt 1) {
@@ -827,6 +839,7 @@ try {
             # completed invocation from exporting a total of zero.
             if ([int]$state['totalInvocations'] -lt 1) { $state['totalInvocations'] = 1 }
             $state["${gate}Verdict"] = $verdict
+            if ($verdict -eq 'NEEDS-USER') { $state['needsUserReached'] = 0 }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = [int]$state["${gate}Attempts"]
@@ -864,6 +877,11 @@ try {
                     $stuckList = $stuck -join ', '
                     $footerLines += "Next required action: the $stuckList gate(s) reached the $script:MaxAttempts-attempt limit without passing. Stop looping and escalate to the user now, per your escalation protocol. ask_user is permitted again, and further reviewer invocations are now refused. This session can no longer reach a clean 'all gates passed' state; say so plainly at wrap-up."
                 }
+                $footerLines += "Audit trail: $auditPath"
+                $footerLines += "Reviewer feedback log: $feedbackPath"
+            }
+            elseif ($phase -eq 'needs-user') {
+                $footerLines += "Next required action: stop now. Do not revise the plan, call ask_user, or invoke any agent. Explain the required authorized decision or external action to the user, point them to the plan and reviewer feedback log, and end this turn. After the user completes the action or supplies the decision or evidence in a later turn, re-invoke only autodev:autodev-$gate-review with that new context."
                 $footerLines += "Audit trail: $auditPath"
                 $footerLines += "Reviewer feedback log: $feedbackPath"
             }
@@ -918,6 +936,19 @@ try {
             }
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             $phase = Get-Phase -State $state
+            if ($phase -eq 'needs-user') {
+                Confirm-Directory -Path $stateDir | Out-Null
+                Confirm-Directory -Path $viewDir | Out-Null
+                if ([int]$state['needsUserReached'] -eq 0) {
+                    $state['needsUserReached'] = 1
+                    Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
+                    $gate = Get-NextGate -State $state
+                    Add-AuditRow -Path $auditPath -SessionId $sessionId -Gate $gate `
+                        -Attempt ([int]$state["${gate}Attempts"]) -Action 'waiting for user' -Verdict 'NEEDS-USER'
+                }
+                Write-JsonResult @{}
+                exit 0
+            }
             if ($phase -ne 'gating') { Write-JsonResult @{}; exit 0 }
             # The authoritative directory may be what was deleted. Recreate it before persisting
             # the recovered block counter; Write-State still fails open if this is impossible.
@@ -972,6 +1003,23 @@ try {
             $phase = Get-Phase -State $state
 
             if ($toolName -eq 'task') {
+                if ($phase -eq 'needs-user') {
+                    $targetName = Get-TaskAgentType -ToolArgs $payload.toolArgs
+                    $targetGate = Resolve-Gate -AgentName $targetName
+                    $waitingGate = Get-NextGate -State $state
+                    if ([int]$state['needsUserReached'] -eq 0) {
+                        $reason = "The $waitingGate gate returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
+                    }
+                    elseif ($null -eq $targetGate -or $targetGate -ne $waitingGate) {
+                        $reason = "The autodev-plan workflow is waiting on user action for the $waitingGate gate. Only autodev:autodev-$waitingGate-review may resume it after the user supplies the required decision, action, or evidence."
+                    }
+                    else {
+                        Write-JsonResult @{}
+                        exit 0
+                    }
+                    Write-JsonResult @{ permissionDecision = 'deny'; permissionDecisionReason = $reason }
+                    exit 0
+                }
                 # Everything else in this plugin only *asks* the orchestrator to stop looping
                 # once a gate is out of attempts. This is the part that actually stops it: once
                 # the budget is spent, refuse to start another reviewer. Without it an
@@ -1000,6 +1048,12 @@ try {
                 exit 0
             }
 
+            if ($phase -eq 'needs-user') {
+                $waitingGate = Get-NextGate -State $state
+                $reason = "The $waitingGate gate returned NEEDS-USER. Do not call ask_user; explain the required authorized decision or external action in your response and end the turn so the user can handle it and resume later."
+                Write-JsonResult @{ permissionDecision = 'deny'; permissionDecisionReason = $reason }
+                exit 0
+            }
             if ($phase -ne 'gating') { Write-JsonResult @{}; exit 0 }
 
             $nextGate = Get-NextGate -State $state
