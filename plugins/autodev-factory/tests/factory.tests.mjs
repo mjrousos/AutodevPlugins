@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -109,6 +109,13 @@ async function createReviewRun() {
     await mkdir(resolve(repoRoot, ".autodev"), { recursive: true });
     await writeFile(paths.planPath, "# Plan\n", "utf8");
     await writeFile(paths.todosPath, "# Todos\n", "utf8");
+    await writeFile(resolve(repoRoot, "tracked.txt"), "initial\n", "utf8");
+    await execFileAsync("git", ["add", "."], { cwd: repoRoot });
+    await execFileAsync(
+        "git",
+        ["-c", "user.name=Autodev Test", "-c", "user.email=autodev@example.com", "commit", "--quiet", "-m", "initial"],
+        { cwd: repoRoot },
+    );
     return {
         repoRoot,
         ...paths,
@@ -191,6 +198,12 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
                 planPath: run.planPath,
                 todosPath: run.todosPath,
                 baseline: "a".repeat(40),
+                project: {
+                    context: "Persisted project context",
+                    build: "npm run build",
+                    test: "npm test",
+                    conventions: "Use the existing store pattern.",
+                },
                 gates: {
                     codeSecurity: { status: "passed", attempts: 1 },
                     codePrivacy: {
@@ -235,6 +248,68 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
     assert.match(prompts[0], new RegExp(`Baseline: ${"a".repeat(40)}`));
 });
 
+test("a resumed final review restores project commands before invoking a fixer", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    await writeFile(
+        run.statusPath,
+        `${JSON.stringify(
+            {
+                runId: "prior-fix-run",
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                baseline: "b".repeat(40),
+                project: {
+                    context: "Persisted project context",
+                    build: "npm run build",
+                    test: "npm test",
+                    conventions: "Use the existing store pattern.",
+                },
+                gates: {
+                    codeSecurity: {
+                        status: "needs-user",
+                        attempts: 2,
+                        findings: "Approval was required.",
+                    },
+                },
+                milestones: [{ number: 1, title: "feature", status: "complete", reviewRounds: 1 }],
+                notes: [],
+                violations: [],
+            },
+            null,
+            2,
+        )}\n`,
+        "utf8",
+    );
+
+    const calls = [];
+    const result = await autodevFactory.run({
+        args: {
+            repoRoot: run.repoRoot,
+            resumeNeedsUser: true,
+            userEvidence: "Approval was supplied.",
+        },
+        runId: "resumed-fix-run",
+        phase() {},
+        log() {},
+        async agent(prompt, options) {
+            calls.push({ label: options.label, prompt });
+            if (options.label === "final-review:codeSecurity:2") {
+                return "## Findings\n\n### [major] A code fix is required.\n\nAUTODEV-VERDICT: ISSUES";
+            }
+            if (options.label === "final-fix:codeSecurity:2") {
+                return "Applied the fix.\n\nAUTODEV-VERDICT: DONE";
+            }
+            return "## Findings\n\nNone.\n\nAUTODEV-VERDICT: PASS";
+        },
+    });
+
+    assert.equal(result.status, "completed");
+    const fixCall = calls.find((call) => call.label === "final-fix:codeSecurity:2");
+    assert.match(fixCall.prompt, /Build command: npm run build/);
+    assert.match(fixCall.prompt, /Test command: npm test/);
+});
+
 test("a resumed plan gate that still needs user action stops without replaying planning agents", async (t) => {
     const run = await createReviewRun();
     t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
@@ -245,6 +320,13 @@ test("a resumed plan gate that still needs user action stops without replaying p
                 runId: "prior-plan-run",
                 planPath: run.planPath,
                 todosPath: run.todosPath,
+                baseline: "c".repeat(40),
+                project: {
+                    context: "Persisted plan context",
+                    build: "dotnet build",
+                    test: "dotnet test",
+                    conventions: "Follow repository conventions.",
+                },
                 gates: {
                     architecture: { status: "passed", attempts: 1 },
                     security: {
@@ -284,6 +366,16 @@ test("a resumed plan gate that still needs user action stops without replaying p
     assert.equal(result.status, "needs-user");
     assert.deepEqual(labels, ["plan-gate:security:7"]);
     assert.match(prompts[0], /The owner deferred the decision; no approval exists yet/);
+    const { stdout: currentHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: run.repoRoot });
+    const resumedStatus = JSON.parse(await readFile(run.statusPath, "utf8"));
+    assert.equal(resumedStatus.baseline, currentHead.trim());
+    assert.notEqual(resumedStatus.baseline, "c".repeat(40));
+    assert.deepEqual(resumedStatus.project, {
+        context: "Persisted plan context",
+        build: "dotnet build",
+        test: "dotnet test",
+        conventions: "Follow repository conventions.",
+    });
 });
 
 test("gateLine reports reviewer integrity failures as process violations", () => {

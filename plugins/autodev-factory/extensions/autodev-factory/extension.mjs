@@ -612,6 +612,7 @@ async function writeStatus(run) {
         planPath: run.planPath,
         todosPath: run.todosPath,
         baseline: run.baseline,
+        project: run.project,
         subagentCalls: run.subagentCalls,
         planReviewerCalls: run.planReviewerCalls,
         gates: run.gates,
@@ -682,9 +683,18 @@ async function loadNeedsUserResume(run, userEvidence) {
     run.milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
     run.notes = Array.isArray(prior.notes) ? [...prior.notes] : [];
     run.violations = Array.isArray(prior.violations) ? [...prior.violations] : [];
-    run.project.context = "Existing Autodev artifacts; resuming the paused reviewer before any other agent.";
+    const priorProject =
+        prior.project && typeof prior.project === "object" && !Array.isArray(prior.project) ? prior.project : {};
+    run.project = {
+        context:
+            asText(priorProject.context).slice(0, 800) ||
+            "Existing Autodev artifacts; resuming the paused reviewer before any other agent.",
+        build: asText(priorProject.build).slice(0, 200) || "none found",
+        test: asText(priorProject.test).slice(0, 200) || "none found",
+        conventions: asText(priorProject.conventions).slice(0, 1200),
+    };
     const baseline = asText(prior.baseline).trim();
-    if (/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseline)) {
+    if (resume.flow === "final" && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseline)) {
         run.baseline = baseline;
     } else {
         const head = await git(run.repoRoot, ["rev-parse", "HEAD"]);
