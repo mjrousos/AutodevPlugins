@@ -308,7 +308,7 @@ AUTODEV-VERDICT: NEEDS-USER' | jq -r '.modifiedResponse // ""')"
   assert_match 'Recorded verdict: NEEDS-USER' "$footer" || return 1
   assert_match 'stop now' "$footer" || return 1
 
-  jq '.totalInvocations = 40' "$(state_path "$sid")" > "$(state_path "$sid").tmp" &&
+  jq '.totalInvocations = 40 | .securityAttempts = 10' "$(state_path "$sid")" > "$(state_path "$sid").tmp" &&
     mv "$(state_path "$sid").tmp" "$(state_path "$sid")"
 
   same="$(reviewer_task "$sid" security)"
@@ -321,8 +321,15 @@ AUTODEV-VERDICT: NEEDS-USER' | jq -r '.modifiedResponse // ""')"
 
   assert_equal '{}' "$(agent_stop "$sid")" || return 1
   assert_equal '{}' "$(reviewer_task "$sid" security)" || return 1
+  start_gate "$sid" security
+  assert_equal '10' "$(jq -r '.securityAttempts' "$(state_path "$sid")")" || return 1
+  assert_equal 'NEEDS-USER' "$(jq -r '.securityVerdict' "$(state_path "$sid")")" || return 1
+  assert_equal '2' "$(jq -r '.needsUserReached' "$(state_path "$sid")")" || return 1
+  assert_match '"permissionDecision":"deny"' "$(reviewer_task "$sid" security)" || return 1
   assert_match '"permissionDecision":"deny"' "$(reviewer_task "$sid" privacy)" || return 1
-  footer="$(round "$sid" security PASS)"
+  assert_match '"permissionDecision":"deny"' "$(ask_user "$sid")" || return 1
+  assert_equal 'block' "$(agent_stop "$sid" | jq -r '.decision // ""')" || return 1
+  footer="$(stop_gate "$sid" security $'Body text.\n\nAUTODEV-VERDICT: PASS' | jq -r '.modifiedResponse // ""')"
   assert_match 'Invoke autodev:autodev-privacy-review next' "$footer"
 }
 run_test 'security NEEDS-USER pauses, stops cleanly, and resumes only the same gate' t_needs_user_pause_resume

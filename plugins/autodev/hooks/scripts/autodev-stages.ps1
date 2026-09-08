@@ -1199,18 +1199,28 @@ try {
                     }
                 }
                 'code-security-review' {
-                    if ([string]$state['securityVerdict'] -eq 'PASS') { $state['securityAttempts'] = 1 }
+                    $resumingNeedsUser = [string]$state['securityVerdict'] -eq 'NEEDS-USER' -and
+                        [int]$state['needsUserReached'] -eq 1
+                    if ($resumingNeedsUser) {
+                        $state['needsUserReached'] = 2
+                    }
+                    elseif ([string]$state['securityVerdict'] -eq 'PASS') { $state['securityAttempts'] = 1 }
                     else { $state['securityAttempts'] = [int]$state['securityAttempts'] + 1 }
-                    $state['securityVerdict'] = 'running'
+                    if (-not $resumingNeedsUser) { $state['securityVerdict'] = 'running' }
                     # A security re-review describes a newer state of the code, so any privacy
                     # verdict recorded against the older code is stale.
                     $state['privacyVerdict'] = 'pending'
                     $state['privacyAttempts'] = 0
                 }
                 'code-privacy-review' {
-                    if ([string]$state['privacyVerdict'] -eq 'PASS') { $state['privacyAttempts'] = 1 }
+                    $resumingNeedsUser = [string]$state['privacyVerdict'] -eq 'NEEDS-USER' -and
+                        [int]$state['needsUserReached'] -eq 1
+                    if ($resumingNeedsUser) {
+                        $state['needsUserReached'] = 2
+                    }
+                    elseif ([string]$state['privacyVerdict'] -eq 'PASS') { $state['privacyAttempts'] = 1 }
                     else { $state['privacyAttempts'] = [int]$state['privacyAttempts'] + 1 }
-                    $state['privacyVerdict'] = 'running'
+                    if (-not $resumingNeedsUser) { $state['privacyVerdict'] = 'running' }
                 }
             }
 
@@ -1321,11 +1331,21 @@ try {
                 }
                 'code-security-review' {
                     $state['securityVerdict'] = $verdict
-                    if ($verdict -eq 'NEEDS-USER') { $state['needsUserReached'] = 0 }
+                    if ($verdict -eq 'NEEDS-USER') {
+                        $state['needsUserReached'] = 0
+                    }
+                    elseif ([int]$state['needsUserReached'] -eq 2) {
+                        $state['needsUserReached'] = 1
+                    }
                 }
                 'code-privacy-review' {
                     $state['privacyVerdict'] = $verdict
-                    if ($verdict -eq 'NEEDS-USER') { $state['needsUserReached'] = 0 }
+                    if ($verdict -eq 'NEEDS-USER') {
+                        $state['needsUserReached'] = 0
+                    }
+                    elseif ([int]$state['needsUserReached'] -eq 2) {
+                        $state['needsUserReached'] = 1
+                    }
                 }
             }
 
@@ -1429,6 +1449,19 @@ try {
                 exit 0
             }
             if ($stage -eq 'needs-user') {
+                if ([int]$state['needsUserReached'] -eq 2) {
+                    $waitingStage = if ([string]$state['securityVerdict'] -eq 'NEEDS-USER') {
+                        'code-security-review'
+                    }
+                    else {
+                        'code-privacy-review'
+                    }
+                    Write-JsonResult @{
+                        decision = 'block'
+                        reason   = "The resumed $waitingStage is still verifying the user's decision, action, or evidence. Do not end the turn or start anything else until that reviewer returns."
+                    }
+                    exit 0
+                }
                 Confirm-Directory -Path $stateDir | Out-Null
                 Confirm-Directory -Path $viewDir | Out-Null
                 if ([int]$state['needsUserReached'] -eq 0) {
@@ -1518,7 +1551,10 @@ try {
                     else {
                         'code-privacy-review'
                     }
-                    if ([int]$state['needsUserReached'] -eq 0) {
+                    if ([int]$state['needsUserReached'] -eq 2) {
+                        $reason = "The resumed $waitingAgent is already running. Do not invoke any other agent until it finishes verifying the user's decision, action, or evidence."
+                    }
+                    elseif ([int]$state['needsUserReached'] -eq 0) {
                         $reason = "The $waitingAgent stage returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
                     }
                     elseif ($target -ne $waitingAgent) {

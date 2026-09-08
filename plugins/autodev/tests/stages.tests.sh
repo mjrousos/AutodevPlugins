@@ -389,7 +389,7 @@ AUTODEV-VERDICT: NEEDS-USER' | jq -r '.modifiedResponse // ""')"
   assert_match 'Recorded verdict: NEEDS-USER' "$footer" || return 1
   assert_match 'Stop now and explain the required user action' "$footer" || return 1
 
-  jq --argjson total "$(max_total)" '.totalInvocations = $total' "$(state_path "$sid")" \
+  jq --argjson total "$(max_total)" '.totalInvocations = $total | .securityAttempts = 10' "$(state_path "$sid")" \
     > "$(state_path "$sid").tmp" &&
     mv "$(state_path "$sid").tmp" "$(state_path "$sid")"
 
@@ -400,8 +400,15 @@ AUTODEV-VERDICT: NEEDS-USER' | jq -r '.modifiedResponse // ""')"
 
   assert_equal '{}' "$(agent_stop "$sid")" || return 1
   assert_equal '{}' "$(agent_task_check "$sid" code-security-review)" || return 1
+  start_agent "$sid" code-security-review
+  assert_equal '10' "$(jq -r '.securityAttempts' "$(state_path "$sid")")" || return 1
+  assert_equal 'NEEDS-USER' "$(jq -r '.securityVerdict' "$(state_path "$sid")")" || return 1
+  assert_equal '2' "$(jq -r '.needsUserReached' "$(state_path "$sid")")" || return 1
+  assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" code-security-review)" || return 1
   assert_match '"permissionDecision":"deny"' "$(agent_task_check "$sid" code-privacy-review)" || return 1
-  footer="$(round "$sid" code-security-review PASS)"
+  assert_match '"permissionDecision":"deny"' "$(tool_check "$sid" ask_user)" || return 1
+  assert_equal 'block' "$(agent_stop "$sid" | jq -r '.decision // ""')" || return 1
+  footer="$(stop_agent "$sid" code-security-review $'Body text.\n\nAUTODEV-VERDICT: PASS' | jq -r '.modifiedResponse // ""')"
   assert_match 'autodev-code-privacy-review' "$footer"
 }
 run_test 'security NEEDS-USER pauses, stops cleanly, and resumes only the same review' t_needs_user_pause_resume

@@ -120,6 +120,83 @@ route_by_session() {
   fi
 }
 
+workflow_state_is_valid() {
+  local workflow="$1" snapshot="$2"
+  if [ "$workflow" = "gates" ]; then
+    printf '%s' "$snapshot" | jq -e '
+      def nonnegint:
+        (type == "number"
+         and . >= 0 and . <= 2147483647 and floor == .
+         and (tostring | test("^[0-9]+$")))
+        or (type == "string"
+            and test("^[0-9]+$")
+            and (tonumber <= 2147483647));
+      def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+      def verdict_ok($key):
+        (has($key) | not)
+        or (.[$key] | type == "string" and
+            (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+             or . == "NEEDS-USER"));
+      def ordinary_verdict_ok($key):
+        (has($key) | not)
+        or (.[$key] | type == "string" and
+            (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
+      counter_ok("blocks")
+      and counter_ok("needsUserReached")
+      and counter_ok("totalInvocations")
+      and counter_ok("architectureAttempts")
+      and counter_ok("securityAttempts")
+      and counter_ok("privacyAttempts")
+      and ordinary_verdict_ok("architectureVerdict")
+      and verdict_ok("securityVerdict")
+      and verdict_ok("privacyVerdict")
+    ' >/dev/null 2>&1
+    return
+  fi
+
+  printf '%s' "$snapshot" | jq -e '
+    def nonnegint:
+      (type == "number"
+       and . >= 0 and . <= 2147483647 and floor == .
+       and (tostring | test("^[0-9]+$")))
+      or (type == "string"
+          and test("^[0-9]+$")
+          and (tonumber <= 2147483647));
+    def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    def worker_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "DONE" or . == "BLOCKED"));
+    def review_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+           or . == "NEEDS-USER"));
+    def ordinary_review_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
+    counter_ok("blocks")
+    and counter_ok("totalInvocations")
+    and counter_ok("taskingAttempts")
+    and counter_ok("milestoneCount")
+    and counter_ok("currentMilestone")
+    and counter_ok("completedMilestones")
+    and counter_ok("implementAttempts")
+    and counter_ok("reviewAttempts")
+    and counter_ok("fixInvocations")
+    and counter_ok("userReviewReached")
+    and counter_ok("needsUserReached")
+    and counter_ok("securityAttempts")
+    and counter_ok("privacyAttempts")
+    and worker_ok("taskingVerdict")
+    and worker_ok("implementVerdict")
+    and ordinary_review_ok("reviewVerdict")
+    and review_ok("securityVerdict")
+    and review_ok("privacyVerdict")
+  ' >/dev/null 2>&1
+}
+
 # A cross-workflow task is legal only after the current workflow is complete or escalated. Missing
 # or malformed state is treated as active: the owning tracker may still be able to recover it from
 # its workspace mirror, so allowing a different starter would risk bypassing that enforcement.
@@ -287,6 +364,7 @@ workflow_needs_user() {
   printf '%s' "$snapshot" | jq -e . >/dev/null 2>&1 || return 0
   owner="$(printf '%s' "$snapshot" | jq -r '.sessionId // ""' 2>/dev/null)"
   [ "$owner" = "$SAFE_SESSION_ID" ] || return 0
+  workflow_state_is_valid "$workflow" "$snapshot" || return 0
   printf '%s' "$snapshot" | jq -e '
     .securityVerdict == "NEEDS-USER" or .privacyVerdict == "NEEDS-USER"
   ' >/dev/null 2>&1

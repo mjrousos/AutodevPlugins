@@ -178,6 +178,8 @@ test("implementation NEEDS-USER stops before a fixer even when the reviewer chan
 test("a new factory run resumes the recorded NEEDS-USER reviewer before any other agent", async (t) => {
     const run = await createReviewRun();
     t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    const subdirectory = resolve(run.repoRoot, "nested");
+    await mkdir(subdirectory);
     await writeFile(
         run.statusPath,
         `${JSON.stringify(
@@ -190,7 +192,7 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
                     codePrivacy: {
                         status: "needs-user",
                         attempts: 1,
-                        findings: "The privacy owner must approve the retention policy.",
+                        findings: "x".repeat(13000),
                     },
                 },
                 milestones: [{ number: 1, title: "feature", status: "complete", reviewRounds: 1 }],
@@ -207,7 +209,7 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
     const prompts = [];
     const result = await autodevFactory.run({
         args: {
-            repoRoot: run.repoRoot,
+            repoRoot: subdirectory,
             resumeNeedsUser: true,
             userEvidence: "Approved by the privacy owner in issue #123.",
         },
@@ -222,9 +224,10 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
     });
 
     assert.equal(result.status, "completed");
+    assert.equal(result.repoRoot, run.repoRoot);
     assert.deepEqual(labels, ["final-review:codePrivacy:1"]);
     assert.match(prompts[0], /Approved by the privacy owner in issue #123/);
-    assert.match(prompts[0], /The privacy owner must approve the retention policy/);
+    assert.match(prompts[0], /User-provided decision, action, or evidence/);
 });
 
 test("a resumed plan gate that still needs user action stops without replaying planning agents", async (t) => {
@@ -242,7 +245,7 @@ test("a resumed plan gate that still needs user action stops without replaying p
                     security: {
                         status: "needs-user",
                         attempts: 1,
-                        findings: "The service owner must approve production access.",
+                        findings: "y".repeat(13000),
                     },
                 },
                 milestones: [],

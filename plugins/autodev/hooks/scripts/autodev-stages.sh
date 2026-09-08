@@ -917,25 +917,43 @@ case "$EVENT_NAME" in
         fi
         ;;
       code-security-review)
-        if [ "$(state_str "$STATE" 'securityVerdict')" = "PASS" ]; then
+        RESUMING_NEEDS_USER=0
+        if [ "$(state_str "$STATE" 'securityVerdict')" = "NEEDS-USER" ] &&
+          [ "$(state_num "$STATE" 'needsUserReached')" -eq 1 ] 2>/dev/null; then
+          RESUMING_NEEDS_USER=1
+          ATTEMPT="$(state_num "$STATE" 'securityAttempts')"
+          STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 2')"
+        elif [ "$(state_str "$STATE" 'securityVerdict')" = "PASS" ]; then
           ATTEMPT=1
         else
           ATTEMPT=$(( $(state_num "$STATE" 'securityAttempts') + 1 ))
         fi
         # A security re-review describes a newer state of the code, so any privacy verdict
         # recorded against the older code is stale.
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" \
-          '.securityAttempts = $a | .securityVerdict = "running"
-           | .privacyVerdict = "pending" | .privacyAttempts = 0')"
+        if [ "$RESUMING_NEEDS_USER" -eq 1 ]; then
+          STATE="$(printf '%s' "$STATE" | jq '.privacyVerdict = "pending" | .privacyAttempts = 0')"
+        else
+          STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" \
+            '.securityAttempts = $a | .securityVerdict = "running"
+             | .privacyVerdict = "pending" | .privacyAttempts = 0')"
+        fi
         ;;
       code-privacy-review)
-        if [ "$(state_str "$STATE" 'privacyVerdict')" = "PASS" ]; then
+        RESUMING_NEEDS_USER=0
+        if [ "$(state_str "$STATE" 'privacyVerdict')" = "NEEDS-USER" ] &&
+          [ "$(state_num "$STATE" 'needsUserReached')" -eq 1 ] 2>/dev/null; then
+          RESUMING_NEEDS_USER=1
+          ATTEMPT="$(state_num "$STATE" 'privacyAttempts')"
+          STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 2')"
+        elif [ "$(state_str "$STATE" 'privacyVerdict')" = "PASS" ]; then
           ATTEMPT=1
         else
           ATTEMPT=$(( $(state_num "$STATE" 'privacyAttempts') + 1 ))
         fi
-        STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" \
-          '.privacyAttempts = $a | .privacyVerdict = "running"')"
+        if [ "$RESUMING_NEEDS_USER" -eq 0 ]; then
+          STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPT" \
+            '.privacyAttempts = $a | .privacyVerdict = "running"')"
+        fi
         ;;
     esac
 
@@ -1039,12 +1057,16 @@ $1"; fi; }
       code-security-review)
         STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" \
           '.securityVerdict = $v
-           | .needsUserReached = (if $v == "NEEDS-USER" then 0 else .needsUserReached end)')"
+           | .needsUserReached = (if $v == "NEEDS-USER" then 0
+                                  elif .needsUserReached == 2 then 1
+                                  else .needsUserReached end)')"
         ;;
       code-privacy-review)
         STATE="$(printf '%s' "$STATE" | jq --arg v "$VERDICT" \
           '.privacyVerdict = $v
-           | .needsUserReached = (if $v == "NEEDS-USER" then 0 else .needsUserReached end)')"
+           | .needsUserReached = (if $v == "NEEDS-USER" then 0
+                                  elif .needsUserReached == 2 then 1
+                                  else .needsUserReached end)')"
         ;;
     esac
 
@@ -1133,6 +1155,16 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
       emit_empty
     fi
     if [ "$STAGE" = "needs-user" ]; then
+      if [ "$(state_num "$STATE" 'needsUserReached')" -eq 2 ] 2>/dev/null; then
+        if [ "$(state_str "$STATE" 'securityVerdict')" = "NEEDS-USER" ]; then
+          WAITING_AGENT='code-security-review'
+        else
+          WAITING_AGENT='code-privacy-review'
+        fi
+        REASON="The resumed $WAITING_AGENT is still verifying the user's decision, action, or evidence. Do not end the turn or start anything else until that reviewer returns."
+        jq -cn --arg r "$REASON" '{decision: "block", reason: $r}' 2>/dev/null || emit_empty
+        exit 0
+      fi
       ensure_dir "$STATE_DIR" || true
       ensure_dir "$VIEW_DIR" || true
       if [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
@@ -1209,7 +1241,9 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
         else
           WAITING_AGENT='code-privacy-review'
         fi
-        if [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
+        if [ "$(state_num "$STATE" 'needsUserReached')" -eq 2 ] 2>/dev/null; then
+          REASON="The resumed $WAITING_AGENT is already running. Do not invoke any other agent until it finishes verifying the user's decision, action, or evidence."
+        elif [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
           REASON="The $WAITING_AGENT stage returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
         elif [ "$TARGET" != "$WAITING_AGENT" ]; then
           REASON="The autodev-implement workflow is waiting on user action for $WAITING_AGENT. Only autodev:autodev-$WAITING_AGENT may resume it after the user supplies the required decision, action, or evidence."

@@ -324,6 +324,7 @@ AUTODEV-VERDICT: NEEDS-USER
 
     $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
     $state.totalInvocations = 40
+    $state.securityAttempts = 10
     Set-Content -LiteralPath (Get-StatePath $sid) -Value ($state | ConvertTo-Json -Depth 5) -Encoding UTF8
 
     $sameArgs = @{ agent_type = 'autodev:autodev-security-review' } | ConvertTo-Json -Compress
@@ -336,9 +337,17 @@ AUTODEV-VERDICT: NEEDS-USER
 
     Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $sameArgs })
+    Start-Gate -SessionId $sid -Gate 'security'
+    $running = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal '10' ([string]$running.securityAttempts)
+    Assert-Equal 'NEEDS-USER' ([string]$running.securityVerdict)
+    Assert-Equal '2' ([string]$running.needsUserReached)
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $sameArgs })
     Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $otherArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+    Assert-Equal 'block' ((Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json).decision)
 
-    $resumed = Get-Footer (Invoke-Round -SessionId $sid -Gate 'security' -Verdict 'PASS')
+    $resumed = Get-Footer (Stop-Gate -SessionId $sid -Gate 'security' -Response "Body text.`n`nAUTODEV-VERDICT: PASS")
     Assert-Match 'Invoke autodev:autodev-privacy-review next' $resumed
 }
 

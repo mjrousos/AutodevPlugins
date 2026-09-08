@@ -782,7 +782,15 @@ try {
             Confirm-Directory -Path $viewDir | Out-Null
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
-            if ([string]$state["${gate}Verdict"] -eq 'PASS') {
+            $resumingNeedsUser = [string]$state["${gate}Verdict"] -eq 'NEEDS-USER' -and
+                [int]$state['needsUserReached'] -eq 1
+            if ($resumingNeedsUser) {
+                # This is the continuation of the paused attempt, not another autonomous retry.
+                # Keep the NEEDS-USER verdict visible so the workflow remains locked while the
+                # reviewer verifies the new evidence.
+                $state['needsUserReached'] = 2
+            }
+            elseif ([string]$state["${gate}Verdict"] -eq 'PASS') {
                 # This gate already passed, so this is a re-gate after a material change.
                 # Start a fresh per-pass budget rather than charging it the old pass's attempts.
                 $state["${gate}Attempts"] = 1
@@ -790,7 +798,7 @@ try {
             else {
                 $state["${gate}Attempts"] = [int]$state["${gate}Attempts"] + 1
             }
-            $state["${gate}Verdict"] = 'running'
+            if (-not $resumingNeedsUser) { $state["${gate}Verdict"] = 'running' }
             # Any later gate's verdict described an older version of the plan, so it is now
             # stale. Invalidating them keeps the tracker in step with the orchestrator's rule of
             # re-running every gate from the first one affected onward, and stops a re-gate from
@@ -839,7 +847,12 @@ try {
             # completed invocation from exporting a total of zero.
             if ([int]$state['totalInvocations'] -lt 1) { $state['totalInvocations'] = 1 }
             $state["${gate}Verdict"] = $verdict
-            if ($verdict -eq 'NEEDS-USER') { $state['needsUserReached'] = 0 }
+            if ($verdict -eq 'NEEDS-USER') {
+                $state['needsUserReached'] = 0
+            }
+            elseif ([int]$state['needsUserReached'] -eq 2) {
+                $state['needsUserReached'] = 1
+            }
             Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
 
             $attempt = [int]$state["${gate}Attempts"]
@@ -937,6 +950,14 @@ try {
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
             $phase = Get-Phase -State $state
             if ($phase -eq 'needs-user') {
+                if ([int]$state['needsUserReached'] -eq 2) {
+                    $gate = Get-NextGate -State $state
+                    Write-JsonResult @{
+                        decision = 'block'
+                        reason   = "The resumed $gate reviewer is still verifying the user's decision, action, or evidence. Do not end the turn or start anything else until that reviewer returns."
+                    }
+                    exit 0
+                }
                 Confirm-Directory -Path $stateDir | Out-Null
                 Confirm-Directory -Path $viewDir | Out-Null
                 if ([int]$state['needsUserReached'] -eq 0) {
@@ -1007,7 +1028,10 @@ try {
                     $targetName = Get-TaskAgentType -ToolArgs $payload.toolArgs
                     $targetGate = Resolve-Gate -AgentName $targetName
                     $waitingGate = Get-NextGate -State $state
-                    if ([int]$state['needsUserReached'] -eq 0) {
+                    if ([int]$state['needsUserReached'] -eq 2) {
+                        $reason = "The resumed $waitingGate reviewer is already running. Do not invoke any other agent until it finishes verifying the user's decision, action, or evidence."
+                    }
+                    elseif ([int]$state['needsUserReached'] -eq 0) {
                         $reason = "The $waitingGate gate returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
                     }
                     elseif ($null -eq $targetGate -or $targetGate -ne $waitingGate) {

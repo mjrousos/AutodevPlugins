@@ -480,7 +480,15 @@ case "$EVENT_NAME" in
     [ -n "$GATE" ] || emit_empty
     ensure_dir "$STATE_DIR" || true
     ensure_dir "$VIEW_DIR" || true
-    if [ "$(state_str "$STATE" "${GATE}Verdict")" = "PASS" ]; then
+    RESUMING_NEEDS_USER=0
+    if [ "$(state_str "$STATE" "${GATE}Verdict")" = "NEEDS-USER" ] &&
+      [ "$(state_num "$STATE" 'needsUserReached')" -eq 1 ] 2>/dev/null; then
+      # This is the continuation of the paused attempt, not another autonomous retry. Keep the
+      # NEEDS-USER verdict visible so the workflow remains locked while evidence is verified.
+      RESUMING_NEEDS_USER=1
+      STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 2')"
+      ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
+    elif [ "$(state_str "$STATE" "${GATE}Verdict")" = "PASS" ]; then
       # This gate already passed, so this is a re-gate after a material change.
       # Start a fresh per-pass budget rather than charging it the old pass's attempts.
       ATTEMPTS=1
@@ -492,8 +500,12 @@ case "$EVENT_NAME" in
     # Invalidating them keeps the tracker in step with the orchestrator's rule of re-running
     # every gate from the first one affected onward, and stops a re-gate from reaching
     # "complete" while downstream gates hold verdicts for a plan that changed.
-    STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
+    if [ "$RESUMING_NEEDS_USER" -eq 1 ]; then
+      STATE="$(printf '%s' "$STATE" | jq --argjson t "$TOTAL" '.totalInvocations = $t | .blocks = 0')"
+    else
+      STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
+        ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
+    fi
     SEEN_CURRENT=0
     for LATER in $GATE_ORDER; do
       if [ "$SEEN_CURRENT" -eq 1 ]; then
@@ -532,7 +544,9 @@ case "$EVENT_NAME" in
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
       --argjson t "$TOTAL_INVOCATIONS" \
       ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v
-       | .needsUserReached = (if \$v == \"NEEDS-USER\" then 0 else .needsUserReached end)
+       | .needsUserReached = (if \$v == \"NEEDS-USER\" then 0
+                              elif .needsUserReached == 2 then 1
+                              else .needsUserReached end)
        | .totalInvocations = \$t")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
@@ -608,6 +622,12 @@ $FOOTER" '{modifiedResponse: $r}'
     [ -f "$STATE_PATH" ] || [ -f "$MIRROR_PATH" ] || emit_empty
     PHASE="$(get_phase "$STATE")"
     if [ "$PHASE" = "needs-user" ]; then
+      if [ "$(state_num "$STATE" 'needsUserReached')" -eq 2 ] 2>/dev/null; then
+        NEXT_GATE="$(get_next_gate "$STATE")"
+        REASON="The resumed $NEXT_GATE reviewer is still verifying the user's decision, action, or evidence. Do not end the turn or start anything else until that reviewer returns."
+        jq -cn --arg r "$REASON" '{decision: "block", reason: $r}'
+        exit 0
+      fi
       ensure_dir "$STATE_DIR" || true
       ensure_dir "$VIEW_DIR" || true
       if [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
@@ -665,7 +685,9 @@ $FOOTER" '{modifiedResponse: $r}'
       if [ "$PHASE" = "needs-user" ]; then
         TARGET_GATE="$(resolve_gate "$(get_task_agent_type)")"
         WAITING_GATE="$(get_next_gate "$STATE")"
-        if [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
+        if [ "$(state_num "$STATE" 'needsUserReached')" -eq 2 ] 2>/dev/null; then
+          REASON="The resumed $WAITING_GATE reviewer is already running. Do not invoke any other agent until it finishes verifying the user's decision, action, or evidence."
+        elif [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
           REASON="The $WAITING_GATE gate returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
         elif [ "$TARGET_GATE" != "$WAITING_GATE" ]; then
           REASON="The autodev-plan workflow is waiting on user action for the $WAITING_GATE gate. Only autodev:autodev-$WAITING_GATE-review may resume it after the user supplies the required decision, action, or evidence."

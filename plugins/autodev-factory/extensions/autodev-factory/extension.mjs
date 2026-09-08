@@ -446,6 +446,15 @@ function artifactPaths(repoRoot, pathArgs = {}) {
     };
 }
 
+async function normalizeRepositoryRoot(run) {
+    const gitRoot = await git(run.repoRoot, ["rev-parse", "--show-toplevel"]);
+    if (!gitRoot.ok || !gitRoot.stdout) return;
+    const root = resolve(gitRoot.stdout);
+    if (root === run.repoRoot) return;
+    run.repoRoot = root;
+    Object.assign(run, artifactPaths(root, run.pathArgs));
+}
+
 function parseMilestones(text) {
     const heading = /^##[ \t]+Milestone[ \t]+(\d+)\b[ \t]*[—–-]?[ \t]*(.*)$/;
     // `autodev-tasking` is explicit that this line is part of the machine-readable contract:
@@ -666,14 +675,9 @@ async function loadNeedsUserResume(run, userEvidence) {
     run.project.context = "Existing Autodev artifacts; resuming the paused reviewer before any other agent.";
     if (!run.request) run.request = `the existing plan at ${run.planPath}`;
 
-    const findings = asText(priorOutcome.findings).trim() || "The prior reviewer paused for required user action.";
-    resume.previousFindings = [
-        findings,
-        "",
-        "## User-provided decision, action, or evidence",
-        "",
-        evidence,
-    ].join("\n");
+    resume.previousFindings =
+        asText(priorOutcome.findings).trim() || "The prior reviewer paused for required user action.";
+    resume.userEvidence = evidence;
     return resume;
 }
 
@@ -1014,19 +1018,10 @@ async function escalate(ctx, run, { key, stage, attempts, lastFindings }) {
 async function intake(ctx, run, { requireRequest }) {
     setPhase(ctx, run, "Intake");
 
-    const gitRoot = await git(run.repoRoot, ["rev-parse", "--show-toplevel"]);
-    if (gitRoot.ok && gitRoot.stdout) {
-        const root = resolve(gitRoot.stdout);
-        if (root !== run.repoRoot) {
-            // The factory was invoked from a subdirectory. Everything else in the run is anchored
-            // to the repository root — the `.autodev` ignore check, the root handed to every
-            // subagent, the worktree snapshots — so the default artifact paths have to move with
-            // it. Otherwise the plan lands in whichever subdirectory the CLI happened to start in
-            // while the reviewers are told to look for it at the root.
-            run.repoRoot = root;
-            Object.assign(run, artifactPaths(root, run.pathArgs));
-        }
-    }
+    // Everything else in the run is anchored to the repository root, including default artifact
+    // paths and worktree snapshots. Continuation uses this same read-only normalization before it
+    // loads persisted state, without replaying the rest of intake.
+    await normalizeRepositoryRoot(run);
 
     const head = await git(run.repoRoot, ["rev-parse", "HEAD"]);
     run.baseline = head.ok ? head.stdout : "uncommitted working tree";
@@ -1476,7 +1471,7 @@ async function approvePlan(ctx, run) {
  * Sequential, deliberately: each reviewer should see the plan as amended by the previous one.
  * ------------------------------------------------------------------------------------------- */
 
-async function runPlanGates(ctx, run, { startKey = null, previousFindings = null } = {}) {
+async function runPlanGates(ctx, run, { startKey = null, previousFindings = null, userEvidence = null } = {}) {
     const startIndex = startKey ? PLAN_GATES.findIndex((gate) => gate.key === startKey) : 0;
     if (startIndex < 0) return { stop: `Unknown plan review resume target: ${startKey}.` };
     for (const [index, gate] of PLAN_GATES.entries()) {
@@ -1484,6 +1479,7 @@ async function runPlanGates(ctx, run, { startKey = null, previousFindings = null
         setPhase(ctx, run, `${gate.title} gate`);
         const outcome = await runPlanGate(ctx, run, gate, {
             previousFindings: gate.key === startKey ? previousFindings : null,
+            userEvidence: gate.key === startKey ? userEvidence : null,
         });
         run.gates[gate.key] = outcome;
         await writeStatus(run);
@@ -1504,7 +1500,12 @@ async function runPlanGates(ctx, run, { startKey = null, previousFindings = null
     return {};
 }
 
-async function runPlanGate(ctx, run, gate, { previousFindings: initialPreviousFindings = null } = {}) {
+async function runPlanGate(
+    ctx,
+    run,
+    gate,
+    { previousFindings: initialPreviousFindings = null, userEvidence = null } = {},
+) {
     const guard = () => fileSnapshot(run.planPath);
     let previousFindings = initialPreviousFindings;
     let guidance = "";
@@ -1533,7 +1534,7 @@ async function runPlanGate(ctx, run, gate, { previousFindings: initialPreviousFi
             // The model fallback is a second reviewer subagent, so it is only offered when the
             // ceiling can actually pay for it. Otherwise a run sitting at 39 could finish at 41.
             maxInvocations: CAPS.planReviewerCalls - run.planReviewerCalls,
-            task: buildGateTask(run, gate, attempt, budget, previousFindings, guidance),
+            task: buildGateTask(run, gate, attempt, budget, previousFindings, guidance, userEvidence),
         });
         // Charged after the fact and by actual invocation count, because a model fallback inside
         // `callAgent` spends two reviewer subagents on one attempt.
@@ -1615,7 +1616,7 @@ async function runPlanGate(ctx, run, gate, { previousFindings: initialPreviousFi
     return { status: "escalated", attempts: attempt, reason: "attempt budget exhausted" };
 }
 
-function buildGateTask(run, gate, attempt, budget, previousFindings, guidance) {
+function buildGateTask(run, gate, attempt, budget, previousFindings, guidance, userEvidence) {
     const lines = [
         `Review the implementation plan at ${run.planPath}.`,
         ``,
@@ -1649,6 +1650,16 @@ function buildGateTask(run, gate, attempt, budget, previousFindings, guidance) {
             `added or changed by the plan.`,
             ``,
             truncate(previousFindings, 12000),
+        );
+    }
+    if (userEvidence) {
+        lines.push(
+            ``,
+            `## User-provided decision, action, or evidence`,
+            ``,
+            `Treat this as the new authoritative evidence to verify against the current plan:`,
+            ``,
+            truncate(userEvidence, 4000),
         );
     }
     lines.push(``, `Follow your output format exactly and end with your AUTODEV-VERDICT line.`);
@@ -1994,7 +2005,7 @@ async function reviewMilestone(ctx, run, milestone) {
     return {};
 }
 
-function buildCodeReviewTask(run, { scope, changedAreas, round, budget, previousFindings, guidance }) {
+function buildCodeReviewTask(run, { scope, changedAreas, round, budget, previousFindings, guidance, userEvidence }) {
     const lines = [
         `Review ${scope}.`,
         ``,
@@ -2020,6 +2031,16 @@ function buildCodeReviewTask(run, { scope, changedAreas, round, budget, previous
             `was genuinely resolved, and review the current state of the code as a whole.`,
             ``,
             truncate(previousFindings, 12000),
+        );
+    }
+    if (userEvidence) {
+        lines.push(
+            ``,
+            `## User-provided decision, action, or evidence`,
+            ``,
+            `Treat this as the new authoritative evidence to verify against the current implementation:`,
+            ``,
+            truncate(userEvidence, 4000),
         );
     }
     lines.push(``, `Follow your output format exactly and end with your AUTODEV-VERDICT line.`);
@@ -2174,7 +2195,7 @@ const FINAL_REVIEWS = Object.freeze([
     { key: "codePrivacy", phase: "Code privacy review", title: "privacy", prompt: "autodev-code-privacy-review" },
 ]);
 
-async function runFinalReviews(ctx, run, { startKey = null, previousFindings = null } = {}) {
+async function runFinalReviews(ctx, run, { startKey = null, previousFindings = null, userEvidence = null } = {}) {
     const startIndex = startKey ? FINAL_REVIEWS.findIndex((review) => review.key === startKey) : 0;
     if (startIndex < 0) return { stop: `Unknown final review resume target: ${startKey}.` };
     for (const [index, review] of FINAL_REVIEWS.entries()) {
@@ -2182,6 +2203,7 @@ async function runFinalReviews(ctx, run, { startKey = null, previousFindings = n
         setPhase(ctx, run, review.phase);
         const outcome = await runFinalReview(ctx, run, review, {
             previousFindings: review.key === startKey ? previousFindings : null,
+            userEvidence: review.key === startKey ? userEvidence : null,
         });
         run.gates[review.key] = outcome;
         await writeStatus(run);
@@ -2202,7 +2224,12 @@ async function runFinalReviews(ctx, run, { startKey = null, previousFindings = n
     return {};
 }
 
-async function runFinalReview(ctx, run, review, { previousFindings: initialPreviousFindings = null } = {}) {
+async function runFinalReview(
+    ctx,
+    run,
+    review,
+    { previousFindings: initialPreviousFindings = null, userEvidence = null } = {},
+) {
     const guard = () => codeSnapshot(run.repoRoot, [run.planPath, run.todosPath]);
     let previousFindings = initialPreviousFindings;
     let guidance = "";
@@ -2228,6 +2255,7 @@ async function runFinalReview(ctx, run, review, { previousFindings: initialPrevi
                 budget,
                 previousFindings,
                 guidance,
+                userEvidence,
             }),
         });
 
@@ -2453,6 +2481,7 @@ const autodevFactory = defineFactory({
         };
 
         const startAt = args.startAt === "implement" ? "implement" : "plan";
+        if (args.resumeNeedsUser === true) await normalizeRepositoryRoot(run);
         const resume = args.resumeNeedsUser === true ? await loadNeedsUserResume(run, args.userEvidence) : null;
         if (resume?.error) {
             return {
@@ -2490,6 +2519,7 @@ const autodevFactory = defineFactory({
             const finalReviews = await runFinalReviews(ctx, run, {
                 startKey: resume.key,
                 previousFindings: resume.previousFindings,
+                userEvidence: resume.userEvidence,
             });
             if (finalReviews.stop) {
                 return wrapup(ctx, run, {
@@ -2513,6 +2543,7 @@ const autodevFactory = defineFactory({
             const gated = await runPlanGates(ctx, run, {
                 startKey: resume.key,
                 previousFindings: resume.previousFindings,
+                userEvidence: resume.userEvidence,
             });
             if (gated.stop) {
                 return wrapup(ctx, run, {

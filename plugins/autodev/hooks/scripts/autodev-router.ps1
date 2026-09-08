@@ -361,6 +361,13 @@ function Test-WorkflowNeedsUser {
         $safe = ($SessionId -replace '[^A-Za-z0-9._-]', '_')
         if ([string]::IsNullOrEmpty($safe)) { $safe = 'unknown-session' }
         if ([string]$state.sessionId -ne $safe) { return $true }
+        $valid = if ($Workflow -eq 'gates') {
+            Test-GateStateSemantics $state
+        }
+        else {
+            Test-StageStateSemantics $state
+        }
+        if (-not $valid) { return $true }
         return (Get-StateString $state 'securityVerdict' 'pending') -eq 'NEEDS-USER' -or
             (Get-StateString $state 'privacyVerdict' 'pending') -eq 'NEEDS-USER'
     }

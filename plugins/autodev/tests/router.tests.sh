@@ -159,6 +159,10 @@ assert_denied "a NEEDS-USER planning pause remains active at the session ceiling
   "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')"
 assert_routed "a NEEDS-USER planning pause routes an unrelated agent for denial" gates \
   "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"plan-needs-user","totalInvocations":40,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":10,"securityVerdict":"NEEDS-USER-corrupt","privacyVerdict":"pending"}' \
+  > "$GATES_DIR/plan-needs-user.json"
+assert_routed "a semantically corrupt planning state still routes an unrelated agent for mirror recovery" gates \
+  "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
 rm -f "$GATES_DIR/plan-needs-user.json"
 assert_routed "a remembered planning pause still routes an unrelated agent when authoritative state is missing" gates \
   "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
@@ -178,6 +182,10 @@ printf '%s' '{"sessionId":"implementation-needs-user","totalInvocations":150,"ta
 assert_denied "a NEEDS-USER implementation pause remains active at the session ceiling" \
   "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
 assert_routed "a NEEDS-USER implementation pause routes an unrelated agent for denial" stages \
+  "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"implementation-needs-user","totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"userReviewReached":1,"securityAttempts":10,"securityVerdict":"NEEDS-USER-corrupt","privacyVerdict":"pending"}' \
+  > "$STAGES_DIR/implementation-needs-user.json"
+assert_routed "a semantically corrupt implementation state still routes an unrelated agent for mirror recovery" stages \
   "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
 printf '%s' '{not-json' > "$STAGES_DIR/implementation-needs-user.json"
 assert_routed "a remembered implementation pause still routes an unrelated agent when authoritative state is corrupt" stages \
