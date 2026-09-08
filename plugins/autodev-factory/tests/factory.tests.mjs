@@ -206,6 +206,7 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
                 },
                 subagentCalls: 12,
                 planReviewerCalls: 3,
+                finalReviewReady: true,
                 gates: {
                     codeSecurity: { status: "passed", attempts: 1 },
                     codePrivacy: {
@@ -274,6 +275,7 @@ test("a resumed final review restores project commands before invoking a fixer",
                 },
                 subagentCalls: 8,
                 planReviewerCalls: 2,
+                finalReviewReady: true,
                 gates: {
                     codeSecurity: {
                         status: "needs-user",
@@ -445,6 +447,64 @@ test("factory resume rejects a paused reviewer whose prerequisites did not finis
 
     assert.equal(result.status, "needs-user");
     assert.match(result.reason, /prerequisite review state is missing or non-terminal: architecture, security/);
+    assert.deepEqual(labels, []);
+});
+
+test("factory resume rejects final security before milestones and checkpoint complete", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    await writeFile(
+        run.statusPath,
+        `${JSON.stringify(
+            {
+                runId: "invalid-final-prerequisite-run",
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                baseline: "e".repeat(40),
+                project: {
+                    context: "Persisted implementation context",
+                    build: "npm run build",
+                    test: "npm test",
+                    conventions: "",
+                },
+                subagentCalls: 5,
+                planReviewerCalls: 0,
+                finalReviewReady: false,
+                gates: {
+                    codeSecurity: {
+                        status: "needs-user",
+                        attempts: 1,
+                        findings: "Security approval required.",
+                    },
+                },
+                milestones: [],
+                notes: [],
+                violations: [],
+            },
+            null,
+            2,
+        )}\n`,
+        "utf8",
+    );
+
+    const labels = [];
+    const result = await autodevFactory.run({
+        args: {
+            repoRoot: run.repoRoot,
+            resumeNeedsUser: true,
+            userEvidence: "Security approval supplied.",
+        },
+        runId: "invalid-final-prerequisite-resume",
+        phase() {},
+        log() {},
+        async agent(_prompt, options) {
+            labels.push(options.label);
+            return "AUTODEV-VERDICT: PASS";
+        },
+    });
+
+    assert.equal(result.status, "needs-user");
+    assert.match(result.reason, /implementation milestones and the code checkpoint are not recorded as complete/);
     assert.deepEqual(labels, []);
 });
 

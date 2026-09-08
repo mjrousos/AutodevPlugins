@@ -163,6 +163,10 @@ printf '%s' '{"sessionId":"plan-needs-user","totalInvocations":40,"architectureA
   > "$GATES_DIR/plan-needs-user.json"
 assert_routed "a semantically corrupt planning state still routes an unrelated agent for mirror recovery" gates \
   "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"plan-needs-user","needsUserReached":3,"totalInvocations":40,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":10,"securityVerdict":"ISSUES","privacyVerdict":"pending"}' \
+  > "$GATES_DIR/plan-needs-user.json"
+assert_denied "an out-of-range planning pause marker keeps the cross-workflow guard active" \
+  "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')"
 rm -f "$GATES_DIR/plan-needs-user.json"
 assert_routed "a remembered planning pause still routes an unrelated agent when authoritative state is missing" gates \
   "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
@@ -187,6 +191,10 @@ printf '%s' '{"sessionId":"implementation-needs-user","totalInvocations":150,"ta
   > "$STAGES_DIR/implementation-needs-user.json"
 assert_routed "a semantically corrupt implementation state still routes an unrelated agent for mirror recovery" stages \
   "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"implementation-needs-user","needsUserReached":3,"totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"userReviewReached":1,"securityAttempts":10,"securityVerdict":"ISSUES","privacyVerdict":"pending"}' \
+  > "$STAGES_DIR/implementation-needs-user.json"
+assert_denied "an out-of-range implementation pause marker keeps the cross-workflow guard active" \
+  "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
 printf '%s' '{not-json' > "$STAGES_DIR/implementation-needs-user.json"
 assert_routed "a remembered implementation pause still routes an unrelated agent when authoritative state is corrupt" stages \
   "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"

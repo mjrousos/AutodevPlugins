@@ -613,6 +613,7 @@ async function writeStatus(run) {
         todosPath: run.todosPath,
         baseline: run.baseline,
         project: run.project,
+        finalReviewReady: run.finalReviewReady,
         subagentCalls: run.subagentCalls,
         planReviewerCalls: run.planReviewerCalls,
         gates: run.gates,
@@ -687,6 +688,21 @@ async function loadNeedsUserResume(run, userEvidence) {
                 `state is missing or non-terminal: ${missingPrerequisites.join(", ")}.`,
         };
     }
+    if (resume.flow === "final") {
+        const milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
+        const milestoneError = milestonesAreWellFormed(milestones);
+        if (
+            prior.finalReviewReady !== true ||
+            milestoneError !== null ||
+            milestones.some((milestone) => milestone.status !== "complete")
+        ) {
+            return {
+                error:
+                    `The paused ${resume.title} review cannot resume because implementation milestones ` +
+                    `and the code checkpoint are not recorded as complete.`,
+            };
+        }
+    }
     const maxAttempts = resume.flow === "plan" ? CAPS.planGateAttempts : CAPS.finalReviewRounds;
     const priorAttempts = priorOutcome.attempts;
     if (!Number.isSafeInteger(priorAttempts) || priorAttempts < 1 || priorAttempts > maxAttempts) {
@@ -710,6 +726,7 @@ async function loadNeedsUserResume(run, userEvidence) {
     }
     run.gates = { ...prior.gates };
     run.milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
+    run.finalReviewReady = prior.finalReviewReady === true;
     run.notes = Array.isArray(prior.notes) ? [...prior.notes] : [];
     run.violations = Array.isArray(prior.violations) ? [...prior.violations] : [];
     run.subagentCalls = priorSubagentCalls;
@@ -2576,6 +2593,7 @@ const autodevFactory = defineFactory({
             phase: "Intake",
             project: { context: "", build: "none found", test: "none found", conventions: "" },
             baseline: "uncommitted working tree",
+            finalReviewReady: false,
             planSummary: "",
             clarifications: [],
             milestones: [],
@@ -2712,6 +2730,8 @@ const autodevFactory = defineFactory({
 
         const checkpoint = await codeCheckpoint(ctx, run);
         if (checkpoint.stop) return wrapup(ctx, run, { status: "implemented", reason: checkpoint.stop });
+        run.finalReviewReady = true;
+        await writeStatus(run);
 
         const finalReviews = await runFinalReviews(ctx, run);
         if (finalReviews.stop) {
