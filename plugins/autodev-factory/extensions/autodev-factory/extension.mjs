@@ -611,6 +611,7 @@ async function writeStatus(run) {
         phase: run.phase,
         planPath: run.planPath,
         todosPath: run.todosPath,
+        baseline: run.baseline,
         subagentCalls: run.subagentCalls,
         planReviewerCalls: run.planReviewerCalls,
         gates: run.gates,
@@ -673,6 +674,13 @@ async function loadNeedsUserResume(run, userEvidence) {
     run.notes = Array.isArray(prior.notes) ? [...prior.notes] : [];
     run.violations = Array.isArray(prior.violations) ? [...prior.violations] : [];
     run.project.context = "Existing Autodev artifacts; resuming the paused reviewer before any other agent.";
+    const baseline = asText(prior.baseline).trim();
+    if (/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseline)) {
+        run.baseline = baseline;
+    } else {
+        const head = await git(run.repoRoot, ["rev-parse", "HEAD"]);
+        run.baseline = head.ok && head.stdout ? head.stdout : "uncommitted working tree";
+    }
     if (!run.request) run.request = `the existing plan at ${run.planPath}`;
 
     resume.previousFindings =
@@ -1486,6 +1494,14 @@ async function runPlanGates(ctx, run, { startKey = null, previousFindings = null
         if (outcome.status === "stopped") {
             return { stop: `The ${gate.title.toLowerCase()} gate was stopped by you.` };
         }
+        if (outcome.status === "process-violation") {
+            return {
+                stop:
+                    `The ${gate.title.toLowerCase()} reviewer did not remain verifiably read-only, so its ` +
+                    `NEEDS-USER verdict was not accepted and no revision agent was run. Inspect the process ` +
+                    `violation in ${run.feedbackPath} before starting another workflow run.`,
+            };
+        }
         if (outcome.status === "needs-user") {
             return {
                 needsUser: true,
@@ -1546,10 +1562,20 @@ async function runPlanGate(
         }
         if (
             review.verdict === "NEEDS-USER" &&
-            gate.key !== "architecture"
+            gate.key !== "architecture" &&
+            !review.violated &&
+            !review.unverified
         ) {
             ctx.log(`${gate.title} gate requires user action; stopping without invoking a revision agent`);
             return { status: "needs-user", attempts: attempt, findings: review.response };
+        }
+        if (review.verdict === "NEEDS-USER" && (review.violated || review.unverified)) {
+            ctx.log(`${gate.title} gate returned NEEDS-USER without a valid read-only guard; stopping the workflow`);
+            return {
+                status: "process-violation",
+                attempts: attempt,
+                reason: review.violated ? "reviewer modified the plan" : "reviewer read-only behavior could not be verified",
+            };
         }
 
         // A reviewer that edited the plan it was reviewing does not get to approve the result of
@@ -2210,6 +2236,14 @@ async function runFinalReviews(ctx, run, { startKey = null, previousFindings = n
         if (outcome.status === "stopped") {
             return { stop: `The ${review.title} review was stopped by you.` };
         }
+        if (outcome.status === "process-violation") {
+            return {
+                stop:
+                    `The ${review.title} reviewer did not remain verifiably read-only, so its NEEDS-USER ` +
+                    `verdict was not accepted and no fix agent was run. Inspect the process violation in ` +
+                    `${run.feedbackPath} before starting another workflow run.`,
+            };
+        }
         if (outcome.status === "needs-user") {
             return {
                 needsUser: true,
@@ -2263,9 +2297,17 @@ async function runFinalReview(
             ctx.log(`${review.title} review passed on round ${round}`);
             return { status: "passed", attempts: round };
         }
-        if (result.verdict === "NEEDS-USER") {
+        if (result.verdict === "NEEDS-USER" && !result.violated && !result.unverified) {
             ctx.log(`${review.title} review requires user action; stopping without invoking a fix agent`);
             return { status: "needs-user", attempts: round, findings: result.response };
+        }
+        if (result.verdict === "NEEDS-USER" && (result.violated || result.unverified)) {
+            ctx.log(`${review.title} review returned NEEDS-USER without a valid read-only guard; stopping the workflow`);
+            return {
+                status: "process-violation",
+                attempts: round,
+                reason: result.violated ? "reviewer changed the tree" : "reviewer read-only behavior could not be verified",
+            };
         }
         // Same rule as the gates: it reviewed its own edit, or its restraint could not be
         // checked, so the PASS does not stand.

@@ -100,12 +100,14 @@ test("readVerdict refuses a verdict that is not the last thing in the response",
 });
 
 async function createReviewRun() {
-    const repoRoot = await mkdtemp(join(tmpdir(), "autodev-factory-review-"));
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "autodev-factory-review-"));
+    await execFileAsync("git", ["init", "--quiet"], { cwd: temporaryRoot });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: temporaryRoot });
+    const repoRoot = resolve(stdout.trim());
     const paths = artifactPaths(repoRoot);
     await mkdir(resolve(repoRoot, ".autodev"), { recursive: true });
     await writeFile(paths.planPath, "# Plan\n", "utf8");
     await writeFile(paths.todosPath, "# Todos\n", "utf8");
-    await execFileAsync("git", ["init", "--quiet"], { cwd: repoRoot });
     return {
         repoRoot,
         ...paths,
@@ -124,7 +126,7 @@ async function createReviewRun() {
     };
 }
 
-test("plan NEEDS-USER stops before a reviser even when the reviewer changed the plan", async (t) => {
+test("plan NEEDS-USER with a reviewer write stops as a process violation", async (t) => {
     const run = await createReviewRun();
     t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
     const labels = [];
@@ -143,12 +145,12 @@ test("plan NEEDS-USER stops before a reviser even when the reviewer changed the 
         prompt: "autodev-security-review",
     });
 
-    assert.equal(outcome.status, "needs-user");
+    assert.equal(outcome.status, "process-violation");
     assert.deepEqual(labels, ["plan-gate:security:1"]);
     assert.equal(run.violations[0]?.kind, "reviewer-write");
 });
 
-test("implementation NEEDS-USER stops before a fixer even when the reviewer changed code", async (t) => {
+test("implementation NEEDS-USER with a reviewer write stops as a process violation", async (t) => {
     const run = await createReviewRun();
     t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
     const sourcePath = resolve(run.repoRoot, "source.txt");
@@ -170,7 +172,7 @@ test("implementation NEEDS-USER stops before a fixer even when the reviewer chan
         prompt: "autodev-code-security-review",
     });
 
-    assert.equal(outcome.status, "needs-user");
+    assert.equal(outcome.status, "process-violation");
     assert.deepEqual(labels, ["final-review:codeSecurity:1"]);
     assert.equal(run.violations[0]?.kind, "reviewer-write");
 });
@@ -187,6 +189,7 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
                 runId: "prior-run",
                 planPath: run.planPath,
                 todosPath: run.todosPath,
+                baseline: "a".repeat(40),
                 gates: {
                     codeSecurity: { status: "passed", attempts: 1 },
                     codePrivacy: {
@@ -228,6 +231,7 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
     assert.deepEqual(labels, ["final-review:codePrivacy:1"]);
     assert.match(prompts[0], /Approved by the privacy owner in issue #123/);
     assert.match(prompts[0], /User-provided decision, action, or evidence/);
+    assert.match(prompts[0], new RegExp(`Baseline: ${"a".repeat(40)}`));
 });
 
 test("a resumed plan gate that still needs user action stops without replaying planning agents", async (t) => {
