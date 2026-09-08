@@ -703,13 +703,28 @@ async function loadNeedsUserResume(run, userEvidence) {
             };
         }
     }
-    const maxAttempts = resume.flow === "plan" ? CAPS.planGateAttempts : CAPS.finalReviewRounds;
+    const attemptWindow = resume.flow === "plan" ? CAPS.planGateAttempts : CAPS.finalReviewRounds;
     const priorAttempts = priorOutcome.attempts;
-    if (!Number.isSafeInteger(priorAttempts) || priorAttempts < 1 || priorAttempts > maxAttempts) {
+    const derivedEscalations = Math.ceil(priorAttempts / attemptWindow) - 1;
+    const priorEscalations =
+        priorOutcome.escalations === undefined ? derivedEscalations : priorOutcome.escalations;
+    const priorBudget =
+        priorOutcome.budget === undefined ? attemptWindow * (priorEscalations + 1) : priorOutcome.budget;
+    if (
+        !Number.isSafeInteger(priorAttempts) ||
+        priorAttempts < 1 ||
+        !Number.isSafeInteger(priorEscalations) ||
+        priorEscalations < 0 ||
+        priorEscalations > CAPS.escalationsPerStage ||
+        !Number.isSafeInteger(priorBudget) ||
+        priorBudget !== attemptWindow * (priorEscalations + 1) ||
+        priorAttempts > priorBudget
+    ) {
         return {
             error:
-                `The paused ${resume.title.toLowerCase()} review has an invalid attempt count ` +
-                `(${String(priorAttempts)}); expected 1-${maxAttempts}.`,
+                `The paused ${resume.title.toLowerCase()} review has invalid retry state ` +
+                `(attempt ${String(priorAttempts)}, budget ${String(priorBudget)}, ` +
+                `escalations ${String(priorEscalations)}).`,
         };
     }
     const priorSubagentCalls = prior.subagentCalls;
@@ -754,6 +769,9 @@ async function loadNeedsUserResume(run, userEvidence) {
         asText(priorOutcome.findings).trim() || "The prior reviewer paused for required user action.";
     resume.userEvidence = evidence;
     resume.attempt = priorAttempts;
+    resume.budget = priorBudget;
+    resume.escalations = priorEscalations;
+    resume.guidance = asText(priorOutcome.guidance);
     return resume;
 }
 
@@ -1550,7 +1568,15 @@ async function approvePlan(ctx, run) {
 async function runPlanGates(
     ctx,
     run,
-    { startKey = null, previousFindings = null, userEvidence = null, resumeAttempt = null } = {},
+    {
+        startKey = null,
+        previousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
 ) {
     const startIndex = startKey ? PLAN_GATES.findIndex((gate) => gate.key === startKey) : 0;
     if (startIndex < 0) return { stop: `Unknown plan review resume target: ${startKey}.` };
@@ -1561,6 +1587,9 @@ async function runPlanGates(
             previousFindings: gate.key === startKey ? previousFindings : null,
             userEvidence: gate.key === startKey ? userEvidence : null,
             resumeAttempt: gate.key === startKey ? resumeAttempt : null,
+            resumeBudget: gate.key === startKey ? resumeBudget : null,
+            resumeEscalations: gate.key === startKey ? resumeEscalations : null,
+            resumeGuidance: gate.key === startKey ? resumeGuidance : null,
         });
         run.gates[gate.key] = outcome;
         await writeStatus(run);
@@ -1593,14 +1622,21 @@ async function runPlanGate(
     ctx,
     run,
     gate,
-    { previousFindings: initialPreviousFindings = null, userEvidence = null, resumeAttempt = null } = {},
+    {
+        previousFindings: initialPreviousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
 ) {
     const guard = () => fileSnapshot(run.planPath);
     let previousFindings = initialPreviousFindings;
-    let guidance = "";
-    let escalations = 0;
+    let guidance = resumeGuidance ?? "";
+    let escalations = resumeEscalations ?? 0;
     let attempt = resumeAttempt === null ? 0 : resumeAttempt - 1;
-    let budget = CAPS.planGateAttempts;
+    let budget = resumeBudget ?? CAPS.planGateAttempts;
 
     while (attempt < budget) {
         const resumingPausedAttempt = resumeAttempt !== null && attempt === resumeAttempt - 1;
@@ -1641,7 +1677,14 @@ async function runPlanGate(
             !review.unverified
         ) {
             ctx.log(`${gate.title} gate requires user action; stopping without invoking a revision agent`);
-            return { status: "needs-user", attempts: attempt, findings: review.response };
+            return {
+                status: "needs-user",
+                attempts: attempt,
+                budget,
+                escalations,
+                guidance,
+                findings: review.response,
+            };
         }
         if (review.verdict === "NEEDS-USER" && (review.violated || review.unverified)) {
             ctx.log(`${gate.title} gate returned NEEDS-USER without a valid read-only guard; stopping the workflow`);
@@ -2298,7 +2341,15 @@ const FINAL_REVIEWS = Object.freeze([
 async function runFinalReviews(
     ctx,
     run,
-    { startKey = null, previousFindings = null, userEvidence = null, resumeAttempt = null } = {},
+    {
+        startKey = null,
+        previousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
 ) {
     const startIndex = startKey ? FINAL_REVIEWS.findIndex((review) => review.key === startKey) : 0;
     if (startIndex < 0) return { stop: `Unknown final review resume target: ${startKey}.` };
@@ -2309,6 +2360,9 @@ async function runFinalReviews(
             previousFindings: review.key === startKey ? previousFindings : null,
             userEvidence: review.key === startKey ? userEvidence : null,
             resumeAttempt: review.key === startKey ? resumeAttempt : null,
+            resumeBudget: review.key === startKey ? resumeBudget : null,
+            resumeEscalations: review.key === startKey ? resumeEscalations : null,
+            resumeGuidance: review.key === startKey ? resumeGuidance : null,
         });
         run.gates[review.key] = outcome;
         await writeStatus(run);
@@ -2341,14 +2395,21 @@ async function runFinalReview(
     ctx,
     run,
     review,
-    { previousFindings: initialPreviousFindings = null, userEvidence = null, resumeAttempt = null } = {},
+    {
+        previousFindings: initialPreviousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
 ) {
     const guard = () => codeSnapshot(run.repoRoot, [run.planPath, run.todosPath]);
     let previousFindings = initialPreviousFindings;
-    let guidance = "";
-    let escalations = 0;
+    let guidance = resumeGuidance ?? "";
+    let escalations = resumeEscalations ?? 0;
     let round = resumeAttempt === null ? 0 : resumeAttempt - 1;
-    let budget = CAPS.finalReviewRounds;
+    let budget = resumeBudget ?? CAPS.finalReviewRounds;
 
     while (round < budget) {
         round += 1;
@@ -2378,7 +2439,14 @@ async function runFinalReview(
         }
         if (result.verdict === "NEEDS-USER" && !result.violated && !result.unverified) {
             ctx.log(`${review.title} review requires user action; stopping without invoking a fix agent`);
-            return { status: "needs-user", attempts: round, findings: result.response };
+            return {
+                status: "needs-user",
+                attempts: round,
+                budget,
+                escalations,
+                guidance,
+                findings: result.response,
+            };
         }
         if (result.verdict === "NEEDS-USER" && (result.violated || result.unverified)) {
             ctx.log(`${review.title} review returned NEEDS-USER without a valid read-only guard; stopping the workflow`);
@@ -2647,6 +2715,9 @@ const autodevFactory = defineFactory({
                 previousFindings: resume.previousFindings,
                 userEvidence: resume.userEvidence,
                 resumeAttempt: resume.attempt,
+                resumeBudget: resume.budget,
+                resumeEscalations: resume.escalations,
+                resumeGuidance: resume.guidance,
             });
             if (finalReviews.stop) {
                 return wrapup(ctx, run, {
@@ -2673,6 +2744,9 @@ const autodevFactory = defineFactory({
                 previousFindings: resume.previousFindings,
                 userEvidence: resume.userEvidence,
                 resumeAttempt: resume.attempt,
+                resumeBudget: resume.budget,
+                resumeEscalations: resume.escalations,
+                resumeGuidance: resume.guidance,
             });
             if (gated.stop) {
                 return wrapup(ctx, run, {

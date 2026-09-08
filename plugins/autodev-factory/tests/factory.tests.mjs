@@ -211,7 +211,10 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
                     codeSecurity: { status: "passed", attempts: 1 },
                     codePrivacy: {
                         status: "needs-user",
-                        attempts: 10,
+                        attempts: 11,
+                        budget: 20,
+                        escalations: 1,
+                        guidance: "Retry with the approved retention decision.",
                         findings: "x".repeat(13000),
                     },
                 },
@@ -248,9 +251,11 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
     assert.equal(result.status, "completed");
     assert.equal(result.subagentCalls, 13);
     assert.equal(result.repoRoot, run.repoRoot);
-    assert.deepEqual(labels, ["final-review:codePrivacy:10"]);
+    assert.deepEqual(labels, ["final-review:codePrivacy:11"]);
     assert.match(prompts[0], /Approved by the privacy owner in issue #123/);
     assert.match(prompts[0], /User-provided decision, action, or evidence/);
+    assert.match(prompts[0], /Retry with the approved retention decision/);
+    assert.match(prompts[0], /round 11 of at most 20/);
     assert.match(prompts[0], new RegExp(`Baseline: ${"a".repeat(40)}`));
     assert.match(await readFile(run.auditPath, "utf8"), /Run: `resumed-run`/);
     assert.match(await readFile(run.feedbackPath, "utf8"), /# Resumed /);
@@ -344,7 +349,10 @@ test("a resumed plan gate that still needs user action stops without replaying p
                     architecture: { status: "passed", attempts: 1 },
                     security: {
                         status: "needs-user",
-                        attempts: 7,
+                        attempts: 17,
+                        budget: 20,
+                        escalations: 1,
+                        guidance: "Retry after the owner records the decision.",
                         findings: "y".repeat(13000),
                     },
                 },
@@ -378,8 +386,10 @@ test("a resumed plan gate that still needs user action stops without replaying p
 
     assert.equal(result.status, "needs-user");
     assert.equal(result.subagentCalls, 41);
-    assert.deepEqual(labels, ["plan-gate:security:7"]);
+    assert.deepEqual(labels, ["plan-gate:security:17"]);
     assert.match(prompts[0], /The owner deferred the decision; no approval exists yet/);
+    assert.match(prompts[0], /Retry after the owner records the decision/);
+    assert.match(prompts[0], /attempt 17 of at most 20/);
     const { stdout: currentHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: run.repoRoot });
     const resumedStatus = JSON.parse(await readFile(run.statusPath, "utf8"));
     assert.equal(resumedStatus.baseline, currentHead.trim());
@@ -391,6 +401,68 @@ test("a resumed plan gate that still needs user action stops without replaying p
         conventions: "Follow repository conventions.",
     });
     assert.equal(resumedStatus.planReviewerCalls, 41);
+    assert.equal(resumedStatus.gates.security.attempts, 17);
+    assert.equal(resumedStatus.gates.security.budget, 20);
+    assert.equal(resumedStatus.gates.security.escalations, 1);
+});
+
+test("factory resume derives an extended retry window for legacy paused status", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    await writeFile(
+        run.statusPath,
+        `${JSON.stringify(
+            {
+                runId: "legacy-extended-run",
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                baseline: "f".repeat(40),
+                project: {
+                    context: "Persisted plan context",
+                    build: "dotnet build",
+                    test: "dotnet test",
+                    conventions: "",
+                },
+                subagentCalls: 15,
+                planReviewerCalls: 15,
+                gates: {
+                    architecture: { status: "passed", attempts: 1 },
+                    security: {
+                        status: "needs-user",
+                        attempts: 15,
+                        findings: "Owner decision required.",
+                    },
+                },
+                milestones: [],
+                notes: [],
+                violations: [],
+            },
+            null,
+            2,
+        )}\n`,
+        "utf8",
+    );
+
+    const prompts = [];
+    const result = await autodevFactory.run({
+        args: {
+            repoRoot: run.repoRoot,
+            resumeNeedsUser: true,
+            userEvidence: "The owner supplied the decision.",
+        },
+        runId: "legacy-extended-resume",
+        phase() {},
+        log() {},
+        async agent(prompt) {
+            prompts.push(prompt);
+            return "## Required user action\n\nMore evidence is required.\n\nAUTODEV-VERDICT: NEEDS-USER";
+        },
+    });
+
+    assert.equal(result.status, "needs-user");
+    assert.match(prompts[0], /attempt 15 of at most 20/);
+    assert.equal(result.planGates.security.budget, 20);
+    assert.equal(result.planGates.security.escalations, 1);
 });
 
 test("factory resume rejects a paused reviewer whose prerequisites did not finish", async (t) => {
