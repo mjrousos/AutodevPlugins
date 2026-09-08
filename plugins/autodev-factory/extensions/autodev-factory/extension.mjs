@@ -669,6 +669,15 @@ async function loadNeedsUserResume(run, userEvidence) {
 
     const resume = waiting[0];
     const priorOutcome = prior.gates[resume.key];
+    const maxAttempts = resume.flow === "plan" ? CAPS.planGateAttempts : CAPS.finalReviewRounds;
+    const priorAttempts = priorOutcome.attempts;
+    if (!Number.isSafeInteger(priorAttempts) || priorAttempts < 1 || priorAttempts > maxAttempts) {
+        return {
+            error:
+                `The paused ${resume.title.toLowerCase()} review has an invalid attempt count ` +
+                `(${String(priorAttempts)}); expected 1-${maxAttempts}.`,
+        };
+    }
     run.gates = { ...prior.gates };
     run.milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
     run.notes = Array.isArray(prior.notes) ? [...prior.notes] : [];
@@ -686,6 +695,7 @@ async function loadNeedsUserResume(run, userEvidence) {
     resume.previousFindings =
         asText(priorOutcome.findings).trim() || "The prior reviewer paused for required user action.";
     resume.userEvidence = evidence;
+    resume.attempt = priorAttempts;
     return resume;
 }
 
@@ -1479,7 +1489,11 @@ async function approvePlan(ctx, run) {
  * Sequential, deliberately: each reviewer should see the plan as amended by the previous one.
  * ------------------------------------------------------------------------------------------- */
 
-async function runPlanGates(ctx, run, { startKey = null, previousFindings = null, userEvidence = null } = {}) {
+async function runPlanGates(
+    ctx,
+    run,
+    { startKey = null, previousFindings = null, userEvidence = null, resumeAttempt = null } = {},
+) {
     const startIndex = startKey ? PLAN_GATES.findIndex((gate) => gate.key === startKey) : 0;
     if (startIndex < 0) return { stop: `Unknown plan review resume target: ${startKey}.` };
     for (const [index, gate] of PLAN_GATES.entries()) {
@@ -1488,6 +1502,7 @@ async function runPlanGates(ctx, run, { startKey = null, previousFindings = null
         const outcome = await runPlanGate(ctx, run, gate, {
             previousFindings: gate.key === startKey ? previousFindings : null,
             userEvidence: gate.key === startKey ? userEvidence : null,
+            resumeAttempt: gate.key === startKey ? resumeAttempt : null,
         });
         run.gates[gate.key] = outcome;
         await writeStatus(run);
@@ -1520,13 +1535,13 @@ async function runPlanGate(
     ctx,
     run,
     gate,
-    { previousFindings: initialPreviousFindings = null, userEvidence = null } = {},
+    { previousFindings: initialPreviousFindings = null, userEvidence = null, resumeAttempt = null } = {},
 ) {
     const guard = () => fileSnapshot(run.planPath);
     let previousFindings = initialPreviousFindings;
     let guidance = "";
     let escalations = 0;
-    let attempt = 0;
+    let attempt = resumeAttempt === null ? 0 : resumeAttempt - 1;
     let budget = CAPS.planGateAttempts;
 
     while (attempt < budget) {
@@ -2221,7 +2236,11 @@ const FINAL_REVIEWS = Object.freeze([
     { key: "codePrivacy", phase: "Code privacy review", title: "privacy", prompt: "autodev-code-privacy-review" },
 ]);
 
-async function runFinalReviews(ctx, run, { startKey = null, previousFindings = null, userEvidence = null } = {}) {
+async function runFinalReviews(
+    ctx,
+    run,
+    { startKey = null, previousFindings = null, userEvidence = null, resumeAttempt = null } = {},
+) {
     const startIndex = startKey ? FINAL_REVIEWS.findIndex((review) => review.key === startKey) : 0;
     if (startIndex < 0) return { stop: `Unknown final review resume target: ${startKey}.` };
     for (const [index, review] of FINAL_REVIEWS.entries()) {
@@ -2230,6 +2249,7 @@ async function runFinalReviews(ctx, run, { startKey = null, previousFindings = n
         const outcome = await runFinalReview(ctx, run, review, {
             previousFindings: review.key === startKey ? previousFindings : null,
             userEvidence: review.key === startKey ? userEvidence : null,
+            resumeAttempt: review.key === startKey ? resumeAttempt : null,
         });
         run.gates[review.key] = outcome;
         await writeStatus(run);
@@ -2262,13 +2282,13 @@ async function runFinalReview(
     ctx,
     run,
     review,
-    { previousFindings: initialPreviousFindings = null, userEvidence = null } = {},
+    { previousFindings: initialPreviousFindings = null, userEvidence = null, resumeAttempt = null } = {},
 ) {
     const guard = () => codeSnapshot(run.repoRoot, [run.planPath, run.todosPath]);
     let previousFindings = initialPreviousFindings;
     let guidance = "";
     let escalations = 0;
-    let round = 0;
+    let round = resumeAttempt === null ? 0 : resumeAttempt - 1;
     let budget = CAPS.finalReviewRounds;
 
     while (round < budget) {
@@ -2369,6 +2389,9 @@ function gateLine(title, outcome) {
     if (outcome.status === "passed") return `- ${title}: passed on attempt ${outcome.attempts}`;
     if (outcome.status === "stopped") return `- ${title}: stopped by the user after ${outcome.attempts} attempts`;
     if (outcome.status === "needs-user") return `- ${title}: **waiting for required user action** after attempt ${outcome.attempts}`;
+    if (outcome.status === "process-violation") {
+        return `- ${title}: **process violation** on attempt ${outcome.attempts} (${outcome.reason})`;
+    }
     return `- ${title}: **escalated** after ${outcome.attempts} attempts (${outcome.reason})`;
 }
 
@@ -2562,6 +2585,7 @@ const autodevFactory = defineFactory({
                 startKey: resume.key,
                 previousFindings: resume.previousFindings,
                 userEvidence: resume.userEvidence,
+                resumeAttempt: resume.attempt,
             });
             if (finalReviews.stop) {
                 return wrapup(ctx, run, {
@@ -2586,6 +2610,7 @@ const autodevFactory = defineFactory({
                 startKey: resume.key,
                 previousFindings: resume.previousFindings,
                 userEvidence: resume.userEvidence,
+                resumeAttempt: resume.attempt,
             });
             if (gated.stop) {
                 return wrapup(ctx, run, {
@@ -2686,6 +2711,7 @@ export {
     CAPS,
     describeChanges,
     escapeCell,
+    gateLine,
     milestonesAreWellFormed,
     parseMilestones,
     questionsToSchema,

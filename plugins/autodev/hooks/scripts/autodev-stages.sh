@@ -1173,9 +1173,10 @@ $FOOTER" '{modifiedResponse: $r}' 2>/dev/null || emit_empty
         else
           WAITING_AGENT='code-privacy-review'
         fi
+        WAITING_ATTEMPT="$(state_num "$STATE" "$(attempts_key "$WAITING_AGENT")")"
         STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 1')"
         write_state "$STATE"
-        add_audit_row "$WAITING_AGENT" "-" "0" "waiting for user" "NEEDS-USER"
+        add_audit_row "$WAITING_AGENT" "-" "$WAITING_ATTEMPT" "waiting for user" "NEEDS-USER"
       fi
       emit_empty
     fi

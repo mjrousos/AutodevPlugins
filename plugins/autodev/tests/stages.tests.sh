@@ -399,6 +399,8 @@ AUTODEV-VERDICT: NEEDS-USER' | jq -r '.modifiedResponse // ""')"
   assert_match '"permissionDecision":"deny"' "$(tool_check "$sid" ask_user)" || return 1
 
   assert_equal '{}' "$(agent_stop "$sid")" || return 1
+  assert_match '\| code-security-review \| - \| 10 \| waiting for user \| NEEDS-USER \|' \
+    "$(cat "$(view_path "$sid" 'implement-gate-audit.md')")" || return 1
   assert_equal '{}' "$(agent_task_check "$sid" code-security-review)" || return 1
   start_agent "$sid" code-security-review
   assert_equal '10' "$(jq -r '.securityAttempts' "$(state_path "$sid")")" || return 1

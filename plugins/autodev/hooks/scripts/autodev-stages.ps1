@@ -1473,8 +1473,10 @@ try {
                     else {
                         'code-privacy-review'
                     }
+                    $attemptsKey = Get-AttemptsKey -Agent $waitingStage
                     Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $waitingStage `
-                        -Milestone '-' -Attempt 0 -Action 'waiting for user' -Verdict 'NEEDS-USER'
+                        -Milestone '-' -Attempt ([int]$state[$attemptsKey]) `
+                        -Action 'waiting for user' -Verdict 'NEEDS-USER'
                 }
                 Write-JsonResult @{}
                 exit 0

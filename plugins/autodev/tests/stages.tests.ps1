@@ -437,6 +437,8 @@ AUTODEV-VERDICT: NEEDS-USER
     Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
 
     Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
+    $audit = Get-Content -LiteralPath (Get-ViewPath $sid 'implement-gate-audit.md') -Raw
+    Assert-Match '\| code-security-review \| - \| 10 \| waiting for user \| NEEDS-USER \|' $audit
     Assert-Equal '{}' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
     Start-Agent -SessionId $sid -Agent 'code-security-review'
     $running = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json

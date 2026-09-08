@@ -28,6 +28,7 @@ const {
     CAPS,
     describeChanges,
     escapeCell,
+    gateLine,
     milestonesAreWellFormed,
     parseMilestones,
     questionsToSchema,
@@ -194,7 +195,7 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
                     codeSecurity: { status: "passed", attempts: 1 },
                     codePrivacy: {
                         status: "needs-user",
-                        attempts: 1,
+                        attempts: 10,
                         findings: "x".repeat(13000),
                     },
                 },
@@ -228,7 +229,7 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
 
     assert.equal(result.status, "completed");
     assert.equal(result.repoRoot, run.repoRoot);
-    assert.deepEqual(labels, ["final-review:codePrivacy:1"]);
+    assert.deepEqual(labels, ["final-review:codePrivacy:10"]);
     assert.match(prompts[0], /Approved by the privacy owner in issue #123/);
     assert.match(prompts[0], /User-provided decision, action, or evidence/);
     assert.match(prompts[0], new RegExp(`Baseline: ${"a".repeat(40)}`));
@@ -248,7 +249,7 @@ test("a resumed plan gate that still needs user action stops without replaying p
                     architecture: { status: "passed", attempts: 1 },
                     security: {
                         status: "needs-user",
-                        attempts: 1,
+                        attempts: 7,
                         findings: "y".repeat(13000),
                     },
                 },
@@ -281,8 +282,19 @@ test("a resumed plan gate that still needs user action stops without replaying p
     });
 
     assert.equal(result.status, "needs-user");
-    assert.deepEqual(labels, ["plan-gate:security:1"]);
+    assert.deepEqual(labels, ["plan-gate:security:7"]);
     assert.match(prompts[0], /The owner deferred the decision; no approval exists yet/);
+});
+
+test("gateLine reports reviewer integrity failures as process violations", () => {
+    assert.equal(
+        gateLine("Security", {
+            status: "process-violation",
+            attempts: 3,
+            reason: "reviewer modified the plan",
+        }),
+        "- Security: **process violation** on attempt 3 (reviewer modified the plan)",
+    );
 });
 
 /* ---------------------------------------------------------------------------------------------
