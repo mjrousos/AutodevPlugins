@@ -732,6 +732,14 @@ Test-Case 'a negative counter is rejected as corrupt' {
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
 }
 
+Test-Case 'an out-of-range NEEDS-USER marker is rejected as corrupt' {
+    $sid = New-SessionId
+    $statePath = Get-StatePath $sid
+    New-Item -ItemType Directory -Path (Split-Path $statePath -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $statePath -Value "{`"sessionId`":`"$sid`",`"needsUserReached`":3,`"taskingAttempts`":1,`"taskingVerdict`":`"running`"}" -Encoding UTF8
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+}
+
 Test-Case 'a corrupt authoritative file falls back to the valid mirror' {
     $sid = New-SessionId
     # A real run first, so a valid mirror exists in the workspace.

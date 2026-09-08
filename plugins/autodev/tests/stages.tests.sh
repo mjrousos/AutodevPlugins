@@ -661,6 +661,17 @@ t_negative_counter() {
 }
 run_test 'a negative counter is rejected as corrupt' t_negative_counter
 
+t_invalid_needs_user_marker() {
+  local sid path
+  sid="$(new_session_id)"
+  path="$(state_path "$sid")"
+  mkdir -p "$(dirname "$path")"
+  jq -n --arg s "$sid" \
+    '{sessionId:$s, needsUserReached:3, taskingAttempts:1, taskingVerdict:"running"}' > "$path"
+  assert_equal '{}' "$(tool_check "$sid" 'ask_user')"
+}
+run_test 'an out-of-range NEEDS-USER marker is rejected as corrupt' t_invalid_needs_user_marker
+
 t_mirror_recovery() {
   local sid
   sid="$(new_session_id)"

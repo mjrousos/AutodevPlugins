@@ -670,6 +670,23 @@ async function loadNeedsUserResume(run, userEvidence) {
 
     const resume = waiting[0];
     const priorOutcome = prior.gates[resume.key];
+    const terminal = (key) => ["passed", "escalated"].includes(prior.gates[key]?.status);
+    const prerequisites =
+        resume.key === "security"
+            ? ["architecture"]
+            : resume.key === "privacy"
+              ? ["architecture", "security"]
+              : resume.key === "codePrivacy"
+                ? ["codeSecurity"]
+                : [];
+    const missingPrerequisites = prerequisites.filter((key) => !terminal(key));
+    if (missingPrerequisites.length > 0) {
+        return {
+            error:
+                `The paused ${resume.title.toLowerCase()} review cannot resume because prerequisite review ` +
+                `state is missing or non-terminal: ${missingPrerequisites.join(", ")}.`,
+        };
+    }
     const maxAttempts = resume.flow === "plan" ? CAPS.planGateAttempts : CAPS.finalReviewRounds;
     const priorAttempts = priorOutcome.attempts;
     if (!Number.isSafeInteger(priorAttempts) || priorAttempts < 1 || priorAttempts > maxAttempts) {
@@ -679,10 +696,24 @@ async function loadNeedsUserResume(run, userEvidence) {
                 `(${String(priorAttempts)}); expected 1-${maxAttempts}.`,
         };
     }
+    const priorSubagentCalls = prior.subagentCalls;
+    const priorPlanReviewerCalls = prior.planReviewerCalls;
+    if (!Number.isSafeInteger(priorSubagentCalls) || priorSubagentCalls < 0) {
+        return { error: "The paused factory status has an invalid subagent invocation count." };
+    }
+    if (
+        !Number.isSafeInteger(priorPlanReviewerCalls) ||
+        priorPlanReviewerCalls < 0 ||
+        priorPlanReviewerCalls > priorSubagentCalls
+    ) {
+        return { error: "The paused factory status has an invalid plan reviewer invocation count." };
+    }
     run.gates = { ...prior.gates };
     run.milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
     run.notes = Array.isArray(prior.notes) ? [...prior.notes] : [];
     run.violations = Array.isArray(prior.violations) ? [...prior.violations] : [];
+    run.subagentCalls = priorSubagentCalls;
+    run.planReviewerCalls = priorPlanReviewerCalls;
     const priorProject =
         prior.project && typeof prior.project === "object" && !Array.isArray(prior.project) ? prior.project : {};
     run.project = {
@@ -1555,7 +1586,8 @@ async function runPlanGate(
     let budget = CAPS.planGateAttempts;
 
     while (attempt < budget) {
-        if (run.planReviewerCalls >= CAPS.planReviewerCalls) {
+        const resumingPausedAttempt = resumeAttempt !== null && attempt === resumeAttempt - 1;
+        if (run.planReviewerCalls >= CAPS.planReviewerCalls && !resumingPausedAttempt) {
             run.notes.push(
                 `The ${gate.title.toLowerCase()} gate stopped at the ${CAPS.planReviewerCalls}-call ceiling for plan reviewers.`,
             );
@@ -1574,7 +1606,7 @@ async function runPlanGate(
             guard,
             // The model fallback is a second reviewer subagent, so it is only offered when the
             // ceiling can actually pay for it. Otherwise a run sitting at 39 could finish at 41.
-            maxInvocations: CAPS.planReviewerCalls - run.planReviewerCalls,
+            maxInvocations: Math.max(1, CAPS.planReviewerCalls - run.planReviewerCalls),
             task: buildGateTask(run, gate, attempt, budget, previousFindings, guidance, userEvidence),
         });
         // Charged after the fact and by actual invocation count, because a model fallback inside
@@ -2590,6 +2622,7 @@ const autodevFactory = defineFactory({
         }
 
         if (resume?.flow === "final") {
+            await initTrail(run);
             run.notes.push(`Resumed the paused ${resume.title} review with user-provided evidence before invoking any other agent.`);
             const finalReviews = await runFinalReviews(ctx, run, {
                 startKey: resume.key,
@@ -2615,6 +2648,7 @@ const autodevFactory = defineFactory({
 
         // --- Planning -------------------------------------------------------------------
         if (resume?.flow === "plan") {
+            await initTrail(run);
             run.notes.push(`Resumed the paused ${resume.title} gate with user-provided evidence before invoking any other agent.`);
             const gated = await runPlanGates(ctx, run, {
                 startKey: resume.key,

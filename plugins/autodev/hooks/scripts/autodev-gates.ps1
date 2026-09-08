@@ -161,7 +161,8 @@ function Read-State {
                     [Globalization.CultureInfo]::InvariantCulture)
                 if ($rendered -notmatch '^[0-9]+$' -or
                     -not [int]::TryParse($rendered, [ref]$normalized) -or
-                    $normalized -lt 0) {
+                    $normalized -lt 0 -or
+                    ($key -eq 'needsUserReached' -and $normalized -gt 2)) {
                     throw "Invalid state counter '$key'."
                 }
                 $state[$key] = $normalized

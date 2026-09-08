@@ -396,6 +396,7 @@ t_semantic_corruption_uses_mirror() {
     'negative counter|.architectureAttempts = -1' \
     'exponent-sized counter|.totalInvocations = 1e30' \
     'signed numeric string|.blocks = "+5"' \
+    'out-of-range user marker|.needsUserReached = 3' \
     'unknown verdict|.architectureVerdict = "PASSING"'; do
     name="${spec%%|*}"
     filter="${spec#*|}"

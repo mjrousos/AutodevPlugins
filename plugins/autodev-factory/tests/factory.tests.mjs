@@ -204,6 +204,8 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
                     test: "npm test",
                     conventions: "Use the existing store pattern.",
                 },
+                subagentCalls: 12,
+                planReviewerCalls: 3,
                 gates: {
                     codeSecurity: { status: "passed", attempts: 1 },
                     codePrivacy: {
@@ -221,6 +223,8 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
         )}\n`,
         "utf8",
     );
+    await writeFile(run.auditPath, "# Prior audit\n", "utf8");
+    await writeFile(run.feedbackPath, "# Prior feedback\n", "utf8");
 
     const labels = [];
     const prompts = [];
@@ -241,11 +245,14 @@ test("a new factory run resumes the recorded NEEDS-USER reviewer before any othe
     });
 
     assert.equal(result.status, "completed");
+    assert.equal(result.subagentCalls, 13);
     assert.equal(result.repoRoot, run.repoRoot);
     assert.deepEqual(labels, ["final-review:codePrivacy:10"]);
     assert.match(prompts[0], /Approved by the privacy owner in issue #123/);
     assert.match(prompts[0], /User-provided decision, action, or evidence/);
     assert.match(prompts[0], new RegExp(`Baseline: ${"a".repeat(40)}`));
+    assert.match(await readFile(run.auditPath, "utf8"), /Run: `resumed-run`/);
+    assert.match(await readFile(run.feedbackPath, "utf8"), /# Resumed /);
 });
 
 test("a resumed final review restores project commands before invoking a fixer", async (t) => {
@@ -265,6 +272,8 @@ test("a resumed final review restores project commands before invoking a fixer",
                     test: "npm test",
                     conventions: "Use the existing store pattern.",
                 },
+                subagentCalls: 8,
+                planReviewerCalls: 2,
                 gates: {
                     codeSecurity: {
                         status: "needs-user",
@@ -327,6 +336,8 @@ test("a resumed plan gate that still needs user action stops without replaying p
                     test: "dotnet test",
                     conventions: "Follow repository conventions.",
                 },
+                subagentCalls: 40,
+                planReviewerCalls: 40,
                 gates: {
                     architecture: { status: "passed", attempts: 1 },
                     security: {
@@ -364,6 +375,7 @@ test("a resumed plan gate that still needs user action stops without replaying p
     });
 
     assert.equal(result.status, "needs-user");
+    assert.equal(result.subagentCalls, 41);
     assert.deepEqual(labels, ["plan-gate:security:7"]);
     assert.match(prompts[0], /The owner deferred the decision; no approval exists yet/);
     const { stdout: currentHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: run.repoRoot });
@@ -376,6 +388,64 @@ test("a resumed plan gate that still needs user action stops without replaying p
         test: "dotnet test",
         conventions: "Follow repository conventions.",
     });
+    assert.equal(resumedStatus.planReviewerCalls, 41);
+});
+
+test("factory resume rejects a paused reviewer whose prerequisites did not finish", async (t) => {
+    const run = await createReviewRun();
+    t.after(() => rm(run.repoRoot, { recursive: true, force: true }));
+    await writeFile(
+        run.statusPath,
+        `${JSON.stringify(
+            {
+                runId: "invalid-prerequisite-run",
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                baseline: "d".repeat(40),
+                project: {
+                    context: "Persisted plan context",
+                    build: "dotnet build",
+                    test: "dotnet test",
+                    conventions: "",
+                },
+                subagentCalls: 1,
+                planReviewerCalls: 1,
+                gates: {
+                    privacy: {
+                        status: "needs-user",
+                        attempts: 1,
+                        findings: "Privacy approval required.",
+                    },
+                },
+                milestones: [],
+                notes: [],
+                violations: [],
+            },
+            null,
+            2,
+        )}\n`,
+        "utf8",
+    );
+
+    const labels = [];
+    const result = await autodevFactory.run({
+        args: {
+            repoRoot: run.repoRoot,
+            resumeNeedsUser: true,
+            userEvidence: "Privacy approval supplied.",
+        },
+        runId: "invalid-prerequisite-resume",
+        phase() {},
+        log() {},
+        async agent(_prompt, options) {
+            labels.push(options.label);
+            return "AUTODEV-VERDICT: PASS";
+        },
+    });
+
+    assert.equal(result.status, "needs-user");
+    assert.match(result.reason, /prerequisite review state is missing or non-terminal: architecture, security/);
+    assert.deepEqual(labels, []);
 });
 
 test("gateLine reports reviewer integrity failures as process violations", () => {

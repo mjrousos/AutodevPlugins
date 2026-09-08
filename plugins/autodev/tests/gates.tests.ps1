@@ -412,6 +412,7 @@ Test-Case 'semantically corrupt authoritative state falls back to the valid mirr
         @{ Name = 'negative counter'; Property = 'architectureAttempts'; Value = -1 }
         @{ Name = 'exponent-sized counter'; Property = 'totalInvocations'; Value = 1e30 }
         @{ Name = 'signed numeric string'; Property = 'blocks'; Value = '+5' }
+        @{ Name = 'out-of-range user marker'; Property = 'needsUserReached'; Value = 3 }
         @{ Name = 'unknown verdict'; Property = 'architectureVerdict'; Value = 'PASSING' }
     )
     foreach ($case in $cases) {

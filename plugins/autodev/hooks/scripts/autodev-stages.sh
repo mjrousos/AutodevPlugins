@@ -170,6 +170,7 @@ read_state_file() {
           and test("^[0-9]+$")
           and (tonumber <= 2147483647));
     def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    def marker_ok: (has("needsUserReached") | not) or (.needsUserReached | nonnegint and tonumber <= 2);
     def worker_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
@@ -184,7 +185,7 @@ read_state_file() {
       or (.[$key] | type == "string" and
           (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
     counter_ok("blocks")
-    and counter_ok("needsUserReached")
+    and marker_ok
     and counter_ok("totalInvocations")
     and counter_ok("taskingAttempts")
     and counter_ok("milestoneCount")

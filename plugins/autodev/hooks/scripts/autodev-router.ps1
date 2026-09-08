@@ -195,6 +195,7 @@ function Test-GateStateSemantics {
         )) {
         if (-not (Test-StateCounter $State $name)) { return $false }
     }
+    if ((Get-StateNumber $State 'needsUserReached') -gt 2) { return $false }
     if (-not (Test-StateVerdict $State 'architectureVerdict' @('pending', 'running', 'PASS', 'ISSUES'))) {
         return $false
     }
@@ -215,6 +216,7 @@ function Test-StageStateSemantics {
         )) {
         if (-not (Test-StateCounter $State $name)) { return $false }
     }
+    if ((Get-StateNumber $State 'needsUserReached') -gt 2) { return $false }
     foreach ($name in @('taskingVerdict', 'implementVerdict')) {
         if (-not (Test-StateVerdict $State $name @('pending', 'running', 'DONE', 'BLOCKED'))) {
             return $false
