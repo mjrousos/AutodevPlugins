@@ -257,6 +257,72 @@ test("lowercase running gate verdicts are projected as active", async () => {
     });
 });
 
+test("NEEDS-USER gates are projected as a user-action pause", async () => {
+    await withTemporaryDirectory(async (root) => {
+        const autodevDir = path.join(root, ".autodev");
+        await mkdir(autodevDir);
+        await Promise.all([
+            writeFile(
+                path.join(autodevDir, "gate-status.json"),
+                JSON.stringify({
+                    sessionId: "test-session",
+                    architectureVerdict: "PASS",
+                    securityVerdict: "NEEDS-USER",
+                    privacyVerdict: "pending",
+                }),
+            ),
+            writeFile(
+                path.join(autodevDir, "gate-audit.md"),
+                [
+                    "Session: `test-session`",
+                    "",
+                    "| Time (UTC) | Gate | Attempt | Event | Verdict |",
+                    "|---|---|---:|---|---|",
+                    "| 2026-09-01 12:00:00 | security | 1 | invoked | - |",
+                    "| 2026-09-01 12:01:00 | security | 1 | completed | NEEDS-USER |",
+                ].join("\n"),
+            ),
+            writeFile(
+                path.join(autodevDir, "feedback-log.md"),
+                [
+                    "Session: `test-session`",
+                    "",
+                    "# security - attempt 1 - NEEDS-USER",
+                    "",
+                    "## Summary",
+                    "An authorized owner must record approval.",
+                    "",
+                    "## Required user action",
+                    "Record approval in the linked issue.",
+                ].join("\n"),
+            ),
+            writeFile(
+                path.join(autodevDir, "implement-status.json"),
+                JSON.stringify({
+                    sessionId: "test-session",
+                    taskingVerdict: "DONE",
+                    milestoneCount: 1,
+                    completedMilestones: 1,
+                    userReviewReached: 1,
+                    securityVerdict: "PASS",
+                    privacyVerdict: "NEEDS-USER",
+                }),
+            ),
+        ]);
+
+        const state = await loadAutodevState(autodevDir);
+
+        assert.equal(state.plan.status, "needs-user");
+        assert.equal(state.plan.currentPhase, "Waiting for user: Security");
+        assert.equal(state.plan.gates[1].status, "needs-user");
+        assert.equal(state.plan.feedback[0].verdict, "NEEDS-USER");
+        assert.equal(state.implementation.status, "needs-user");
+        assert.equal(state.implementation.currentPhase, "Waiting for user: Privacy");
+        assert.equal(state.workflow.status, "needs-user");
+        assert.equal(state.workflow.label, "User action required");
+    });
+});
+
 test("blocked implementation status requires intervention without audit events", async () => {
     await withTemporaryDirectory(async (root) => {
         const autodevDir = path.join(root, ".autodev");

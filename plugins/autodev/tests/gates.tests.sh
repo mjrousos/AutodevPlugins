@@ -235,7 +235,8 @@ seed_state() { # sid  jq-assignment-expression
   path="$(state_path "$sid")"
   mkdir -p "$(dirname "$path")"
   jq -n --arg sid "$sid" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
-    sessionId: $sid, createdAt: $now, updatedAt: $now, blocks: 0, totalInvocations: 0,
+    sessionId: $sid, createdAt: $now, updatedAt: $now,
+    blocks: 0, needsUserReached: 0, totalInvocations: 0,
     architectureAttempts: 0, architectureVerdict: "pending",
     securityAttempts: 0,     securityVerdict: "pending",
     privacyAttempts: 0,      privacyVerdict: "pending"
@@ -292,6 +293,55 @@ for CASE in "${VERDICT_CASES[@]}"; do
   run_test "verdict: $CASE_NAME" verdict_test
 done
 
+t_needs_user_pause_resume() {
+  local sid footer same other unrelated
+  sid="$(new_session_id)"
+  round "$sid" architecture PASS >/dev/null
+  start_gate "$sid" security
+  footer="$(stop_gate "$sid" security '### [major] Owner approval is required
+
+## Required user action
+
+The service owner must approve the external retention policy and record durable evidence.
+
+AUTODEV-VERDICT: NEEDS-USER' | jq -r '.modifiedResponse // ""')"
+  assert_match 'Recorded verdict: NEEDS-USER' "$footer" || return 1
+  assert_match 'stop now' "$footer" || return 1
+
+  jq '.totalInvocations = 40 | .securityAttempts = 10' "$(state_path "$sid")" > "$(state_path "$sid").tmp" &&
+    mv "$(state_path "$sid").tmp" "$(state_path "$sid")"
+
+  same="$(reviewer_task "$sid" security)"
+  other="$(reviewer_task "$sid" privacy)"
+  unrelated="$(reviewer_task "$sid" explore)"
+  assert_match '"permissionDecision":"deny"' "$same" || return 1
+  assert_match '"permissionDecision":"deny"' "$other" || return 1
+  assert_match '"permissionDecision":"deny"' "$unrelated" || return 1
+  assert_match '"permissionDecision":"deny"' "$(ask_user "$sid")" || return 1
+
+  assert_equal '{}' "$(agent_stop "$sid")" || return 1
+  assert_equal '{}' "$(reviewer_task "$sid" security)" || return 1
+  start_gate "$sid" security
+  assert_equal '10' "$(jq -r '.securityAttempts' "$(state_path "$sid")")" || return 1
+  assert_equal 'NEEDS-USER' "$(jq -r '.securityVerdict' "$(state_path "$sid")")" || return 1
+  assert_equal '2' "$(jq -r '.needsUserReached' "$(state_path "$sid")")" || return 1
+  assert_match '"permissionDecision":"deny"' "$(reviewer_task "$sid" security)" || return 1
+  assert_match '"permissionDecision":"deny"' "$(reviewer_task "$sid" privacy)" || return 1
+  assert_match '"permissionDecision":"deny"' "$(ask_user "$sid")" || return 1
+  assert_equal 'block' "$(agent_stop "$sid" | jq -r '.decision // ""')" || return 1
+  footer="$(stop_gate "$sid" security $'Body text.\n\nAUTODEV-VERDICT: PASS' | jq -r '.modifiedResponse // ""')"
+  assert_match 'Invoke autodev:autodev-privacy-review next' "$footer"
+}
+run_test 'security NEEDS-USER pauses, stops cleanly, and resumes only the same gate' t_needs_user_pause_resume
+
+t_architecture_needs_user_fails_safe() {
+  local sid footer
+  sid="$(new_session_id)"
+  footer="$(round "$sid" architecture NEEDS-USER)"
+  assert_match 'Recorded verdict: ISSUES' "$footer"
+}
+run_test 'architecture NEEDS-USER fails safe as ISSUES' t_architecture_needs_user_fails_safe
+
 # --------------------------------------------------------------------------------------------
 section "Fail-safes (a hook must never deny a tool call or crash)"
 # --------------------------------------------------------------------------------------------
@@ -346,6 +396,7 @@ t_semantic_corruption_uses_mirror() {
     'negative counter|.architectureAttempts = -1' \
     'exponent-sized counter|.totalInvocations = 1e30' \
     'signed numeric string|.blocks = "+5"' \
+    'out-of-range user marker|.needsUserReached = 3' \
     'unknown verdict|.architectureVerdict = "PASSING"'; do
     name="${spec%%|*}"
     filter="${spec#*|}"

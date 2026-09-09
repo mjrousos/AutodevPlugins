@@ -222,6 +222,7 @@ function Set-ImplState {
         createdAt           = (Get-Date).ToUniversalTime().ToString('o')
         updatedAt           = (Get-Date).ToUniversalTime().ToString('o')
         blocks              = 0
+        needsUserReached    = 0
         totalInvocations    = 0
         taskingAttempts     = 0
         taskingVerdict      = 'pending'
@@ -406,6 +407,60 @@ foreach ($case in $reviewVerdictCases) {
         $footer = Get-Footer (Stop-Agent -SessionId $sid -Agent 'code-review' -Response $c.Body)
         Assert-Match "Recorded verdict: $($c.Expect)" $footer
     }.GetNewClosure()
+}
+
+Test-Case 'security NEEDS-USER pauses, stops cleanly, and resumes only the same review' {
+    $sid = New-SessionId
+    Set-StageState -SessionId $sid -Stage 'security'
+    Start-Agent -SessionId $sid -Agent 'code-security-review'
+    $footer = Get-Footer (Stop-Agent -SessionId $sid -Agent 'code-security-review' -Response @'
+### [major] Owner approval is required
+
+## Required user action
+
+The service owner must complete an external approval and record durable evidence.
+
+AUTODEV-VERDICT: NEEDS-USER
+'@)
+    Assert-Match 'Recorded verdict: NEEDS-USER' $footer
+    Assert-Match 'Stop now and explain the required user action' $footer
+
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    $state.totalInvocations = Get-MaxTotal
+    $state.securityAttempts = 10
+    Set-Content -LiteralPath (Get-StatePath $sid) -Value ($state | ConvertTo-Json -Depth 5) -Encoding UTF8
+
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-fix')
+    $unrelatedArgs = @{ agent_type = 'explore' } | ConvertTo-Json -Compress
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $unrelatedArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
+    $audit = Get-Content -LiteralPath (Get-ViewPath $sid 'implement-gate-audit.md') -Raw
+    Assert-Match '\| code-security-review \| - \| 10 \| waiting for user \| NEEDS-USER \|' $audit
+    Assert-Equal '{}' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
+    Start-Agent -SessionId $sid -Agent 'code-security-review'
+    $running = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal '10' ([string]$running.securityAttempts)
+    Assert-Equal 'NEEDS-USER' ([string]$running.securityVerdict)
+    Assert-Equal '2' ([string]$running.needsUserReached)
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-security-review')
+    Assert-Match '"permissionDecision":"deny"' (Invoke-TaskCheck -SessionId $sid -Agent 'code-privacy-review')
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+    Assert-Equal 'block' ((Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json).decision)
+
+    $resumed = Get-Footer (Stop-Agent -SessionId $sid -Agent 'code-security-review' -Response "Body text.`n`nAUTODEV-VERDICT: PASS")
+    Assert-Match 'autodev-code-privacy-review' $resumed
+}
+
+Test-Case 'milestone code review NEEDS-USER fails safe as ISSUES' {
+    $sid = New-SessionId
+    Set-TodoList -SessionId $sid -Milestones 1
+    Invoke-Round -SessionId $sid -Agent 'tasking' -Verdict 'DONE' | Out-Null
+    Invoke-Round -SessionId $sid -Agent 'implementation' -Verdict 'DONE' | Out-Null
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Agent 'code-review' -Verdict 'NEEDS-USER')
+    Assert-Match 'Recorded verdict: ISSUES' $footer
 }
 
 $workerVerdictCases = @(
@@ -674,6 +729,14 @@ Test-Case 'a negative counter is rejected as corrupt' {
     $statePath = Get-StatePath $sid
     New-Item -ItemType Directory -Path (Split-Path $statePath -Parent) -Force | Out-Null
     Set-Content -LiteralPath $statePath -Value "{`"sessionId`":`"$sid`",`"taskingAttempts`":-4,`"taskingVerdict`":`"running`"}" -Encoding UTF8
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+}
+
+Test-Case 'an out-of-range NEEDS-USER marker is rejected as corrupt' {
+    $sid = New-SessionId
+    $statePath = Get-StatePath $sid
+    New-Item -ItemType Directory -Path (Split-Path $statePath -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $statePath -Value "{`"sessionId`":`"$sid`",`"needsUserReached`":3,`"taskingAttempts`":1,`"taskingVerdict`":`"running`"}" -Encoding UTF8
     Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
 }
 

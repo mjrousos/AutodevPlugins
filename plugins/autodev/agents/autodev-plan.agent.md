@@ -131,7 +131,12 @@ For each gate, loop:
 3. If `AUTODEV-VERDICT: PASS` → the gate is closed. Move to the next gate.
 4. If `AUTODEV-VERDICT: ISSUES` → address the findings, then **re-invoke the same reviewer**.
    This is the loop; it is mandatory, not optional.
-5. If the verdict is **missing or unparseable**, the tracker records the attempt as `ISSUES`
+5. If `AUTODEV-VERDICT: NEEDS-USER` → do not edit the plan and do not invoke any agent. Explain
+   exactly what authorized decision or external action is required, point the user to the plan and
+   feedback log, and end your turn. This is a resumable pause, not a passed or escalated gate. When
+   the user later says the action is complete or supplies the decision or evidence, re-invoke the
+   **same reviewer** with that new context in `## Previous findings`. Do not run another gate first.
+6. If the verdict is **missing or unparseable**, the tracker records the attempt as `ISSUES`
    automatically — a reviewer that fails to state a verdict never yields a pass. Handle it by
    what the response actually contains:
    - **It contains usable findings** but no readable verdict line: treat it exactly as `ISSUES`
@@ -167,6 +172,9 @@ your messages are the only view they have into what the reviewers said.
   whether the review caught something they care about.
 - **When a gate passes, say so in one line** — for example,
   `Architecture gate passed on attempt 2. Starting security review.`
+- **When a gate returns `NEEDS-USER`, stop immediately.** Summarize the required actor, action, and
+  evidence in plain language. Do not call `ask_user`, another reviewer, or a revision agent; end the
+  turn so the user can perform the action and resume the workflow later.
 
 ### 8. WRAPUP
 
@@ -218,13 +226,15 @@ the reviewers treat its presence as the signal that this is a re-review.>
 
 ## Previous findings
 
-Your previous review raised the findings below. I have revised the plan in response.
+Your previous review raised the findings below. I have revised the plan in response, or the user
+has supplied the required decision, completed external action, or evidence recorded below.
 Focus on verifying that each was genuinely addressed. Raise a new finding only if it is blocker
 or major and the plan introduced it, worsened it, or it directly affects behavior added or
 changed by the plan.
 
 <verbatim list of the previous findings, with the resolution noted for each — including
-any you disagreed with and why>
+any you disagreed with and why. After NEEDS-USER, include the user's new input or evidence
+verbatim instead of claiming the plan changed.>
 
 Follow your output format exactly and end with your AUTODEV-VERDICT line.
 ```

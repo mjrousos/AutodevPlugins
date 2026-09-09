@@ -181,11 +181,47 @@ try {
 
     Reset-State
     $null = Invoke-Router 'subagentStart' `
+        '{"sessionId":"plan-needs-user","cwd":"","agentName":"autodev:autodev-security-review"}'
+    New-Item -ItemType Directory -Force -Path $script:GatesDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $script:GatesDir 'plan-needs-user.json') -Encoding UTF8 -Value `
+        '{"sessionId":"plan-needs-user","totalInvocations":40,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":1,"securityVerdict":"NEEDS-USER","privacyVerdict":"pending"}'
+    Assert-Denied "a NEEDS-USER planning pause remains active at the session ceiling" `
+        (Invoke-Router 'preToolUse' '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')
+    Assert-Routed "a NEEDS-USER planning pause routes an unrelated agent for denial" 'gates' `
+        (Invoke-Router 'preToolUse' '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')
+    Set-Content -LiteralPath (Join-Path $script:GatesDir 'plan-needs-user.json') -Encoding UTF8 -Value `
+        '{"sessionId":"plan-needs-user","totalInvocations":40,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":10,"securityVerdict":"NEEDS-USER-corrupt","privacyVerdict":"pending"}'
+    Assert-Routed "a semantically corrupt planning state still routes an unrelated agent for mirror recovery" 'gates' `
+        (Invoke-Router 'preToolUse' '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')
+    Remove-Item -LiteralPath (Join-Path $script:GatesDir 'plan-needs-user.json') -Force
+    Assert-Routed "a remembered planning pause still routes an unrelated agent when authoritative state is missing" 'gates' `
+        (Invoke-Router 'preToolUse' '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')
+
+    Reset-State
+    $null = Invoke-Router 'subagentStart' `
         '{"sessionId":"implementation-active","cwd":"","agentName":"autodev:autodev-tasking"}'
     Assert-Denied "a plan gate cannot start while the implementation workflow is active" `
         (Invoke-Router 'preToolUse' '{"sessionId":"implementation-active","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')
     Assert-Routed "a denied plan starter does not replace the remembered implementation workflow" 'stages' `
         (Invoke-Router 'agentStop' '{"sessionId":"implementation-active","cwd":""}')
+
+    Reset-State
+    $null = Invoke-Router 'subagentStart' `
+        '{"sessionId":"implementation-needs-user","cwd":"","agentName":"autodev:autodev-code-security-review"}'
+    New-Item -ItemType Directory -Force -Path $script:StagesDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $script:StagesDir 'implementation-needs-user.json') -Encoding UTF8 -Value `
+        '{"sessionId":"implementation-needs-user","totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"userReviewReached":1,"securityAttempts":1,"securityVerdict":"NEEDS-USER","privacyVerdict":"pending"}'
+    Assert-Denied "a NEEDS-USER implementation pause remains active at the session ceiling" `
+        (Invoke-Router 'preToolUse' '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')
+    Assert-Routed "a NEEDS-USER implementation pause routes an unrelated agent for denial" 'stages' `
+        (Invoke-Router 'preToolUse' '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')
+    Set-Content -LiteralPath (Join-Path $script:StagesDir 'implementation-needs-user.json') -Encoding UTF8 -Value `
+        '{"sessionId":"implementation-needs-user","totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"userReviewReached":1,"securityAttempts":10,"securityVerdict":"NEEDS-USER-corrupt","privacyVerdict":"pending"}'
+    Assert-Routed "a semantically corrupt implementation state still routes an unrelated agent for mirror recovery" 'stages' `
+        (Invoke-Router 'preToolUse' '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')
+    Set-Content -LiteralPath (Join-Path $script:StagesDir 'implementation-needs-user.json') -Encoding UTF8 -Value '{not-json'
+    Assert-Routed "a remembered implementation pause still routes an unrelated agent when authoritative state is corrupt" 'stages' `
+        (Invoke-Router 'preToolUse' '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')
 
     Reset-State
     $null = Invoke-Router 'subagentStart' `

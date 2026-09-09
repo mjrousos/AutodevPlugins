@@ -151,11 +151,53 @@ assert_routed "a denied implementation starter does not replace the remembered p
   "$(route agentStop '{"sessionId":"plan-active","cwd":""}')"
 
 reset_state
+route subagentStart '{"sessionId":"plan-needs-user","cwd":"","agentName":"autodev:autodev-security-review"}' >/dev/null
+mkdir -p "$GATES_DIR"
+printf '%s' '{"sessionId":"plan-needs-user","totalInvocations":40,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":1,"securityVerdict":"NEEDS-USER","privacyVerdict":"pending"}' \
+  > "$GATES_DIR/plan-needs-user.json"
+assert_denied "a NEEDS-USER planning pause remains active at the session ceiling" \
+  "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')"
+assert_routed "a NEEDS-USER planning pause routes an unrelated agent for denial" gates \
+  "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"plan-needs-user","totalInvocations":40,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":10,"securityVerdict":"NEEDS-USER-corrupt","privacyVerdict":"pending"}' \
+  > "$GATES_DIR/plan-needs-user.json"
+assert_routed "a semantically corrupt planning state still routes an unrelated agent for mirror recovery" gates \
+  "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"plan-needs-user","needsUserReached":3,"totalInvocations":40,"architectureAttempts":1,"architectureVerdict":"PASS","securityAttempts":10,"securityVerdict":"ISSUES","privacyVerdict":"pending"}' \
+  > "$GATES_DIR/plan-needs-user.json"
+assert_denied "an out-of-range planning pause marker keeps the cross-workflow guard active" \
+  "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-tasking\"}"}')"
+rm -f "$GATES_DIR/plan-needs-user.json"
+assert_routed "a remembered planning pause still routes an unrelated agent when authoritative state is missing" gates \
+  "$(route preToolUse '{"sessionId":"plan-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+
+reset_state
 route subagentStart '{"sessionId":"implementation-active","cwd":"","agentName":"autodev:autodev-tasking"}' >/dev/null
 assert_denied "a plan gate cannot start while the implementation workflow is active" \
   "$(route preToolUse '{"sessionId":"implementation-active","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
 assert_routed "a denied plan starter does not replace the remembered implementation workflow" stages \
   "$(route agentStop '{"sessionId":"implementation-active","cwd":""}')"
+
+reset_state
+route subagentStart '{"sessionId":"implementation-needs-user","cwd":"","agentName":"autodev:autodev-code-security-review"}' >/dev/null
+mkdir -p "$STAGES_DIR"
+printf '%s' '{"sessionId":"implementation-needs-user","totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"userReviewReached":1,"securityAttempts":1,"securityVerdict":"NEEDS-USER","privacyVerdict":"pending"}' \
+  > "$STAGES_DIR/implementation-needs-user.json"
+assert_denied "a NEEDS-USER implementation pause remains active at the session ceiling" \
+  "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
+assert_routed "a NEEDS-USER implementation pause routes an unrelated agent for denial" stages \
+  "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"implementation-needs-user","totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"userReviewReached":1,"securityAttempts":10,"securityVerdict":"NEEDS-USER-corrupt","privacyVerdict":"pending"}' \
+  > "$STAGES_DIR/implementation-needs-user.json"
+assert_routed "a semantically corrupt implementation state still routes an unrelated agent for mirror recovery" stages \
+  "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
+printf '%s' '{"sessionId":"implementation-needs-user","needsUserReached":3,"totalInvocations":150,"taskingAttempts":1,"taskingVerdict":"DONE","milestoneCount":1,"completedMilestones":1,"userReviewReached":1,"securityAttempts":10,"securityVerdict":"ISSUES","privacyVerdict":"pending"}' \
+  > "$STAGES_DIR/implementation-needs-user.json"
+assert_denied "an out-of-range implementation pause marker keeps the cross-workflow guard active" \
+  "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"autodev:autodev-architecture-review\"}"}')"
+printf '%s' '{not-json' > "$STAGES_DIR/implementation-needs-user.json"
+assert_routed "a remembered implementation pause still routes an unrelated agent when authoritative state is corrupt" stages \
+  "$(route preToolUse '{"sessionId":"implementation-needs-user","cwd":"","toolName":"task","toolArgs":"{\"agent_type\":\"explore\"}"}')"
 
 reset_state
 route subagentStart '{"sessionId":"plan-complete","cwd":"","agentName":"autodev:autodev-privacy-review"}' >/dev/null

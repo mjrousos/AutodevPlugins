@@ -127,7 +127,7 @@ function Get-SafeSessionId {
 # Numeric and string state keys, declared once so reading, validating and defaulting stay in
 # step. Adding a counter here is all that is needed for it to be persisted and validated.
 $script:NumericKeys = @(
-    'blocks', 'totalInvocations',
+    'blocks', 'needsUserReached', 'totalInvocations',
     'taskingAttempts',
     'milestoneCount', 'currentMilestone', 'completedMilestones',
     'implementAttempts', 'reviewAttempts', 'fixInvocations',
@@ -183,7 +183,8 @@ function Read-State {
                     [Globalization.CultureInfo]::InvariantCulture)
                 if ($rendered -notmatch '^[0-9]+$' -or
                     -not [int]::TryParse($rendered, [ref]$normalized) -or
-                    $normalized -lt 0) {
+                    $normalized -lt 0 -or
+                    ($key -eq 'needsUserReached' -and $normalized -gt 2)) {
                     throw "Invalid state counter '$key'."
                 }
                 $state[$key] = $normalized
@@ -203,7 +204,9 @@ function Read-State {
                 $prop = $parsed.PSObject.Properties[$key]
                 if ($null -eq $prop -or $null -eq $prop.Value) { continue }
                 $verdict = [string]$prop.Value
-                if ($verdict -notin @('pending', 'running', 'PASS', 'ISSUES')) {
+                $allowed = @('pending', 'running', 'PASS', 'ISSUES')
+                if ($key -ne 'reviewVerdict') { $allowed += 'NEEDS-USER' }
+                if ($verdict -notin $allowed) {
                     throw "Invalid state verdict '$key'."
                 }
                 $state[$key] = $verdict
@@ -533,6 +536,7 @@ function Reset-DownstreamVerdicts {
     # that verdict stale, and a stale PASS is worse than no verdict at all: it would let the run
     # skip straight past the USER-REVIEW checkpoint and the final reviews.
     param([hashtable]$State)
+    $State['needsUserReached'] = 0
     $State['securityVerdict'] = 'pending'
     $State['securityAttempts'] = 0
     $State['privacyVerdict'] = 'pending'
@@ -545,6 +549,7 @@ function Reset-FinalVerdictsAfterFix {
     # restart at the security review. Only a PASS is cleared: a loop that is still in progress
     # keeps its attempt budget, or a fix mid-loop would hand it an unlimited number of rounds.
     param([hashtable]$State)
+    $State['needsUserReached'] = 0
     if ([string]$State['securityVerdict'] -eq 'PASS') {
         $State['securityVerdict'] = 'pending'
         $State['securityAttempts'] = 0
@@ -603,7 +608,16 @@ function Get-Stage {
     param([hashtable]$State)
 
     if ([int]$State['taskingAttempts'] -eq 0) { return 'idle' }
-    if ([int]$State['totalInvocations'] -ge (Get-MaxTotalInvocations -State $State)) { return 'escalated' }
+    # A reviewer that requires external action must always produce a resumable pause, even when
+    # that invocation also reaches the session-wide safety ceiling.
+    if ([string]$State['securityVerdict'] -eq 'NEEDS-USER' -or
+        [string]$State['privacyVerdict'] -eq 'NEEDS-USER') {
+        return 'needs-user'
+    }
+    if ([int]$State['needsUserReached'] -eq 0 -and
+        [int]$State['totalInvocations'] -ge (Get-MaxTotalInvocations -State $State)) {
+        return 'escalated'
+    }
 
     if ([string]$State['taskingVerdict'] -ne 'DONE') {
         if ([int]$State['taskingAttempts'] -ge $script:MaxWorkerAttempts) { return 'escalated' }
@@ -723,6 +737,12 @@ function Get-NextAction {
             }
             return 'Invoke autodev:autodev-code-privacy-review.'
         }
+        'needs-user' {
+            if ([string]$State['securityVerdict'] -eq 'NEEDS-USER') {
+                return 'Stop now and explain the required user action. After the user supplies it in a later turn, re-invoke only autodev:autodev-code-security-review.'
+            }
+            return 'Stop now and explain the required user action. After the user supplies it in a later turn, re-invoke only autodev:autodev-code-privacy-review.'
+        }
         'complete' {
             return 'The implementation is complete and every review has passed. Proceed to WRAPUP.'
         }
@@ -781,7 +801,7 @@ function Read-Verdict {
         # Tolerate a trailing code fence wrapped around the verdict.
         if ($line -match '^`{3,}[A-Za-z0-9]*$') { continue }
         # Tolerate markdown emphasis, blockquote markers and trailing punctuation.
-        if ($line -match '^[\s*`>_-]*AUTODEV-VERDICT:\s*(PASS|ISSUES|DONE|BLOCKED)[\s*`.]*$') {
+        if ($line -match '^[\s*`>_-]*AUTODEV-VERDICT:\s*(PASS|ISSUES|NEEDS-USER|DONE|BLOCKED)[\s*`.]*$') {
             $raw = $Matches[1].ToUpperInvariant()
             # A sub-agent that reaches for the other vocabulary means something unambiguous, so
             # translate rather than burn an attempt on a wording mistake.
@@ -792,6 +812,7 @@ function Read-Verdict {
             }
             if ($raw -eq 'PASS') { return 'DONE' }
             if ($raw -eq 'ISSUES') { return 'BLOCKED' }
+            if ($raw -eq 'NEEDS-USER') { return 'BLOCKED' }
             return $raw
         }
         return $fallback
@@ -1179,18 +1200,28 @@ try {
                     }
                 }
                 'code-security-review' {
-                    if ([string]$state['securityVerdict'] -eq 'PASS') { $state['securityAttempts'] = 1 }
+                    $resumingNeedsUser = [string]$state['securityVerdict'] -eq 'NEEDS-USER' -and
+                        [int]$state['needsUserReached'] -eq 1
+                    if ($resumingNeedsUser) {
+                        $state['needsUserReached'] = 2
+                    }
+                    elseif ([string]$state['securityVerdict'] -eq 'PASS') { $state['securityAttempts'] = 1 }
                     else { $state['securityAttempts'] = [int]$state['securityAttempts'] + 1 }
-                    $state['securityVerdict'] = 'running'
+                    if (-not $resumingNeedsUser) { $state['securityVerdict'] = 'running' }
                     # A security re-review describes a newer state of the code, so any privacy
                     # verdict recorded against the older code is stale.
                     $state['privacyVerdict'] = 'pending'
                     $state['privacyAttempts'] = 0
                 }
                 'code-privacy-review' {
-                    if ([string]$state['privacyVerdict'] -eq 'PASS') { $state['privacyAttempts'] = 1 }
+                    $resumingNeedsUser = [string]$state['privacyVerdict'] -eq 'NEEDS-USER' -and
+                        [int]$state['needsUserReached'] -eq 1
+                    if ($resumingNeedsUser) {
+                        $state['needsUserReached'] = 2
+                    }
+                    elseif ([string]$state['privacyVerdict'] -eq 'PASS') { $state['privacyAttempts'] = 1 }
                     else { $state['privacyAttempts'] = [int]$state['privacyAttempts'] + 1 }
-                    $state['privacyVerdict'] = 'running'
+                    if (-not $resumingNeedsUser) { $state['privacyVerdict'] = 'running' }
                 }
             }
 
@@ -1219,6 +1250,9 @@ try {
             $response = [string]$payload.response
             $kind = Get-AgentKind -Agent $agent
             $verdict = Read-Verdict -Response $response -Kind $kind
+            # NEEDS-USER is reserved for whole-implementation security and privacy reviews.
+            # A milestone code reviewer using it is malformed output and fails safe as ISSUES.
+            if ($agent -eq 'code-review' -and $verdict -eq 'NEEDS-USER') { $verdict = 'ISSUES' }
 
             $state = Read-State -Path $statePath -RecoveryPath $mirrorPath -SessionId $sessionId
 
@@ -1298,9 +1332,21 @@ try {
                 }
                 'code-security-review' {
                     $state['securityVerdict'] = $verdict
+                    if ($verdict -eq 'NEEDS-USER') {
+                        $state['needsUserReached'] = 0
+                    }
+                    elseif ([int]$state['needsUserReached'] -eq 2) {
+                        $state['needsUserReached'] = 1
+                    }
                 }
                 'code-privacy-review' {
                     $state['privacyVerdict'] = $verdict
+                    if ($verdict -eq 'NEEDS-USER') {
+                        $state['needsUserReached'] = 0
+                    }
+                    elseif ([int]$state['needsUserReached'] -eq 2) {
+                        $state['needsUserReached'] = 1
+                    }
                 }
             }
 
@@ -1335,7 +1381,8 @@ try {
             )
             foreach ($note in $extraNotes) { $footerLines += $note }
             $footerLines += "Next required action: $(Get-NextAction -State $state -Stage $stage)"
-            if ($stage -eq 'complete' -or $stage -eq 'escalated' -or $stage -eq 'user-review') {
+            if ($stage -eq 'complete' -or $stage -eq 'escalated' -or
+                $stage -eq 'user-review' -or $stage -eq 'needs-user') {
                 $footerLines += "Audit trail: $auditPath"
                 $footerLines += "Feedback log: $feedbackPath"
             }
@@ -1398,6 +1445,39 @@ try {
                     Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
                     Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage 'user-review' `
                         -Milestone '-' -Attempt 0 -Action 'handed to user' -Verdict '-'
+                }
+                Write-JsonResult @{}
+                exit 0
+            }
+            if ($stage -eq 'needs-user') {
+                if ([int]$state['needsUserReached'] -eq 2) {
+                    $waitingStage = if ([string]$state['securityVerdict'] -eq 'NEEDS-USER') {
+                        'code-security-review'
+                    }
+                    else {
+                        'code-privacy-review'
+                    }
+                    Write-JsonResult @{
+                        decision = 'block'
+                        reason   = "The resumed $waitingStage is still verifying the user's decision, action, or evidence. Do not end the turn or start anything else until that reviewer returns."
+                    }
+                    exit 0
+                }
+                Confirm-Directory -Path $stateDir | Out-Null
+                Confirm-Directory -Path $viewDir | Out-Null
+                if ([int]$state['needsUserReached'] -eq 0) {
+                    $state['needsUserReached'] = 1
+                    Write-State -State $state -Path $statePath -MirrorPath $mirrorPath
+                    $waitingStage = if ([string]$state['securityVerdict'] -eq 'NEEDS-USER') {
+                        'code-security-review'
+                    }
+                    else {
+                        'code-privacy-review'
+                    }
+                    $attemptsKey = Get-AttemptsKey -Agent $waitingStage
+                    Add-AuditRow -Path $auditPath -SessionId $sessionId -Stage $waitingStage `
+                        -Milestone '-' -Attempt ([int]$state[$attemptsKey]) `
+                        -Action 'waiting for user' -Verdict 'NEEDS-USER'
                 }
                 Write-JsonResult @{}
                 exit 0
@@ -1467,6 +1547,29 @@ try {
 
             if ($toolName -eq 'task') {
                 $target = Resolve-Agent -AgentName (Get-TaskAgentType -ToolArgs $payload.toolArgs)
+                if ($stage -eq 'needs-user') {
+                    $waitingAgent = if ([string]$state['securityVerdict'] -eq 'NEEDS-USER') {
+                        'code-security-review'
+                    }
+                    else {
+                        'code-privacy-review'
+                    }
+                    if ([int]$state['needsUserReached'] -eq 2) {
+                        $reason = "The resumed $waitingAgent is already running. Do not invoke any other agent until it finishes verifying the user's decision, action, or evidence."
+                    }
+                    elseif ([int]$state['needsUserReached'] -eq 0) {
+                        $reason = "The $waitingAgent stage returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
+                    }
+                    elseif ($target -ne $waitingAgent) {
+                        $reason = "The autodev-implement workflow is waiting on user action for $waitingAgent. Only autodev:autodev-$waitingAgent may resume it after the user supplies the required decision, action, or evidence."
+                    }
+                    else {
+                        Write-JsonResult @{}
+                        exit 0
+                    }
+                    Write-JsonResult @{ permissionDecision = 'deny'; permissionDecisionReason = $reason }
+                    exit 0
+                }
                 # Anything that is not one of this plugin's sub-agents is none of our business.
                 if ($null -eq $target) { Write-JsonResult @{}; exit 0 }
 
@@ -1589,6 +1692,17 @@ try {
                         -Milestone '-' -Attempt 0 -Action 'handed to user' -Verdict '-'
                 }
                 Write-JsonResult @{}
+                exit 0
+            }
+            if ($stage -eq 'needs-user') {
+                $waitingReview = if ([string]$state['securityVerdict'] -eq 'NEEDS-USER') {
+                    'security'
+                }
+                else {
+                    'privacy'
+                }
+                $reason = "The $waitingReview review returned NEEDS-USER. Do not call ask_user; explain the required authorized decision or external action in your response and end the turn so the user can handle it and resume later."
+                Write-JsonResult @{ permissionDecision = 'deny'; permissionDecisionReason = $reason }
                 exit 0
             }
             if ($stage -notin $script:AutonomousStages) { Write-JsonResult @{}; exit 0 }

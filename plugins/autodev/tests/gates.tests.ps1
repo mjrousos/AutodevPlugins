@@ -191,6 +191,7 @@ function Set-GateState {
         createdAt            = (Get-Date).ToUniversalTime().ToString('o')
         updatedAt            = (Get-Date).ToUniversalTime().ToString('o')
         blocks               = 0
+        needsUserReached     = 0
         totalInvocations     = 0
         architectureAttempts = 0
         architectureVerdict  = 'pending'
@@ -305,6 +306,57 @@ foreach ($case in $verdictCases) {
     }.GetNewClosure()
 }
 
+Test-Case 'security NEEDS-USER pauses, stops cleanly, and resumes only the same gate' {
+    $sid = New-SessionId
+    Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'PASS' | Out-Null
+    Start-Gate -SessionId $sid -Gate 'security'
+    $footer = Get-Footer (Stop-Gate -SessionId $sid -Gate 'security' -Response @'
+### [major] Owner approval is required
+
+## Required user action
+
+The service owner must approve the external retention policy and record that approval in issue #1.
+
+AUTODEV-VERDICT: NEEDS-USER
+'@)
+    Assert-Match 'Recorded verdict: NEEDS-USER' $footer
+    Assert-Match 'stop now' $footer
+
+    $state = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    $state.totalInvocations = 40
+    $state.securityAttempts = 10
+    Set-Content -LiteralPath (Get-StatePath $sid) -Value ($state | ConvertTo-Json -Depth 5) -Encoding UTF8
+
+    $sameArgs = @{ agent_type = 'autodev:autodev-security-review' } | ConvertTo-Json -Compress
+    $otherArgs = @{ agent_type = 'autodev:autodev-privacy-review' } | ConvertTo-Json -Compress
+    $unrelatedArgs = @{ agent_type = 'explore' } | ConvertTo-Json -Compress
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $sameArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $otherArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $unrelatedArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+
+    Assert-Equal '{}' (Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' })
+    Assert-Equal '{}' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $sameArgs })
+    Start-Gate -SessionId $sid -Gate 'security'
+    $running = Get-Content -LiteralPath (Get-StatePath $sid) -Raw | ConvertFrom-Json
+    Assert-Equal '10' ([string]$running.securityAttempts)
+    Assert-Equal 'NEEDS-USER' ([string]$running.securityVerdict)
+    Assert-Equal '2' ([string]$running.needsUserReached)
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $sameArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'task'; toolArgs = $otherArgs })
+    Assert-Match '"permissionDecision":"deny"' (Invoke-Hook 'preToolUse' @{ sessionId = $sid; toolName = 'ask_user' })
+    Assert-Equal 'block' ((Invoke-Hook 'agentStop' @{ sessionId = $sid; stopReason = 'end_turn' } | ConvertFrom-Json).decision)
+
+    $resumed = Get-Footer (Stop-Gate -SessionId $sid -Gate 'security' -Response "Body text.`n`nAUTODEV-VERDICT: PASS")
+    Assert-Match 'Invoke autodev:autodev-privacy-review next' $resumed
+}
+
+Test-Case 'architecture NEEDS-USER fails safe as ISSUES' {
+    $sid = New-SessionId
+    $footer = Get-Footer (Invoke-Round -SessionId $sid -Gate 'architecture' -Verdict 'NEEDS-USER')
+    Assert-Match 'Recorded verdict: ISSUES' $footer
+}
+
 # ------------------------------------------------------------------------------------------
 Write-Section 'Fail-safes (a hook must never deny a tool call or crash)'
 # ------------------------------------------------------------------------------------------
@@ -360,6 +412,7 @@ Test-Case 'semantically corrupt authoritative state falls back to the valid mirr
         @{ Name = 'negative counter'; Property = 'architectureAttempts'; Value = -1 }
         @{ Name = 'exponent-sized counter'; Property = 'totalInvocations'; Value = 1e30 }
         @{ Name = 'signed numeric string'; Property = 'blocks'; Value = '+5' }
+        @{ Name = 'out-of-range user marker'; Property = 'needsUserReached'; Value = 3 }
         @{ Name = 'unknown verdict'; Property = 'architectureVerdict'; Value = 'PASSING' }
     )
     foreach ($case in $cases) {

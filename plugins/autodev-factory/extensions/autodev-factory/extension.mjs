@@ -446,6 +446,15 @@ function artifactPaths(repoRoot, pathArgs = {}) {
     };
 }
 
+async function normalizeRepositoryRoot(run) {
+    const gitRoot = await git(run.repoRoot, ["rev-parse", "--show-toplevel"]);
+    if (!gitRoot.ok || !gitRoot.stdout) return;
+    const root = resolve(gitRoot.stdout);
+    if (root === run.repoRoot) return;
+    run.repoRoot = root;
+    Object.assign(run, artifactPaths(root, run.pathArgs));
+}
+
 function parseMilestones(text) {
     const heading = /^##[ \t]+Milestone[ \t]+(\d+)\b[ \t]*[—–-]?[ \t]*(.*)$/;
     // `autodev-tasking` is explicit that this line is part of the machine-readable contract:
@@ -602,6 +611,9 @@ async function writeStatus(run) {
         phase: run.phase,
         planPath: run.planPath,
         todosPath: run.todosPath,
+        baseline: run.baseline,
+        project: run.project,
+        finalReviewReady: run.finalReviewReady,
         subagentCalls: run.subagentCalls,
         planReviewerCalls: run.planReviewerCalls,
         gates: run.gates,
@@ -610,6 +622,157 @@ async function writeStatus(run) {
         notes: run.notes,
     };
     await writeFile(run.statusPath, `${JSON.stringify(status, null, 2)}\n`, "utf8").catch(() => {});
+}
+
+async function loadNeedsUserResume(run, userEvidence) {
+    const evidence = asText(userEvidence).trim();
+    if (!evidence) {
+        return { error: "resumeNeedsUser requires non-empty userEvidence describing the completed action, decision, or proof." };
+    }
+
+    let prior;
+    try {
+        prior = JSON.parse(await readFile(run.statusPath, "utf8"));
+    } catch {
+        return { error: `No readable paused factory status was found at ${run.statusPath}.` };
+    }
+    if (!prior || typeof prior !== "object" || Array.isArray(prior) || !prior.gates || typeof prior.gates !== "object") {
+        return { error: `The factory status at ${run.statusPath} does not contain resumable gate state.` };
+    }
+    if (
+        (typeof prior.planPath === "string" && resolve(prior.planPath) !== run.planPath) ||
+        (typeof prior.todosPath === "string" && resolve(prior.todosPath) !== run.todosPath)
+    ) {
+        return { error: "The paused factory status belongs to different plan or todo artifacts." };
+    }
+
+    const candidates = [
+        { flow: "plan", key: "security", title: "Security", prompt: "autodev-security-review" },
+        { flow: "plan", key: "privacy", title: "Privacy", prompt: "autodev-privacy-review" },
+        {
+            flow: "final",
+            key: "codeSecurity",
+            phase: "Code security review",
+            title: "security",
+            prompt: "autodev-code-security-review",
+        },
+        {
+            flow: "final",
+            key: "codePrivacy",
+            phase: "Code privacy review",
+            title: "privacy",
+            prompt: "autodev-code-privacy-review",
+        },
+    ];
+    const waiting = candidates.filter((candidate) => prior.gates[candidate.key]?.status === "needs-user");
+    if (waiting.length !== 1) {
+        return { error: `Expected exactly one NEEDS-USER review in ${run.statusPath}, but found ${waiting.length}.` };
+    }
+
+    const resume = waiting[0];
+    const priorOutcome = prior.gates[resume.key];
+    const terminal = (key) => ["passed", "escalated"].includes(prior.gates[key]?.status);
+    const prerequisites =
+        resume.key === "security"
+            ? ["architecture"]
+            : resume.key === "privacy"
+              ? ["architecture", "security"]
+              : resume.key === "codePrivacy"
+                ? ["codeSecurity"]
+                : [];
+    const missingPrerequisites = prerequisites.filter((key) => !terminal(key));
+    if (missingPrerequisites.length > 0) {
+        return {
+            error:
+                `The paused ${resume.title.toLowerCase()} review cannot resume because prerequisite review ` +
+                `state is missing or non-terminal: ${missingPrerequisites.join(", ")}.`,
+        };
+    }
+    if (resume.flow === "final") {
+        const milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
+        const milestoneError = milestonesAreWellFormed(milestones);
+        if (
+            prior.finalReviewReady !== true ||
+            milestoneError !== null ||
+            milestones.some((milestone) => milestone.status !== "complete")
+        ) {
+            return {
+                error:
+                    `The paused ${resume.title} review cannot resume because implementation milestones ` +
+                    `and the code checkpoint are not recorded as complete.`,
+            };
+        }
+    }
+    const attemptWindow = resume.flow === "plan" ? CAPS.planGateAttempts : CAPS.finalReviewRounds;
+    const priorAttempts = priorOutcome.attempts;
+    const derivedEscalations = Math.ceil(priorAttempts / attemptWindow) - 1;
+    const priorEscalations =
+        priorOutcome.escalations === undefined ? derivedEscalations : priorOutcome.escalations;
+    const priorBudget =
+        priorOutcome.budget === undefined ? attemptWindow * (priorEscalations + 1) : priorOutcome.budget;
+    if (
+        !Number.isSafeInteger(priorAttempts) ||
+        priorAttempts < 1 ||
+        !Number.isSafeInteger(priorEscalations) ||
+        priorEscalations < 0 ||
+        priorEscalations > CAPS.escalationsPerStage ||
+        !Number.isSafeInteger(priorBudget) ||
+        priorBudget !== attemptWindow * (priorEscalations + 1) ||
+        priorAttempts > priorBudget
+    ) {
+        return {
+            error:
+                `The paused ${resume.title.toLowerCase()} review has invalid retry state ` +
+                `(attempt ${String(priorAttempts)}, budget ${String(priorBudget)}, ` +
+                `escalations ${String(priorEscalations)}).`,
+        };
+    }
+    const priorSubagentCalls = prior.subagentCalls;
+    const priorPlanReviewerCalls = prior.planReviewerCalls;
+    if (!Number.isSafeInteger(priorSubagentCalls) || priorSubagentCalls < 0) {
+        return { error: "The paused factory status has an invalid subagent invocation count." };
+    }
+    if (
+        !Number.isSafeInteger(priorPlanReviewerCalls) ||
+        priorPlanReviewerCalls < 0 ||
+        priorPlanReviewerCalls > priorSubagentCalls
+    ) {
+        return { error: "The paused factory status has an invalid plan reviewer invocation count." };
+    }
+    run.gates = { ...prior.gates };
+    run.milestones = Array.isArray(prior.milestones) ? prior.milestones : [];
+    run.finalReviewReady = prior.finalReviewReady === true;
+    run.notes = Array.isArray(prior.notes) ? [...prior.notes] : [];
+    run.violations = Array.isArray(prior.violations) ? [...prior.violations] : [];
+    run.subagentCalls = priorSubagentCalls;
+    run.planReviewerCalls = priorPlanReviewerCalls;
+    const priorProject =
+        prior.project && typeof prior.project === "object" && !Array.isArray(prior.project) ? prior.project : {};
+    run.project = {
+        context:
+            asText(priorProject.context).slice(0, 800) ||
+            "Existing Autodev artifacts; resuming the paused reviewer before any other agent.",
+        build: asText(priorProject.build).slice(0, 200) || "none found",
+        test: asText(priorProject.test).slice(0, 200) || "none found",
+        conventions: asText(priorProject.conventions).slice(0, 1200),
+    };
+    const baseline = asText(prior.baseline).trim();
+    if (resume.flow === "final" && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(baseline)) {
+        run.baseline = baseline;
+    } else {
+        const head = await git(run.repoRoot, ["rev-parse", "HEAD"]);
+        run.baseline = head.ok && head.stdout ? head.stdout : "uncommitted working tree";
+    }
+    if (!run.request) run.request = `the existing plan at ${run.planPath}`;
+
+    resume.previousFindings =
+        asText(priorOutcome.findings).trim() || "The prior reviewer paused for required user action.";
+    resume.userEvidence = evidence;
+    resume.attempt = priorAttempts;
+    resume.budget = priorBudget;
+    resume.escalations = priorEscalations;
+    resume.guidance = asText(priorOutcome.guidance);
+    return resume;
 }
 
 /* -------------------------------------------------------------------------------------------
@@ -949,19 +1112,10 @@ async function escalate(ctx, run, { key, stage, attempts, lastFindings }) {
 async function intake(ctx, run, { requireRequest }) {
     setPhase(ctx, run, "Intake");
 
-    const gitRoot = await git(run.repoRoot, ["rev-parse", "--show-toplevel"]);
-    if (gitRoot.ok && gitRoot.stdout) {
-        const root = resolve(gitRoot.stdout);
-        if (root !== run.repoRoot) {
-            // The factory was invoked from a subdirectory. Everything else in the run is anchored
-            // to the repository root — the `.autodev` ignore check, the root handed to every
-            // subagent, the worktree snapshots — so the default artifact paths have to move with
-            // it. Otherwise the plan lands in whichever subdirectory the CLI happened to start in
-            // while the reviewers are told to look for it at the root.
-            run.repoRoot = root;
-            Object.assign(run, artifactPaths(root, run.pathArgs));
-        }
-    }
+    // Everything else in the run is anchored to the repository root, including default artifact
+    // paths and worktree snapshots. Continuation uses this same read-only normalization before it
+    // loads persisted state, without replaying the rest of intake.
+    await normalizeRepositoryRoot(run);
 
     const head = await git(run.repoRoot, ["rev-parse", "HEAD"]);
     run.baseline = head.ok ? head.stdout : "uncommitted working tree";
@@ -1411,29 +1565,82 @@ async function approvePlan(ctx, run) {
  * Sequential, deliberately: each reviewer should see the plan as amended by the previous one.
  * ------------------------------------------------------------------------------------------- */
 
-async function runPlanGates(ctx, run) {
-    for (const gate of PLAN_GATES) {
+async function runPlanGates(
+    ctx,
+    run,
+    {
+        startKey = null,
+        previousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
+) {
+    const startIndex = startKey ? PLAN_GATES.findIndex((gate) => gate.key === startKey) : 0;
+    if (startIndex < 0) return { stop: `Unknown plan review resume target: ${startKey}.` };
+    for (const [index, gate] of PLAN_GATES.entries()) {
+        if (index < startIndex) continue;
         setPhase(ctx, run, `${gate.title} gate`);
-        const outcome = await runPlanGate(ctx, run, gate);
+        const outcome = await runPlanGate(ctx, run, gate, {
+            previousFindings: gate.key === startKey ? previousFindings : null,
+            userEvidence: gate.key === startKey ? userEvidence : null,
+            resumeAttempt: gate.key === startKey ? resumeAttempt : null,
+            resumeBudget: gate.key === startKey ? resumeBudget : null,
+            resumeEscalations: gate.key === startKey ? resumeEscalations : null,
+            resumeGuidance: gate.key === startKey ? resumeGuidance : null,
+        });
         run.gates[gate.key] = outcome;
         await writeStatus(run);
         if (outcome.status === "stopped") {
             return { stop: `The ${gate.title.toLowerCase()} gate was stopped by you.` };
         }
+        if (outcome.status === "process-violation") {
+            return {
+                stop:
+                    `The ${gate.title.toLowerCase()} reviewer did not remain verifiably read-only, so its ` +
+                    `NEEDS-USER verdict was not accepted and no revision agent was run. Inspect the process ` +
+                    `violation in ${run.feedbackPath} before starting another workflow run.`,
+            };
+        }
+        if (outcome.status === "needs-user") {
+            return {
+                needsUser: true,
+                stop:
+                    `The ${gate.title.toLowerCase()} gate requires an authorized decision or external action. ` +
+                    `No revision agent was run. Review the required action in ${run.feedbackPath}, complete it, ` +
+                    `then start a new factory run with resumeNeedsUser: true and userEvidence so this same gate ` +
+                    `can verify the new evidence before any other agent runs.`,
+            };
+        }
     }
     return {};
 }
 
-async function runPlanGate(ctx, run, gate) {
+async function runPlanGate(
+    ctx,
+    run,
+    gate,
+    {
+        previousFindings: initialPreviousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
+) {
     const guard = () => fileSnapshot(run.planPath);
-    let previousFindings = null;
-    let guidance = "";
-    let escalations = 0;
-    let attempt = 0;
-    let budget = CAPS.planGateAttempts;
+    let previousFindings = initialPreviousFindings;
+    let guidance = resumeGuidance ?? "";
+    let escalations = resumeEscalations ?? 0;
+    let attempt = resumeAttempt === null ? 0 : resumeAttempt - 1;
+    let budget = resumeBudget ?? CAPS.planGateAttempts;
 
     while (attempt < budget) {
-        if (run.planReviewerCalls >= CAPS.planReviewerCalls) {
+        const resumingPausedAttempt = resumeAttempt !== null && attempt === resumeAttempt - 1;
+        if (run.planReviewerCalls >= CAPS.planReviewerCalls && !resumingPausedAttempt) {
             run.notes.push(
                 `The ${gate.title.toLowerCase()} gate stopped at the ${CAPS.planReviewerCalls}-call ceiling for plan reviewers.`,
             );
@@ -1452,8 +1659,8 @@ async function runPlanGate(ctx, run, gate) {
             guard,
             // The model fallback is a second reviewer subagent, so it is only offered when the
             // ceiling can actually pay for it. Otherwise a run sitting at 39 could finish at 41.
-            maxInvocations: CAPS.planReviewerCalls - run.planReviewerCalls,
-            task: buildGateTask(run, gate, attempt, budget, previousFindings, guidance),
+            maxInvocations: Math.max(1, CAPS.planReviewerCalls - run.planReviewerCalls),
+            task: buildGateTask(run, gate, attempt, budget, previousFindings, guidance, userEvidence),
         });
         // Charged after the fact and by actual invocation count, because a model fallback inside
         // `callAgent` spends two reviewer subagents on one attempt.
@@ -1462,6 +1669,30 @@ async function runPlanGate(ctx, run, gate) {
         if (review.verdict === "PASS" && !review.violated && !review.unverified) {
             ctx.log(`${gate.title} gate passed on attempt ${attempt}`);
             return { status: "passed", attempts: attempt };
+        }
+        if (
+            review.verdict === "NEEDS-USER" &&
+            gate.key !== "architecture" &&
+            !review.violated &&
+            !review.unverified
+        ) {
+            ctx.log(`${gate.title} gate requires user action; stopping without invoking a revision agent`);
+            return {
+                status: "needs-user",
+                attempts: attempt,
+                budget,
+                escalations,
+                guidance,
+                findings: review.response,
+            };
+        }
+        if (review.verdict === "NEEDS-USER" && (review.violated || review.unverified)) {
+            ctx.log(`${gate.title} gate returned NEEDS-USER without a valid read-only guard; stopping the workflow`);
+            return {
+                status: "process-violation",
+                attempts: attempt,
+                reason: review.violated ? "reviewer modified the plan" : "reviewer read-only behavior could not be verified",
+            };
         }
 
         // A reviewer that edited the plan it was reviewing does not get to approve the result of
@@ -1528,7 +1759,7 @@ async function runPlanGate(ctx, run, gate) {
     return { status: "escalated", attempts: attempt, reason: "attempt budget exhausted" };
 }
 
-function buildGateTask(run, gate, attempt, budget, previousFindings, guidance) {
+function buildGateTask(run, gate, attempt, budget, previousFindings, guidance, userEvidence) {
     const lines = [
         `Review the implementation plan at ${run.planPath}.`,
         ``,
@@ -1555,12 +1786,23 @@ function buildGateTask(run, gate, attempt, budget, previousFindings, guidance) {
             ``,
             `## Previous findings`,
             ``,
-            `Your previous review raised the findings below. The plan has been revised in response.`,
+            `Your previous review raised the findings below. The plan has been revised in response, or`,
+            `the user has supplied the required decision, completed external action, or evidence below.`,
             `Focus on verifying that each was genuinely addressed. Raise a new finding only if it is`,
             `blocker or major and the plan introduced it, worsened it, or it directly affects behavior`,
             `added or changed by the plan.`,
             ``,
             truncate(previousFindings, 12000),
+        );
+    }
+    if (userEvidence) {
+        lines.push(
+            ``,
+            `## User-provided decision, action, or evidence`,
+            ``,
+            `Treat this as the new authoritative evidence to verify against the current plan:`,
+            ``,
+            truncate(userEvidence, 4000),
         );
     }
     lines.push(``, `Follow your output format exactly and end with your AUTODEV-VERDICT line.`);
@@ -1906,7 +2148,7 @@ async function reviewMilestone(ctx, run, milestone) {
     return {};
 }
 
-function buildCodeReviewTask(run, { scope, changedAreas, round, budget, previousFindings, guidance }) {
+function buildCodeReviewTask(run, { scope, changedAreas, round, budget, previousFindings, guidance, userEvidence }) {
     const lines = [
         `Review ${scope}.`,
         ``,
@@ -1927,10 +2169,21 @@ function buildCodeReviewTask(run, { scope, changedAreas, round, budget, previous
             ``,
             `## Previous findings`,
             ``,
-            `Your previous review raised the findings below. They have since been addressed. Verify each`,
-            `was genuinely fixed, and review the current state of the code as a whole.`,
+            `Your previous review raised the findings below. They have since been addressed, or the user`,
+            `has supplied the required decision, completed external action, or evidence below. Verify each`,
+            `was genuinely resolved, and review the current state of the code as a whole.`,
             ``,
             truncate(previousFindings, 12000),
+        );
+    }
+    if (userEvidence) {
+        lines.push(
+            ``,
+            `## User-provided decision, action, or evidence`,
+            ``,
+            `Treat this as the new authoritative evidence to verify against the current implementation:`,
+            ``,
+            truncate(userEvidence, 4000),
         );
     }
     lines.push(``, `Follow your output format exactly and end with your AUTODEV-VERDICT line.`);
@@ -2085,26 +2338,78 @@ const FINAL_REVIEWS = Object.freeze([
     { key: "codePrivacy", phase: "Code privacy review", title: "privacy", prompt: "autodev-code-privacy-review" },
 ]);
 
-async function runFinalReviews(ctx, run) {
-    for (const review of FINAL_REVIEWS) {
+async function runFinalReviews(
+    ctx,
+    run,
+    {
+        startKey = null,
+        previousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
+) {
+    const startIndex = startKey ? FINAL_REVIEWS.findIndex((review) => review.key === startKey) : 0;
+    if (startIndex < 0) return { stop: `Unknown final review resume target: ${startKey}.` };
+    for (const [index, review] of FINAL_REVIEWS.entries()) {
+        if (index < startIndex) continue;
         setPhase(ctx, run, review.phase);
-        const outcome = await runFinalReview(ctx, run, review);
+        const outcome = await runFinalReview(ctx, run, review, {
+            previousFindings: review.key === startKey ? previousFindings : null,
+            userEvidence: review.key === startKey ? userEvidence : null,
+            resumeAttempt: review.key === startKey ? resumeAttempt : null,
+            resumeBudget: review.key === startKey ? resumeBudget : null,
+            resumeEscalations: review.key === startKey ? resumeEscalations : null,
+            resumeGuidance: review.key === startKey ? resumeGuidance : null,
+        });
         run.gates[review.key] = outcome;
         await writeStatus(run);
         if (outcome.status === "stopped") {
             return { stop: `The ${review.title} review was stopped by you.` };
         }
+        if (outcome.status === "process-violation") {
+            return {
+                stop:
+                    `The ${review.title} reviewer did not remain verifiably read-only, so its NEEDS-USER ` +
+                    `verdict was not accepted and no fix agent was run. Inspect the process violation in ` +
+                    `${run.feedbackPath} before starting another workflow run.`,
+            };
+        }
+        if (outcome.status === "needs-user") {
+            return {
+                needsUser: true,
+                stop:
+                    `The ${review.title} review requires an authorized decision or external action. ` +
+                    `No fix agent was run. Review the required action in ${run.feedbackPath}, complete it, ` +
+                    `then start a new factory run with resumeNeedsUser: true and userEvidence so this same reviewer ` +
+                    `can verify the new evidence before any other agent runs.`,
+            };
+        }
     }
     return {};
 }
 
-async function runFinalReview(ctx, run, review) {
+async function runFinalReview(
+    ctx,
+    run,
+    review,
+    {
+        previousFindings: initialPreviousFindings = null,
+        userEvidence = null,
+        resumeAttempt = null,
+        resumeBudget = null,
+        resumeEscalations = null,
+        resumeGuidance = null,
+    } = {},
+) {
     const guard = () => codeSnapshot(run.repoRoot, [run.planPath, run.todosPath]);
-    let previousFindings = null;
-    let guidance = "";
-    let escalations = 0;
-    let round = 0;
-    let budget = CAPS.finalReviewRounds;
+    let previousFindings = initialPreviousFindings;
+    let guidance = resumeGuidance ?? "";
+    let escalations = resumeEscalations ?? 0;
+    let round = resumeAttempt === null ? 0 : resumeAttempt - 1;
+    let budget = resumeBudget ?? CAPS.finalReviewRounds;
 
     while (round < budget) {
         round += 1;
@@ -2124,12 +2429,32 @@ async function runFinalReview(ctx, run, review) {
                 budget,
                 previousFindings,
                 guidance,
+                userEvidence,
             }),
         });
 
         if (result.verdict === "PASS" && !result.violated && !result.unverified) {
             ctx.log(`${review.title} review passed on round ${round}`);
             return { status: "passed", attempts: round };
+        }
+        if (result.verdict === "NEEDS-USER" && !result.violated && !result.unverified) {
+            ctx.log(`${review.title} review requires user action; stopping without invoking a fix agent`);
+            return {
+                status: "needs-user",
+                attempts: round,
+                budget,
+                escalations,
+                guidance,
+                findings: result.response,
+            };
+        }
+        if (result.verdict === "NEEDS-USER" && (result.violated || result.unverified)) {
+            ctx.log(`${review.title} review returned NEEDS-USER without a valid read-only guard; stopping the workflow`);
+            return {
+                status: "process-violation",
+                attempts: round,
+                reason: result.violated ? "reviewer changed the tree" : "reviewer read-only behavior could not be verified",
+            };
         }
         // Same rule as the gates: it reviewed its own edit, or its restraint could not be
         // checked, so the PASS does not stand.
@@ -2190,6 +2515,10 @@ function gateLine(title, outcome) {
     if (!outcome) return `- ${title}: not run`;
     if (outcome.status === "passed") return `- ${title}: passed on attempt ${outcome.attempts}`;
     if (outcome.status === "stopped") return `- ${title}: stopped by the user after ${outcome.attempts} attempts`;
+    if (outcome.status === "needs-user") return `- ${title}: **waiting for required user action** after attempt ${outcome.attempts}`;
+    if (outcome.status === "process-violation") {
+        return `- ${title}: **process violation** on attempt ${outcome.attempts} (${outcome.reason})`;
+    }
     return `- ${title}: **escalated** after ${outcome.attempts} attempts (${outcome.reason})`;
 }
 
@@ -2302,6 +2631,8 @@ const autodevFactory = defineFactory({
             '  planPath?: string     — where the plan goes. Defaults to <repoRoot>/.autodev/plan.md.',
             '  todosPath?: string    — where the todo list goes. Defaults to <repoRoot>/.autodev/todos.md.',
             '  startAt?: "plan" | "implement" — "implement" skips planning and uses the existing plan. Defaults to "plan".',
+            "  resumeNeedsUser?: boolean — resume the single NEEDS-USER review recorded in factory-status.json.",
+            "  userEvidence?: string — required with resumeNeedsUser; the completed action, decision, or durable evidence.",
             "  clarifyRounds?: number — how many rounds of clarifying questions to allow, 0-4. Defaults to 3.",
             "}",
             "",
@@ -2330,6 +2661,7 @@ const autodevFactory = defineFactory({
             phase: "Intake",
             project: { context: "", build: "none found", test: "none found", conventions: "" },
             baseline: "uncommitted working tree",
+            finalReviewReady: false,
             planSummary: "",
             clarifications: [],
             milestones: [],
@@ -2342,9 +2674,87 @@ const autodevFactory = defineFactory({
         };
 
         const startAt = args.startAt === "implement" ? "implement" : "plan";
+        if (args.resumeNeedsUser === true) await normalizeRepositoryRoot(run);
+        const resume = args.resumeNeedsUser === true ? await loadNeedsUserResume(run, args.userEvidence) : null;
+        if (resume?.error) {
+            return {
+                status: "needs-user",
+                reason: resume.error,
+                repoRoot: run.repoRoot,
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                statusPath: run.statusPath,
+            };
+        }
+        if (resume && !(await fileExists(run.planPath))) {
+            return {
+                status: "needs-user",
+                reason: `The paused review cannot resume because the plan is missing at ${run.planPath}.`,
+                repoRoot: run.repoRoot,
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                statusPath: run.statusPath,
+            };
+        }
+        if (resume?.flow === "final" && !(await fileExists(run.todosPath))) {
+            return {
+                status: "needs-user",
+                reason: `The paused implementation review cannot resume because the todo list is missing at ${run.todosPath}.`,
+                repoRoot: run.repoRoot,
+                planPath: run.planPath,
+                todosPath: run.todosPath,
+                statusPath: run.statusPath,
+            };
+        }
+
+        if (resume?.flow === "final") {
+            await initTrail(run);
+            run.notes.push(`Resumed the paused ${resume.title} review with user-provided evidence before invoking any other agent.`);
+            const finalReviews = await runFinalReviews(ctx, run, {
+                startKey: resume.key,
+                previousFindings: resume.previousFindings,
+                userEvidence: resume.userEvidence,
+                resumeAttempt: resume.attempt,
+                resumeBudget: resume.budget,
+                resumeEscalations: resume.escalations,
+                resumeGuidance: resume.guidance,
+            });
+            if (finalReviews.stop) {
+                return wrapup(ctx, run, {
+                    status: finalReviews.needsUser ? "needs-user" : "implemented",
+                    reason: finalReviews.stop,
+                });
+            }
+            const clean =
+                run.gates.codeSecurity?.status === "passed" &&
+                run.gates.codePrivacy?.status === "passed" &&
+                run.milestones.every((milestone) => !milestone.unresolvedFindings);
+            return wrapup(ctx, run, {
+                status: clean ? "completed" : "completed-with-findings",
+                reason: clean ? null : "some reviews did not reach a PASS — see the notes",
+            });
+        }
 
         // --- Planning -------------------------------------------------------------------
-        if (startAt === "plan") {
+        if (resume?.flow === "plan") {
+            await initTrail(run);
+            run.notes.push(`Resumed the paused ${resume.title} gate with user-provided evidence before invoking any other agent.`);
+            const gated = await runPlanGates(ctx, run, {
+                startKey: resume.key,
+                previousFindings: resume.previousFindings,
+                userEvidence: resume.userEvidence,
+                resumeAttempt: resume.attempt,
+                resumeBudget: resume.budget,
+                resumeEscalations: resume.escalations,
+                resumeGuidance: resume.guidance,
+            });
+            if (gated.stop) {
+                return wrapup(ctx, run, {
+                    status: gated.needsUser ? "needs-user" : "plan-incomplete",
+                    reason: gated.stop,
+                });
+            }
+        } else if (startAt === "plan") {
             const intakeResult = await intake(ctx, run, { requireRequest: true });
             if (intakeResult.stop) return wrapup(ctx, run, { status: "stopped", reason: intakeResult.stop });
 
@@ -2357,7 +2767,12 @@ const autodevFactory = defineFactory({
             if (approved.stop) return wrapup(ctx, run, { status: "plan-drafted", reason: approved.stop });
 
             const gated = await runPlanGates(ctx, run);
-            if (gated.stop) return wrapup(ctx, run, { status: "plan-incomplete", reason: gated.stop });
+            if (gated.stop) {
+                return wrapup(ctx, run, {
+                    status: gated.needsUser ? "needs-user" : "plan-incomplete",
+                    reason: gated.stop,
+                });
+            }
         } else {
             // Implementing an existing plan needs no feature description: the plan is the brief.
             const intakeResult = await intake(ctx, run, { requireRequest: false });
@@ -2373,7 +2788,7 @@ const autodevFactory = defineFactory({
         }
 
         // --- The handoff ----------------------------------------------------------------
-        if (startAt === "plan") {
+        if (startAt === "plan" || resume?.flow === "plan") {
             const decision = await handoff(ctx, run);
             if (!decision.proceed) {
                 return wrapup(ctx, run, { status: "plan-complete", reason: decision.reason });
@@ -2389,9 +2804,16 @@ const autodevFactory = defineFactory({
 
         const checkpoint = await codeCheckpoint(ctx, run);
         if (checkpoint.stop) return wrapup(ctx, run, { status: "implemented", reason: checkpoint.stop });
+        run.finalReviewReady = true;
+        await writeStatus(run);
 
         const finalReviews = await runFinalReviews(ctx, run);
-        if (finalReviews.stop) return wrapup(ctx, run, { status: "implemented", reason: finalReviews.stop });
+        if (finalReviews.stop) {
+            return wrapup(ctx, run, {
+                status: finalReviews.needsUser ? "needs-user" : "implemented",
+                reason: finalReviews.stop,
+            });
+        }
 
         const clean =
             run.gates.codeSecurity?.status === "passed" &&
@@ -2427,11 +2849,14 @@ export {
     CAPS,
     describeChanges,
     escapeCell,
+    gateLine,
     milestonesAreWellFormed,
     parseMilestones,
     questionsToSchema,
     readVerdict,
     resolveUnder,
+    runFinalReview,
+    runPlanGate,
     sanitizeKey,
     truncate,
 };

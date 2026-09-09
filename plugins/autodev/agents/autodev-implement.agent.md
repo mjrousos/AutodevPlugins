@@ -211,7 +211,12 @@ Loop, up to 10 rounds:
 2. `AUTODEV-VERDICT: PASS` → move to PRIVACY-REVIEW.
 3. `AUTODEV-VERDICT: ISSUES` → invoke `autodev-code-fix` with the findings verbatim, then
    re-invoke the security reviewer.
-4. Missing or unparseable verdict → handled exactly as in the milestone review loop.
+4. `AUTODEV-VERDICT: NEEDS-USER` → do not invoke the fix agent or any other agent. Explain exactly
+   what authorized decision or external action is required, point the user to the todo list and
+   feedback log, and end your turn. This is a resumable pause, not a pass or escalation. When the
+   user later says the action is complete or supplies the decision or evidence, re-invoke the
+   security reviewer with that new context in `## Previous findings`.
+5. Missing or unparseable verdict → handled exactly as in the milestone review loop.
 
 **On hitting the cap without a pass, escalate.** Unlike code review, a security review that will
 not converge is not something to record and walk past. See *Escalation*.
@@ -219,7 +224,8 @@ not converge is not something to record and walk past. See *Escalation*.
 ### 6. PRIVACY-REVIEW
 
 Identical in shape to SECURITY-REVIEW, using `autodev-code-privacy-review`, and escalating the same
-way on cap exhaustion.
+way on cap exhaustion. A `NEEDS-USER` verdict pauses immediately and resumes with the privacy
+reviewer only after the user supplies the required action, decision, or evidence.
 
 ### 7. WRAPUP
 
@@ -320,11 +326,13 @@ the reviewers treat its presence as the signal that this is a re-review.>
 
 ## Previous findings
 
-Your previous review raised the findings below. They have since been addressed.
+Your previous review raised the findings below. They have since been addressed, or the user has
+supplied the required decision, completed external action, or evidence recorded below.
 Verify each was genuinely fixed, and review the current state of the code as a whole.
 
 <verbatim list of the previous findings, with the disposition the fix agent reported for each,
-including any it rejected and why>
+including any it rejected and why. After NEEDS-USER, include the user's new input or evidence
+verbatim instead of a fix-agent disposition.>
 
 Follow your output format exactly and end with your AUTODEV-VERDICT line.
 ```

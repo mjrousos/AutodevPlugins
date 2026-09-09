@@ -149,6 +149,8 @@ Or invoke it directly with `run_factory`, name `autodev-factory`:
 | `planPath` | `<repoRoot>/.autodev/plan.md` | Where the plan is written. Must be inside the repository — these paths reach write-capable subagents, and anything resolving outside falls back to the default. |
 | `todosPath` | `<repoRoot>/.autodev/todos.md` | Where the milestone todo list is written. Same rule as `planPath`. |
 | `startAt` | `"plan"` | `"implement"` skips planning entirely and works from the plan already on disk. |
+| `resumeNeedsUser` | `false` | Resumes the single security or privacy review recorded as `NEEDS-USER` in `.autodev/factory-status.json`. The waiting reviewer runs before any other agent. |
+| `userEvidence` | — | Required with `resumeNeedsUser`. Supplies the authorized decision, completed external action, or durable evidence for the waiting reviewer to verify. |
 | `clarifyRounds` | `3` | How many rounds of clarifying questions to allow, 0–4. |
 
 ### Limits
@@ -197,6 +199,12 @@ Plus escalations. When a gate or a final review exhausts its attempts, you are s
 that keep recurring and offered three options: retry with guidance the reviewer is missing, accept
 the risk, or stop. An escalated gate **never becomes a passed gate** — the audit trail keeps saying
 so, and wrapup says so too.
+
+A security or privacy reviewer may instead return `NEEDS-USER` only when an authorized decision or
+external action is truly unavoidable. The factory stops immediately without calling a reviser,
+fixer, or any other agent. After completing the action, start a new factory run with
+`{"resumeNeedsUser":true,"userEvidence":"…"}`. The factory reads the paused status and invokes only
+that same reviewer first; it continues the remaining workflow only after that review completes.
 
 If the host has no interactive support, the checkpoints are skipped, the run stops at the handoff
 rather than implementing unasked, and every skip is recorded in the notes.

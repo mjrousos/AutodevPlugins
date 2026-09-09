@@ -125,7 +125,8 @@ FEEDBACK_PATH="$VIEW_DIR/feedback-log.md"
 
 default_state() {
   jq -n --arg sid "$SAFE_SESSION_ID" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
-  sessionId: $sid, createdAt: $now, updatedAt: $now, blocks: 0, totalInvocations: 0,
+  sessionId: $sid, createdAt: $now, updatedAt: $now,
+    blocks: 0, needsUserReached: 0, totalInvocations: 0,
     architectureAttempts: 0, architectureVerdict: "pending",
     securityAttempts: 0,     securityVerdict: "pending",
     privacyAttempts: 0,      privacyVerdict: "pending"
@@ -154,21 +155,30 @@ read_state_file() {
           and test("^[0-9]+$")
           and (tonumber <= 2147483647));
     def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    def marker_ok: (has("needsUserReached") | not) or (.needsUserReached | nonnegint and tonumber <= 2);
     def verdict_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+           or . == "NEEDS-USER"));
+    def ordinary_verdict_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
           (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
     counter_ok("blocks")
+    and marker_ok
     and counter_ok("totalInvocations")
     and counter_ok("architectureAttempts")
     and counter_ok("securityAttempts")
     and counter_ok("privacyAttempts")
-    and verdict_ok("architectureVerdict")
+    and ordinary_verdict_ok("architectureVerdict")
     and verdict_ok("securityVerdict")
     and verdict_ok("privacyVerdict")
   ' >/dev/null 2>&1 || return 1
   # Merge over defaults so a partial or older state file still yields every field.
-  jq -s '.[0] * .[1]' <(default_state) <(printf '%s' "$snapshot") 2>/dev/null
+  # Feed both documents through stdin rather than process-substitution paths. Git Bash may
+  # resolve jq to the native Windows executable, which cannot open /dev/fd/*.
+  printf '%s\n%s\n' "$(default_state)" "$snapshot" | jq -s '.[0] * .[1]' 2>/dev/null
 }
 
 read_state() {
@@ -382,8 +392,15 @@ get_phase() {
   done
   if [ "$started" -eq 0 ]; then printf 'idle'; return; fi
   if [ "$all_passed" -eq 1 ]; then printf 'complete'; return; fi
+  for gate in $GATE_ORDER; do
+    if [ "$(state_str "$state" "${gate}Verdict")" = "NEEDS-USER" ]; then
+      printf 'needs-user'
+      return
+    fi
+  done
   if [ "$escalated" -eq 1 ]; then printf 'escalated'; return; fi
-  if [ "$(state_num "$state" 'totalInvocations')" -ge "$MAX_TOTAL_INVOCATIONS" ] 2>/dev/null; then
+  if [ "$(state_num "$state" 'needsUserReached')" -eq 0 ] 2>/dev/null &&
+    [ "$(state_num "$state" 'totalInvocations')" -ge "$MAX_TOTAL_INVOCATIONS" ] 2>/dev/null; then
     printf 'escalated'; return
   fi
   printf 'gating'
@@ -417,19 +434,19 @@ get_gate_status_line() {
 # were fixed") be recorded as a pass. Judge only the last meaningful line, ignoring blank lines
 # and a fence occupying a line by itself; anything unexpected falls through to ISSUES.
 read_verdict() {
-  local last
+  local last raw
   last="$(printf '%s\n' "$1" \
     | tr -d '\r' \
     | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
     | grep -v '^$' \
     | grep -vE '^`{3,}[A-Za-z0-9]*$' \
     | tail -n 1)"
-  if printf '%s' "$last" \
-    | grep -qiE '^[*`>_-]*[[:space:]]*AUTODEV-VERDICT:[[:space:]]*PASS[*`.[:space:]]*$'; then
-    printf 'PASS'
-  else
-    printf 'ISSUES'
-  fi
+  raw="$(printf '%s' "$last" \
+    | grep -oiE '^[*`>_-]*[[:space:]]*AUTODEV-VERDICT:[[:space:]]*(PASS|ISSUES|NEEDS-USER)[*`.[:space:]]*$' \
+    | grep -oiE '(PASS|ISSUES|NEEDS-USER)[*`.[:space:]]*$' \
+    | tr -d '*`. \t' \
+    | tr '[:lower:]' '[:upper:]')"
+  if [ -n "$raw" ]; then printf '%s' "$raw"; else printf 'ISSUES'; fi
 }
 
 get_stuck_gates() {
@@ -464,7 +481,15 @@ case "$EVENT_NAME" in
     [ -n "$GATE" ] || emit_empty
     ensure_dir "$STATE_DIR" || true
     ensure_dir "$VIEW_DIR" || true
-    if [ "$(state_str "$STATE" "${GATE}Verdict")" = "PASS" ]; then
+    RESUMING_NEEDS_USER=0
+    if [ "$(state_str "$STATE" "${GATE}Verdict")" = "NEEDS-USER" ] &&
+      [ "$(state_num "$STATE" 'needsUserReached')" -eq 1 ] 2>/dev/null; then
+      # This is the continuation of the paused attempt, not another autonomous retry. Keep the
+      # NEEDS-USER verdict visible so the workflow remains locked while evidence is verified.
+      RESUMING_NEEDS_USER=1
+      STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 2')"
+      ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
+    elif [ "$(state_str "$STATE" "${GATE}Verdict")" = "PASS" ]; then
       # This gate already passed, so this is a re-gate after a material change.
       # Start a fresh per-pass budget rather than charging it the old pass's attempts.
       ATTEMPTS=1
@@ -476,8 +501,12 @@ case "$EVENT_NAME" in
     # Invalidating them keeps the tracker in step with the orchestrator's rule of re-running
     # every gate from the first one affected onward, and stops a re-gate from reaching
     # "complete" while downstream gates hold verdicts for a plan that changed.
-    STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
+    if [ "$RESUMING_NEEDS_USER" -eq 1 ]; then
+      STATE="$(printf '%s' "$STATE" | jq --argjson t "$TOTAL" '.totalInvocations = $t | .blocks = 0')"
+    else
+      STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --argjson t "$TOTAL" \
+        ".${GATE}Attempts = \$a | .${GATE}Verdict = \"running\" | .totalInvocations = \$t | .blocks = 0")"
+    fi
     SEEN_CURRENT=0
     for LATER in $GATE_ORDER; do
       if [ "$SEEN_CURRENT" -eq 1 ]; then
@@ -499,6 +528,8 @@ case "$EVENT_NAME" in
 
     RESPONSE="$(json_get '.response')"
     VERDICT="$(read_verdict "$RESPONSE")"
+    # NEEDS-USER is reserved for security and privacy review gates.
+    [ "$GATE" = "architecture" ] && [ "$VERDICT" = "NEEDS-USER" ] && VERDICT='ISSUES'
 
     ATTEMPTS="$(state_num "$STATE" "${GATE}Attempts")"
     TOTAL_INVOCATIONS="$(state_num "$STATE" 'totalInvocations')"
@@ -513,7 +544,11 @@ case "$EVENT_NAME" in
     if [ "$TOTAL_INVOCATIONS" -lt 1 ] 2>/dev/null; then TOTAL_INVOCATIONS=1; fi
     STATE="$(printf '%s' "$STATE" | jq --argjson a "$ATTEMPTS" --arg v "$VERDICT" \
       --argjson t "$TOTAL_INVOCATIONS" \
-      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v | .totalInvocations = \$t")"
+      ".${GATE}Attempts = \$a | .${GATE}Verdict = \$v
+       | .needsUserReached = (if \$v == \"NEEDS-USER\" then 0
+                              elif .needsUserReached == 2 then 1
+                              else .needsUserReached end)
+       | .totalInvocations = \$t")"
     write_state "$STATE"
     add_audit_row "$GATE" "$ATTEMPTS" "completed" "$VERDICT"
     # Capture the review itself, not just that it happened, so the findings survive the session
@@ -537,6 +572,10 @@ Reviewer feedback log: $FEEDBACK_PATH"
 Audit trail: $AUDIT_PATH
 Reviewer feedback log: $FEEDBACK_PATH"
       fi
+    elif [ "$PHASE" = "needs-user" ]; then
+      NEXT_ACTION="Next required action: stop now. Do not revise the plan, call ask_user, or invoke any agent. Explain the required authorized decision or external action to the user, point them to the plan and reviewer feedback log, and end this turn. After the user completes the action or supplies the decision or evidence in a later turn, re-invoke only autodev:autodev-$GATE-review with that new context.
+Audit trail: $AUDIT_PATH
+Reviewer feedback log: $FEEDBACK_PATH"
     elif [ "$VERDICT" = "PASS" ]; then
       NEXT_GATE="$(get_next_gate "$STATE")"
       NEXT_ACTION="Next required action: the $GATE gate is closed. Invoke autodev:autodev-$NEXT_GATE-review next."
@@ -582,7 +621,25 @@ $FOOTER" '{modifiedResponse: $r}'
 
   agentStop)
     [ -f "$STATE_PATH" ] || [ -f "$MIRROR_PATH" ] || emit_empty
-    [ "$(get_phase "$STATE")" = "gating" ] || emit_empty
+    PHASE="$(get_phase "$STATE")"
+    if [ "$PHASE" = "needs-user" ]; then
+      if [ "$(state_num "$STATE" 'needsUserReached')" -eq 2 ] 2>/dev/null; then
+        NEXT_GATE="$(get_next_gate "$STATE")"
+        REASON="The resumed $NEXT_GATE reviewer is still verifying the user's decision, action, or evidence. Do not end the turn or start anything else until that reviewer returns."
+        jq -cn --arg r "$REASON" '{decision: "block", reason: $r}'
+        exit 0
+      fi
+      ensure_dir "$STATE_DIR" || true
+      ensure_dir "$VIEW_DIR" || true
+      if [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
+        NEXT_GATE="$(get_next_gate "$STATE")"
+        STATE="$(printf '%s' "$STATE" | jq '.needsUserReached = 1')"
+        write_state "$STATE"
+        add_audit_row "$NEXT_GATE" "$(state_num "$STATE" "${NEXT_GATE}Attempts")" "waiting for user" "NEEDS-USER"
+      fi
+      emit_empty
+    fi
+    [ "$PHASE" = "gating" ] || emit_empty
     # The authoritative directory may be what was deleted. Recreate it before persisting the
     # recovered block counter; write_state still updates the mirror if this is impossible.
     ensure_dir "$STATE_DIR" || true
@@ -626,6 +683,21 @@ $FOOTER" '{modifiedResponse: $r}'
     PHASE="$(get_phase "$STATE")"
 
     if [ "$(printf '%s' "$TOOL_NAME" | tr 'A-Z' 'a-z')" = "task" ]; then
+      if [ "$PHASE" = "needs-user" ]; then
+        TARGET_GATE="$(resolve_gate "$(get_task_agent_type)")"
+        WAITING_GATE="$(get_next_gate "$STATE")"
+        if [ "$(state_num "$STATE" 'needsUserReached')" -eq 2 ] 2>/dev/null; then
+          REASON="The resumed $WAITING_GATE reviewer is already running. Do not invoke any other agent until it finishes verifying the user's decision, action, or evidence."
+        elif [ "$(state_num "$STATE" 'needsUserReached')" -eq 0 ] 2>/dev/null; then
+          REASON="The $WAITING_GATE gate returned NEEDS-USER. Do not invoke any agent in this turn. Explain the required authorized decision or external action to the user and end the turn so the workflow can be resumed later."
+        elif [ "$TARGET_GATE" != "$WAITING_GATE" ]; then
+          REASON="The autodev-plan workflow is waiting on user action for the $WAITING_GATE gate. Only autodev:autodev-$WAITING_GATE-review may resume it after the user supplies the required decision, action, or evidence."
+        else
+          emit_empty
+        fi
+        jq -cn --arg r "$REASON" '{permissionDecision: "deny", permissionDecisionReason: $r}'
+        exit 0
+      fi
       # Everything else in this plugin only *asks* the orchestrator to stop looping once a gate
       # is out of attempts. This is the part that actually stops it: once the budget is spent,
       # refuse to start another reviewer. Without it an orchestrator that ignores the escalation
@@ -648,6 +720,12 @@ $FOOTER" '{modifiedResponse: $r}'
       exit 0
     fi
 
+    if [ "$PHASE" = "needs-user" ]; then
+      WAITING_GATE="$(get_next_gate "$STATE")"
+      REASON="The $WAITING_GATE gate returned NEEDS-USER. Do not call ask_user; explain the required authorized decision or external action in your response and end the turn so the user can handle it and resume later."
+      jq -cn --arg r "$REASON" '{permissionDecision: "deny", permissionDecisionReason: $r}'
+      exit 0
+    fi
     [ "$PHASE" = "gating" ] || emit_empty
 
     NEXT_GATE="$(get_next_gate "$STATE")"

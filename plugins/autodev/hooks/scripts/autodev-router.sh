@@ -120,6 +120,85 @@ route_by_session() {
   fi
 }
 
+workflow_state_is_valid() {
+  local workflow="$1" snapshot="$2"
+  if [ "$workflow" = "gates" ]; then
+    printf '%s' "$snapshot" | jq -e '
+      def nonnegint:
+        (type == "number"
+         and . >= 0 and . <= 2147483647 and floor == .
+         and (tostring | test("^[0-9]+$")))
+        or (type == "string"
+            and test("^[0-9]+$")
+            and (tonumber <= 2147483647));
+      def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+      def marker_ok: (has("needsUserReached") | not) or (.needsUserReached | nonnegint and tonumber <= 2);
+      def verdict_ok($key):
+        (has($key) | not)
+        or (.[$key] | type == "string" and
+            (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+             or . == "NEEDS-USER"));
+      def ordinary_verdict_ok($key):
+        (has($key) | not)
+        or (.[$key] | type == "string" and
+            (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
+      counter_ok("blocks")
+      and marker_ok
+      and counter_ok("totalInvocations")
+      and counter_ok("architectureAttempts")
+      and counter_ok("securityAttempts")
+      and counter_ok("privacyAttempts")
+      and ordinary_verdict_ok("architectureVerdict")
+      and verdict_ok("securityVerdict")
+      and verdict_ok("privacyVerdict")
+    ' >/dev/null 2>&1
+    return
+  fi
+
+  printf '%s' "$snapshot" | jq -e '
+    def nonnegint:
+      (type == "number"
+       and . >= 0 and . <= 2147483647 and floor == .
+       and (tostring | test("^[0-9]+$")))
+      or (type == "string"
+          and test("^[0-9]+$")
+          and (tonumber <= 2147483647));
+    def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    def marker_ok: (has("needsUserReached") | not) or (.needsUserReached | nonnegint and tonumber <= 2);
+    def worker_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "DONE" or . == "BLOCKED"));
+    def review_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+           or . == "NEEDS-USER"));
+    def ordinary_review_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
+    counter_ok("blocks")
+    and counter_ok("totalInvocations")
+    and counter_ok("taskingAttempts")
+    and counter_ok("milestoneCount")
+    and counter_ok("currentMilestone")
+    and counter_ok("completedMilestones")
+    and counter_ok("implementAttempts")
+    and counter_ok("reviewAttempts")
+    and counter_ok("fixInvocations")
+    and counter_ok("userReviewReached")
+    and marker_ok
+    and counter_ok("securityAttempts")
+    and counter_ok("privacyAttempts")
+    and worker_ok("taskingVerdict")
+    and worker_ok("implementVerdict")
+    and ordinary_review_ok("reviewVerdict")
+    and review_ok("securityVerdict")
+    and review_ok("privacyVerdict")
+  ' >/dev/null 2>&1
+}
+
 # A cross-workflow task is legal only after the current workflow is complete or escalated. Missing
 # or malformed state is treated as active: the owning tracker may still be able to recover it from
 # its workspace mirror, so allowing a different starter would risk bypassing that enforcement.
@@ -146,16 +225,23 @@ workflow_is_enforcing() {
             and test("^[0-9]+$")
             and (tonumber <= 2147483647));
       def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+      def marker_ok: (has("needsUserReached") | not) or (.needsUserReached | nonnegint and tonumber <= 2);
       def verdict_ok($key):
+        (has($key) | not)
+        or (.[$key] | type == "string" and
+            (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+             or . == "NEEDS-USER"));
+      def ordinary_verdict_ok($key):
         (has($key) | not)
         or (.[$key] | type == "string" and
             (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
       counter_ok("blocks")
+      and marker_ok
       and counter_ok("totalInvocations")
       and counter_ok("architectureAttempts")
       and counter_ok("securityAttempts")
       and counter_ok("privacyAttempts")
-      and verdict_ok("architectureVerdict")
+      and ordinary_verdict_ok("architectureVerdict")
       and verdict_ok("securityVerdict")
       and verdict_ok("privacyVerdict")
     ' >/dev/null 2>&1 || return 0
@@ -171,11 +257,16 @@ workflow_is_enforcing() {
         s("architectureVerdict") == "PASS"
         and s("securityVerdict") == "PASS"
         and s("privacyVerdict") == "PASS";
+      def needs_user:
+        s("securityVerdict") == "NEEDS-USER" or s("privacyVerdict") == "NEEDS-USER";
       def escalated:
-        n("totalInvocations") >= 40
-        or (s("architectureVerdict") != "PASS" and n("architectureAttempts") >= 10)
-        or (s("securityVerdict") != "PASS" and n("securityAttempts") >= 10)
-        or (s("privacyVerdict") != "PASS" and n("privacyAttempts") >= 10);
+        ((needs_user | not) and n("needsUserReached") == 0 and n("totalInvocations") >= 40)
+        or ((s("architectureVerdict") != "PASS" and s("architectureVerdict") != "NEEDS-USER")
+            and n("architectureAttempts") >= 10)
+        or ((s("securityVerdict") != "PASS" and s("securityVerdict") != "NEEDS-USER")
+            and n("securityAttempts") >= 10)
+        or ((s("privacyVerdict") != "PASS" and s("privacyVerdict") != "NEEDS-USER")
+            and n("privacyAttempts") >= 10);
       started and (complete | not) and (escalated | not)
     ' >/dev/null 2>&1
     return
@@ -190,11 +281,17 @@ workflow_is_enforcing() {
           and test("^[0-9]+$")
           and (tonumber <= 2147483647));
     def counter_ok($key): (has($key) | not) or (.[$key] | nonnegint);
+    def marker_ok: (has("needsUserReached") | not) or (.needsUserReached | nonnegint and tonumber <= 2);
     def worker_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
           (. == "pending" or . == "running" or . == "DONE" or . == "BLOCKED"));
     def review_ok($key):
+      (has($key) | not)
+      or (.[$key] | type == "string" and
+          (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"
+           or . == "NEEDS-USER"));
+    def ordinary_review_ok($key):
       (has($key) | not)
       or (.[$key] | type == "string" and
           (. == "pending" or . == "running" or . == "PASS" or . == "ISSUES"));
@@ -208,11 +305,12 @@ workflow_is_enforcing() {
     and counter_ok("reviewAttempts")
     and counter_ok("fixInvocations")
     and counter_ok("userReviewReached")
+    and marker_ok
     and counter_ok("securityAttempts")
     and counter_ok("privacyAttempts")
     and worker_ok("taskingVerdict")
     and worker_ok("implementVerdict")
-    and review_ok("reviewVerdict")
+    and ordinary_review_ok("reviewVerdict")
     and review_ok("securityVerdict")
     and review_ok("privacyVerdict")
   ' >/dev/null 2>&1 || return 0
@@ -229,7 +327,10 @@ workflow_is_enforcing() {
       end;
     def stage:
       if n("taskingAttempts") == 0 then "idle"
-      elif n("totalInvocations") >= (120 + 30 * milestones) then "escalated"
+      elif s("securityVerdict") == "NEEDS-USER" or s("privacyVerdict") == "NEEDS-USER"
+      then "needs-user"
+      elif n("needsUserReached") == 0
+        and n("totalInvocations") >= (120 + 30 * milestones) then "escalated"
       elif s("taskingVerdict") != "DONE" then
         if n("taskingAttempts") >= 5 then "escalated" else "tasking" end
       elif n("completedMilestones") < milestones then
@@ -243,10 +344,33 @@ workflow_is_enforcing() {
         else "security"
         end
       elif s("privacyVerdict") != "PASS" then
-        if n("privacyAttempts") >= 10 then "escalated" else "privacy" end
+        if n("privacyAttempts") >= 10 then "escalated"
+        else "privacy"
+        end
       else "complete"
       end;
     stage != "idle" and stage != "complete" and stage != "escalated"
+  ' >/dev/null 2>&1
+}
+
+workflow_needs_user() {
+  local workflow="$1" path snapshot owner
+  case "$workflow" in
+    gates) path="$GATE_STATE" ;;
+    stages) path="$STAGE_STATE" ;;
+    *) return 1 ;;
+  esac
+  # The owning tracker may recover a missing or corrupt authoritative file from its workspace
+  # mirror. Route the unclassified task to it rather than letting the task bypass a remembered
+  # pause while the router temporarily cannot inspect the verdict.
+  [ -f "$path" ] || return 0
+  snapshot="$(cat "$path" 2>/dev/null)" || return 0
+  printf '%s' "$snapshot" | jq -e . >/dev/null 2>&1 || return 0
+  owner="$(printf '%s' "$snapshot" | jq -r '.sessionId // ""' 2>/dev/null)"
+  [ "$owner" = "$SAFE_SESSION_ID" ] || return 0
+  workflow_state_is_valid "$workflow" "$snapshot" || return 0
+  printf '%s' "$snapshot" | jq -e '
+    .securityVerdict == "NEEDS-USER" or .privacyVerdict == "NEEDS-USER"
   ' >/dev/null 2>&1
 }
 
@@ -416,6 +540,9 @@ case "$EVENT_NAME" in
         if [ -n "$CURRENT" ] && [ -n "$TARGET" ] && [ "$CURRENT" != "$TARGET" ] &&
           workflow_is_enforcing "$CURRENT"; then
           deny_cross_workflow "$CURRENT" "$TARGET"
+        fi
+        if [ -z "$TARGET" ] && [ -n "$CURRENT" ] && workflow_needs_user "$CURRENT"; then
+          TARGET="$CURRENT"
         fi
         ;;
       ask_user | askuserquestion)

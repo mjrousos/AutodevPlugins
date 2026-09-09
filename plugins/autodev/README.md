@@ -126,7 +126,8 @@ Once a plan exists, `autodev-implement` takes it — normally one produced by `a
 drives it to a complete, reviewed implementation. The plan is broken into milestones, each
 milestone is implemented and then code-reviewed in an isolated context until it passes, and the
 finished implementation is put through security and privacy review before the run ends. **Nothing
-is deferred:** the run ends with the plan implemented, or it escalates to you and says so.
+is silently deferred:** the run ends with the plan implemented, pauses when required user action
+is the only safe way forward, or escalates to you and says so.
 
 ```
 INTAKE → TASKING → ┌──────────────── for each milestone, in order ───────────────┐
@@ -142,10 +143,13 @@ INTAKE → TASKING → ┌──────────────── for e
                                            WRAPUP
 ```
 
-TASKING through the milestone loop runs without input from you. **USER-REVIEW is the one
+TASKING through the milestone loop runs without input from you. **USER-REVIEW is the normal
 checkpoint where the run stops and waits** — you read the code and either approve it or say what
 needs to change, and anything you report is routed back through the fix agent. After you approve,
-the security and privacy reviews run autonomously.
+the security and privacy reviews run autonomously. A security or privacy reviewer may also return
+`NEEDS-USER` as a last resort when progress genuinely requires an authorized decision or external
+action that no safe plan or repository change can replace. That verdict pauses immediately without
+calling a revision or fix agent; after you perform the action, the same reviewer resumes.
 
 ### Implementation agents
 
@@ -160,8 +164,9 @@ the security and privacy reviews run autonomously.
 | `autodev-code-privacy-review` | GPT-5.6 Terra | read-only | Privacy and data-protection review of the finished implementation. |
 
 Reviewers run in their own context and never see the reasoning that produced the code. Every
-sub-agent ends its response with a machine-readable verdict — `PASS`/`ISSUES` for reviewers,
-`DONE`/`BLOCKED` for the others. A missing or unreadable verdict never counts as a pass.
+sub-agent ends its response with a machine-readable verdict — `PASS`/`ISSUES` for ordinary review
+results, `NEEDS-USER` for a last-resort security or privacy pause, and `DONE`/`BLOCKED` for workers.
+A missing or unreadable verdict never counts as a pass.
 
 ## Enforcement
 
@@ -225,6 +230,19 @@ AUTODEV-VERDICT: PASS
 
 or `AUTODEV-VERDICT: ISSUES`. A **missing or unparseable verdict is recorded as `ISSUES`**, so a
 malfunctioning reviewer can never wave a plan through.
+
+Security and privacy reviewers have one additional terminal result:
+
+```
+AUTODEV-VERDICT: NEEDS-USER
+```
+
+They may use it only when a blocker or major finding has no safe autonomous resolution and truly
+requires an authorized decision, credential, approval, or external-system action. Ambiguity,
+inconvenient evidence, or a preference for confirmation is not enough. The tracker permits the
+orchestrator to end the turn, denies `ask_user` and every sub-agent in that turn, and records the
+pause. In a later turn, only the same reviewer may resume the workflow with the user's decision or
+new evidence; the verdict neither passes nor permanently escalates the gate.
 
 ### Loop bounds
 
