@@ -12,7 +12,7 @@
     {
       "name": "autodev",
       "description": "Plans and implements software changes through two orchestrated workflows: autodev-plan drafts a plan hardened by isolated architecture, security, and privacy review gates with a live workflow canvas, and autodev-implement builds it milestone by milestone, hardened by isolated code, security, and privacy review loops.",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "source": "./plugins/autodev"
     },
     {

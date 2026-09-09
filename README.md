@@ -3,7 +3,7 @@
 This repository contains plugins for automating the software development lifecycle with GitHub
 Copilot or other compatible AI assistants. It ships exactly two plugins:
 
-- [**autodev**](./plugins/autodev/README.md) (`0.5.0`): the planning and implementation workflows in
+- [**autodev**](./plugins/autodev/README.md) (`0.5.1`): the planning and implementation workflows in
   one plugin. It contributes two top-level agents — `autodev-plan`, which drafts a development plan
   hardened by isolated architecture, security, and privacy review gates with a live workflow canvas,
   and `autodev-implement`, which builds that plan milestone by milestone, hardened by isolated code,
